@@ -1,6 +1,5 @@
 import claripy
 import angr
-from angr.sim_type import SimTypeString, SimTypeLength
 from angr.sim_options import MEMORY_CHUNK_INDIVIDUAL_READS
 
 import logging
@@ -8,13 +7,9 @@ l = logging.getLogger(name=__name__)
 
 class strlen(angr.SimProcedure):
     #pylint:disable=arguments-differ
+    max_null_index = None
 
     def run(self, s, wchar=False):
-        #pylint:disable=attribute-defined-outside-init
-
-        self.argument_types = {0: self.ty_ptr(SimTypeString())}
-        self.return_type = SimTypeLength(self.state.arch)
-
         if wchar:
             null_seq = self.state.solver.BVV(0, 16)
             step = 2

@@ -16,7 +16,7 @@ arch_data = { # (steps, [hit addrs], finished)
 }
 
 def emulate(arch, binary, use_sim_procs, steps, hit_addrs, finished):
-    p = angr.Project(os.path.join(test_location, arch, binary), use_sim_procedures=use_sim_procs)
+    p = angr.Project(os.path.join(test_location, arch, binary), use_sim_procedures=use_sim_procs, rebase_granularity=0x1000000)
     state = p.factory.full_init_state(args=['./test_arrays'], add_options={angr.options.STRICT_PAGE_ACCESS, angr.options.ENABLE_NX, angr.options.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY, angr.options.USE_SYSTEM_TIMES})
 
     pg = p.factory.simulation_manager(state, resilience=True)
@@ -72,11 +72,11 @@ def test_locale():
 
 
 if __name__ == '__main__':
-    for func, a, b, c, d in test_windows():
-        print(a.filename)
-        func(a, b, c, d)
+    for func, a, b, c, d, e, f in test_windows():
+        print(a, b)
+        func(a, b, c, d, e, f)
     print('locale')
     test_locale()
-    for func, a, b, c, d in test_emulation():
-        print(a.filename)
-        func(a, b, c, d)
+    for func, a, b, c, d, e, f in test_emulation():
+        print(a, b)
+        func(a, b, c, d, e, f)

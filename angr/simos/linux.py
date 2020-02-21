@@ -52,39 +52,32 @@ class SimLinux(SimUserland):
                           )
         self.project.hook(self.vsyscall_addr, P['linux_kernel']['_vsyscall']())
 
-        ld_obj = self.project.loader.linux_loader_object
-        if ld_obj is not None:
-            # there are some functions we MUST use the simprocedures for, regardless of what the user wants
-            self._weak_hook_symbol('__tls_get_addr', L['ld.so'].get('__tls_get_addr', self.arch), ld_obj)
-            self._weak_hook_symbol('___tls_get_addr', L['ld.so'].get('___tls_get_addr', self.arch), ld_obj)
+        # there are some functions we MUST use the simprocedures for, regardless of what the user wants
+        self._weak_hook_symbol('__tls_get_addr', L['ld.so'].get('__tls_get_addr', self.arch))    # ld
+        self._weak_hook_symbol('___tls_get_addr', L['ld.so'].get('___tls_get_addr', self.arch))  # ld
+        self._weak_hook_symbol('_dl_vdso_vsym', L['libc.so.6'].get('_dl_vdso_vsym', self.arch))  # libc
 
-            # set up some static data in the loader object...
-            # TODO it should be legal to get these from the externs now
-            _rtld_global = ld_obj.get_symbol('_rtld_global')
-            if _rtld_global is not None:
-                if isinstance(self.project.arch, ArchAMD64):
-                    self.project.loader.memory.pack_word(_rtld_global.rebased_addr + 0xF08, self._loader_lock_addr)
-                    self.project.loader.memory.pack_word(_rtld_global.rebased_addr + 0xF10, self._loader_unlock_addr)
-                    self.project.loader.memory.pack_word(_rtld_global.rebased_addr + 0x990, self._error_catch_tsd_addr)
-
-            # TODO: what the hell is this
-            _rtld_global_ro = ld_obj.get_symbol('_rtld_global_ro')
-            if _rtld_global_ro is not None:
-                pass
-
-        libc_obj = self.project.loader.find_object('libc.so.6')
-        if libc_obj:
-            self._weak_hook_symbol('_dl_vdso_vsym', L['libc.so.6'].get('_dl_vdso_vsym', self.arch), libc_obj)
-
-        tls_obj = self.project.loader.tls_object
-        if tls_obj is not None:
+        # set up some static data in the loader object...
+        _rtld_global = self.project.loader.find_symbol('_rtld_global')
+        if _rtld_global is not None:
             if isinstance(self.project.arch, ArchAMD64):
-                self.project.loader.memory.pack_word(tls_obj.thread_pointer + 0x28, 0x5f43414e41525900)  # _CANARY\x00
-                self.project.loader.memory.pack_word(tls_obj.thread_pointer + 0x30, 0x5054524755415244)
-            elif isinstance(self.project.arch, ArchX86):
-                self.project.loader.memory.pack_word(tls_obj.thread_pointer + 0x10, self.vsyscall_addr)
-            elif isinstance(self.project.arch, ArchARM):
-                self.project.hook(0xffff0fe0, P['linux_kernel']['_kernel_user_helper_get_tls']())
+                self.project.loader.memory.pack_word(_rtld_global.rebased_addr + 0xF08, self._loader_lock_addr)
+                self.project.loader.memory.pack_word(_rtld_global.rebased_addr + 0xF10, self._loader_unlock_addr)
+                self.project.loader.memory.pack_word(_rtld_global.rebased_addr + 0x990, self._error_catch_tsd_addr)
+
+        # TODO: what the hell is this
+        _rtld_global_ro = self.project.loader.find_symbol('_rtld_global_ro')
+        if _rtld_global_ro is not None:
+            pass
+
+        tls_obj = self.project.loader.tls.new_thread()
+        if isinstance(self.project.arch, ArchAMD64):
+            self.project.loader.memory.pack_word(tls_obj.thread_pointer + 0x28, 0x5f43414e41525900)  # _CANARY\x00
+            self.project.loader.memory.pack_word(tls_obj.thread_pointer + 0x30, 0x5054524755415244)
+        elif isinstance(self.project.arch, ArchX86):
+            self.project.loader.memory.pack_word(tls_obj.thread_pointer + 0x10, self.vsyscall_addr)
+        elif isinstance(self.project.arch, ArchARM):
+            self.project.hook(0xffff0fe0, P['linux_kernel']['_kernel_user_helper_get_tls']())
 
         # Only set up ifunc resolution if we are using the ELF backend on AMD64
         if isinstance(self.project.loader.main_object, MetaELF):
@@ -159,19 +152,19 @@ class SimLinux(SimUserland):
             cwd=None, pathsep=b'/', **kwargs):
         state = super(SimLinux, self).state_blank(**kwargs)
 
-        if self.project.loader.tls_object is not None:
-            if isinstance(state.arch, ArchAMD64):
-                state.regs.fs = self.project.loader.tls_object.user_thread_pointer
-            elif isinstance(state.arch, ArchX86):
-                state.regs.gs = self.project.loader.tls_object.user_thread_pointer >> 16
-            elif isinstance(state.arch, (ArchMIPS32, ArchMIPS64)):
-                state.regs.ulr = self.project.loader.tls_object.user_thread_pointer
-            elif isinstance(state.arch, ArchPPC32):
-                state.regs.r2 = self.project.loader.tls_object.user_thread_pointer
-            elif isinstance(state.arch, ArchPPC64):
-                state.regs.r13 = self.project.loader.tls_object.user_thread_pointer
-            elif isinstance(state.arch, ArchAArch64):
-                state.regs.tpidr_el0 = self.project.loader.tls_object.user_thread_pointer
+        tls_obj = self.project.loader.tls.threads[0]
+        if isinstance(state.arch, ArchAMD64):
+            state.regs.fs = tls_obj.user_thread_pointer
+        elif isinstance(state.arch, ArchX86):
+            state.regs.gs = tls_obj.user_thread_pointer >> 16
+        elif isinstance(state.arch, (ArchMIPS32, ArchMIPS64)):
+            state.regs.ulr = tls_obj.user_thread_pointer
+        elif isinstance(state.arch, ArchPPC32):
+            state.regs.r2 = tls_obj.user_thread_pointer
+        elif isinstance(state.arch, ArchPPC64):
+            state.regs.r13 = tls_obj.user_thread_pointer
+        elif isinstance(state.arch, ArchAArch64):
+            state.regs.tpidr_el0 = tls_obj.user_thread_pointer
 
         if fs is None:
             fs = {}
@@ -339,7 +332,7 @@ class SimLinux(SimUserland):
                 elif val == 'entry':
                     state.registers.store(reg, state.registers.load('pc'))
                 elif val == 'thread_pointer':
-                    state.registers.store(reg, self.project.loader.tls_object.user_thread_pointer)
+                    state.registers.store(reg, self.project.loader.tls.threads[0].user_thread_pointer)
                 else:
                     _l.warning('Unknown entry point register value indicator "%s"', val)
             else:

@@ -1,6 +1,5 @@
 import angr
 from angr.state_plugins.symbolic_memory import MultiwriteAnnotation
-from angr.sim_type import SimTypeString, SimTypeInt, SimTypeChar
 from angr.sim_options import MEMORY_CHUNK_INDIVIDUAL_READS
 
 import logging
@@ -11,11 +10,6 @@ class strchr(angr.SimProcedure):
 
     def run(self, s_addr, c_int, s_strlen=None):
         c = c_int[7:0]
-
-        self.argument_types = {0: self.ty_ptr(SimTypeString()),
-                       1: SimTypeInt(32, True)} # ?
-        self.return_type = self.ty_ptr(SimTypeChar()) # ?
-
         s_strlen = self.inline_call(angr.SIM_PROCEDURES['libc']['strlen'], s_addr)
 
         chunk_size = None

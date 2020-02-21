@@ -1,11 +1,9 @@
 import angr
 import claripy
-from angr.sim_type import SimTypeString, SimTypeInt
+import logging
 from angr.errors import SimProcedureError
 
-import logging
 l = logging.getLogger(name=__name__)
-
 
 # note: this does not handle skipping white space
 
@@ -197,14 +195,7 @@ class strtol(angr.SimProcedure):
 
         return expression, result
 
-    def run(self, nptr, endptr, base):
-
-        self.argument_types = {0: self.ty_ptr(SimTypeString()),
-                               1: self.ty_ptr(self.ty_ptr(SimTypeString())),
-                               2: SimTypeInt(self.state.arch, True)}
-
-        self.return_type = SimTypeInt(self.state.arch, True)
-
+    def run(self, nptr, endptr, base):  # pylint: disable=arguments-differ
         if self.state.solver.symbolic(base):
             l.warning("Concretizing symbolic base in strtol")
             base_concrete = self.state.solver.eval(base)
@@ -235,8 +226,8 @@ class strtol(angr.SimProcedure):
 
             # read a string to long for each possibility
             pred_base = zip([base_16_pred, base_10_pred, base_8_pred], [16, 10, 8])
-            for pred, base in pred_base:
-                expression, value, num_bytes = self.strtol_inner(nptr, self.state, self.state.memory, base, True)
+            for pred, sub_base in pred_base:
+                expression, value, num_bytes = self.strtol_inner(nptr, self.state, self.state.memory, sub_base, True)
                 expressions.append(self.state.solver.And(expression, pred))
                 values.append(value)
                 num_bytes_arr.append(num_bytes)
@@ -252,6 +243,7 @@ class strtol(angr.SimProcedure):
 
             return value
 
-        expression, value, num_bytes = self.strtol_inner(nptr, self.state, self.state.memory, base, True)
-        self.state.memory.store(endptr, nptr+num_bytes, condition=(endptr != 0), endness=self.state.arch.memory_endness)
-        return self.state.solver.If(expression, value, 0)
+        else:
+            expression, value, num_bytes = self.strtol_inner(nptr, self.state, self.state.memory, base, True)
+            self.state.memory.store(endptr, nptr+num_bytes, condition=(endptr != 0), endness=self.state.arch.memory_endness)
+            return self.state.solver.If(expression, value, 0)
