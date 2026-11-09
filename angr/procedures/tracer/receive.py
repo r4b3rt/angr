@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import logging
 
-from ..cgc.receive import receive as orig_receive
-
+from angr import claripy
+from angr.procedures.cgc.receive import receive as orig_receive
 
 l = logging.getLogger(name=__name__)
 
@@ -13,9 +15,8 @@ class receive(orig_receive):
     """
 
     def run(self, fd, buf, count, rx_bytes):
-        if len(self.state.solver.eval_upto(fd, 2)) < 2:
-            if self.state.solver.eval(fd) == 1:
-                l.debug("Fixed receive call's fd.")
-                fd = self.state.solver.BVV(0, self.state.arch.bits)
+        if len(self.state.solver.eval_upto(fd, 2)) < 2 and self.state.solver.eval(fd) == 1:
+            l.debug("Fixed receive call's fd.")
+            fd = claripy.BVV(0, self.state.arch.bits)
 
-        return super(receive, self).run(fd, buf, count, rx_bytes)
+        return super().run(fd, buf, count, rx_bytes)

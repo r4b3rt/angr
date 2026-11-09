@@ -1,9 +1,9 @@
+from __future__ import annotations
 
 import random
 import string
 
-from ..func import Func, TestData
-
+from angr.analyses.identifier.func import Func, TestData
 
 BASES = [8, 10, 16]
 
@@ -24,46 +24,37 @@ def int2base(x, base):
         digits.append(digs[x % base])
         x //= base
     if sign < 0:
-        digits.append('-')
+        digits.append("-")
     digits.reverse()
-    return ''.join(digits)
+    return "".join(digits)
 
 
-class OneTwoOrThree(object):
+class OneTwoOrThree:
     def __eq__(self, other):
         if other == 1:
             return True
         if other == 2:
             return True
-        if other == 3:
-            return True
-        return False
+        return other == 3
 
     def __ne__(self, other):
         if other == 1:
             return False
         if other == 2:
             return False
-        if other == 3:
-            return False
-        return True
+        return not other == 3
 
 
 class based_atoi(Func):
     def __init__(self):
-        super(based_atoi, self).__init__()
+        super().__init__()
         self.allows_negative = True
         self.base = None
-
-    def rand_str(self, length, byte_list=None): #pylint disable=no-self-use
-        if byte_list is None:
-            return "".join(chr(random.randint(0, 255)) for _ in range(length))
-        return "".join(random.choice(byte_list) for _ in range(length))
 
     def num_args(self):
         return OneTwoOrThree()
 
-    def args(self): #pylint disable=no-self-use
+    def args(self):  # pylint disable=no-self-use
         return ["buf", "size", "err"]
 
     def get_name(self):
@@ -74,7 +65,7 @@ class based_atoi(Func):
         return name
 
     def gen_input_output_pair(self):
-        num = random.randint(-(2**26), 2**26-1)
+        num = random.randint(-(2**26), 2**26 - 1)
 
         if not self.allows_negative:
             num = abs(num)
@@ -104,7 +95,7 @@ class based_atoi(Func):
         if self.base is None:
             return False
 
-        num = random.randint(-(2 ** 26), 2 ** 26 - 1)
+        num = random.randint(-(2**26), 2**26 - 1)
 
         num = abs(num)
         s = int2base(num, self.base)

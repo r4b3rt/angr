@@ -1,14 +1,15 @@
+from __future__ import annotations
 
 import logging
 
-from ..values import SimSootValue_ArrayRef
+from angr.engines.soot.values import SimSootValue_ArrayRef
+
 from .base import SimSootExpr
 
-l = logging.getLogger('angr.engines.soot.expressions.arrayref')
+l = logging.getLogger("angr.engines.soot.expressions.arrayref")
 
 
 class SimSootExpr_ArrayRef(SimSootExpr):
-
     def _execute(self):
         array_base_local = self._translate_value(self.expr.base)
         array_base = self.state.memory.load(array_base_local)

@@ -1,106 +1,115 @@
 # This submodule stores and manages FLIRT signatures
+from __future__ import annotations
 
-from typing import Set, List, Dict, Optional
-import os
 import json
+import logging
+import os
 from collections import defaultdict
 
-import nampa
+from angr.analyses.flirt import (
+    FlirtSignature,
+    FlirtSignatureError,
+    FlirtSignatureParsed,
+    flirt_arch_to_arch_name,
+    flirt_os_type_to_os_name,
+)
 
-
-class FlirtSignature:
-    """
-    This class describes a FLIRT signature.
-    """
-    def __init__(self, arch: str, platform: str, sig_name: str, sig_path: str,
-                 unique_strings: Optional[Set[str]]=None,
-                 compiler: Optional[str]=None,
-                 compiler_version: Optional[str]=None,
-                 os_name: Optional[str]=None,
-                 os_version: Optional[str]=None):
-        self.arch = arch
-        self.platform = platform
-        self.sig_name = sig_name
-        self.sig_path = sig_path
-        self.unique_strings = unique_strings
-        self.compiler = compiler
-        self.compiler_version = compiler_version
-        self.os_name = os_name
-        self.os_version = os_version
-
-    def __repr__(self):
-        if self.os_name:
-            if self.os_version:
-                return f"<{self.sig_name}@{self.arch}-{self.os_name}-{self.os_version}>"
-            return f"<{self.sig_name}@{self.arch}-{self.os_name}>"
-        return f"<{self.sig_name}@{self.arch}-{self.platform}>"
+_l = logging.getLogger(__name__)
 
 
 FS = FlirtSignature
 
 # A dict from architecture names to FLIRT signatures under that architecture. Arch names are always in lower case.
-FLIRT_SIGNATURES_BY_ARCH: Dict[str,List[FlirtSignature]] = defaultdict(list)
-LIBRARY_TO_SIGNATURES: Dict[str,List[FlirtSignature]] = defaultdict(list)
-STRING_TO_LIBRARIES: Dict[str,Set[str]] = defaultdict(set)
+FLIRT_SIGNATURES_BY_ARCH: dict[str, list[FlirtSignature]] = defaultdict(list)
+LIBRARY_TO_SIGNATURES: dict[str, list[FlirtSignature]] = defaultdict(list)
+STRING_TO_LIBRARIES: dict[str, set[str]] = defaultdict(set)
 
 
-def load_signatures(path: str) -> None:
+def load_signature(sig_path: str, meta_path: str | None = None) -> tuple[str, FlirtSignature] | None:
+    """
+    Load a single FLIRT signature from a specific path.
+
+    :param sig_path:    Location of the FLIRT signature.
+    :return:            A FlirtSignature object if loading was successful, None otherwise.
+    """
+
+    # parse the header only; the function tree is parsed lazily at match time
+    try:
+        with open(sig_path, "rb") as f:
+            sig_parsed = FlirtSignatureParsed.parse_header(f)
+    except FlirtSignatureError:
+        return None
+
+    # is there a meta data file?
+    if meta_path is not None and os.path.isfile(meta_path):
+        # yes!
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        arch = str(meta.get("arch", "Unknown"))
+        platform = str(meta.get("platform", "UnknownOS"))
+        os_name = meta.get("os", None)
+        os_version = meta.get("os_version", None)
+        compiler = meta.get("compiler", None)
+        compiler_version = meta.get("compiler_version", None)
+        unique_strings = meta.get("unique_strings", None)
+
+    else:
+        # nope... we need to extract information from the signature file
+        arch = flirt_arch_to_arch_name(sig_parsed.arch, sig_parsed.app_types)
+        platform = flirt_os_type_to_os_name(sig_parsed.os_types)
+        os_name = None
+        os_version = None
+        unique_strings = None
+        compiler = None
+        compiler_version = None
+
+    signature = FlirtSignature(
+        arch,
+        platform,
+        sig_parsed.libname,
+        sig_path,
+        unique_strings=unique_strings,
+        compiler=compiler,
+        compiler_version=compiler_version,
+        os_name=os_name,
+        os_version=os_version,
+    )
+
+    return arch, signature
+
+
+def load_signatures(path: str, ignore: list[str] | None = None) -> None:
     """
     Recursively load all FLIRT signatures under a specific path.
 
     :param path:    Location of FLIRT signatures.
+    :param ignore:  A list of signature directory path prefixes to ignore. If None, a default list of signatures will
+                    be loaded.
     """
 
     FLIRT_SIGNATURES_BY_ARCH.clear()
     LIBRARY_TO_SIGNATURES.clear()
     STRING_TO_LIBRARIES.clear()
 
+    if ignore is None:
+        ignore = ["x86_64/linux/rust"]
+
     for root, _, filenames in os.walk(path):
+        if ignore:
+            normalized_root = root.replace("\\", "/")[len(path) :].lstrip("/")
+            if any(normalized_root.startswith(i) for i in ignore):
+                continue
         for filename in filenames:
             if filename.endswith(".sig"):
-                # parse it
                 sig_path = os.path.join(root, filename)
-                with open(sig_path, "rb") as f:
-                    flirt = nampa.parse_flirt_file(f)
-
-                # is there a meta data file?
                 meta_path = os.path.join(root, filename[:-4] + ".meta")
-                if os.path.isfile(meta_path):
-                    # yes!
-                    with open(meta_path, "r") as f:
-                        meta = json.load(f)
+                r = load_signature(sig_path, meta_path=meta_path)
+                if r is None:
+                    _l.warning("Failed to load FLIRT signature file %s.", sig_path)
+                    continue
 
-                    arch = meta.get("arch", None)
-                    platform = meta.get("platform", None)
-                    os_name = meta.get("os", None)
-                    os_version = meta.get("os_version", None)
-                    compiler = meta.get("compiler", None)
-                    compiler_version = meta.get("compiler_version", None)
-                    unique_strings = meta.get("unique_strings", None)
-
-                else:
-                    # nope... we need to extract information from the signature file
-                    # TODO: Convert them to angr-specific strings
-                    arch = flirt.header.arch
-                    platform = flirt.header.os_types
-                    os_name = None
-                    os_version = None
-                    unique_strings = None
-                    compiler = None
-                    compiler_version = None
-
-                signature = FlirtSignature(
-                    arch,
-                    platform,
-                    flirt.header.library_name.decode("utf-8"),
-                    sig_path,
-                    unique_strings=unique_strings,
-                    compiler=compiler,
-                    compiler_version=compiler_version,
-                    os_name=os_name,
-                    os_version=os_version,
-                )
-
+                arch, signature = r
                 FLIRT_SIGNATURES_BY_ARCH[arch].append(signature)
 
     # fill in LIBRARY_TO_SIGNATURES and STRING_TO_LIBRARIES
@@ -110,3 +119,14 @@ def load_signatures(path: str) -> None:
             if sig.unique_strings:
                 for us in sig.unique_strings:
                     STRING_TO_LIBRARIES[us].add(sig.sig_name)
+
+
+__all__ = (
+    "FLIRT_SIGNATURES_BY_ARCH",
+    "FS",
+    "LIBRARY_TO_SIGNATURES",
+    "STRING_TO_LIBRARIES",
+    "FlirtSignature",
+    "load_signature",
+    "load_signatures",
+)

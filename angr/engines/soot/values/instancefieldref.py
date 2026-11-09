@@ -1,15 +1,16 @@
+from __future__ import annotations
 
-from . import translate_value
+import angr
+from angr.engines.soot.field_dispatcher import resolve_field
+
 from .base import SimSootValue
-from ..field_dispatcher import resolve_field
 
 
 class SimSootValue_InstanceFieldRef(SimSootValue):
-
-    __slots__ = ['id', 'class_name', 'field_name', 'type']
+    __slots__ = ["class_name", "field_name", "id", "type"]
 
     def __init__(self, heap_alloc_id, class_name, field_name, type_):
-        self.id = "%s.%s.%s" % (heap_alloc_id, class_name, field_name)
+        self.id = f"{heap_alloc_id}.{class_name}.{field_name}"
         self.class_name = class_name
         self.field_name = field_name
         self.type = type_
@@ -26,7 +27,7 @@ class SimSootValue_InstanceFieldRef(SimSootValue):
         field_name, field_class_name = soot_value.field
         field_type = soot_value.type
         # get heap allocation id from base object
-        fixed_base = translate_value(soot_value.base, state)
+        fixed_base = angr.engines.soot.values.translate_value(soot_value.base, state)
         field_ref_base = state.memory.load(fixed_base)
         obj_alloc_id = field_ref_base.heap_alloc_id
         # return field reference

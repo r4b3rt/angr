@@ -1,6 +1,7 @@
-import claripy
+from __future__ import annotations
 
-from ..smart_find_mixin import SmartFindMixin
+from angr import claripy
+from angr.storage.memory_mixins.smart_find_mixin import SmartFindMixin
 
 
 class StaticFindMixin(SmartFindMixin):  # pylint:disable=abstract-method
@@ -8,19 +9,24 @@ class StaticFindMixin(SmartFindMixin):  # pylint:disable=abstract-method
     Implements data finding for abstract memory.
     """
 
-    def find(self, addr, data, max_search,
-             default=None,
-             endness=None,
-             chunk_size=None,
-             max_symbolic_bytes=None,
-             condition=None,
-             char_size=1,
-             **kwargs): #pylint:disable=arguments-differ
-
+    def find(
+        self,
+        addr,
+        data,
+        max_search,
+        *,
+        default=None,
+        endness=None,
+        chunk_size=None,
+        max_symbolic_bytes=None,
+        condition=None,
+        char_size=1,
+        **kwargs,
+    ):  # pylint:disable=arguments-differ
         if endness is None:
             endness = self.endness
             if endness is None:
-                endness = 'Iend_BE'
+                endness = "Iend_BE"
 
         char_num = self._calc_char_num(data, char_size)
 
@@ -30,8 +36,12 @@ class StaticFindMixin(SmartFindMixin):  # pylint:disable=abstract-method
 
         match_indices = []
 
-        for i, (_, element) in enumerate(self._find_iter_items(addr, char_num, char_size, chunk_size, max_search, endness, condition, max_symbolic_bytes, **kwargs)):
-            comparison, concrete_comparison = self._find_compare(element, data, **kwargs)
+        for i, (_, element) in enumerate(
+            self._find_iter_items(
+                addr, char_num, char_size, chunk_size, max_search, endness, condition, max_symbolic_bytes, **kwargs
+            )
+        ):
+            comparison, concrete_comparison = self._find_compare(element, data)
 
             if comparison:
                 match_indices.append(i)
@@ -42,21 +52,18 @@ class StaticFindMixin(SmartFindMixin):  # pylint:disable=abstract-method
         r_union = claripy.ESI(self.state.arch.bits)
         for index in match_indices:
             r_union = r_union.union(addr + index)
-        return r_union, [ ], match_indices
+        return r_union, [], match_indices
 
-    def _find_compare(self, element, target, **kwargs):
-        elem_si = element._model_vsa  # pylint:disable=protected-access
-        target_si = target._model_vsa  # pylint:disable=protected-access
-
+    def _find_compare(self, element, target):
         comparison, concrete_comparison = False, False
 
         # we only support strided intervals
-        if isinstance(elem_si, claripy.vsa.StridedInterval):
-            comparison = not elem_si.intersection(target_si).is_empty
-            concrete_comparison = elem_si.identical(target_si)
+        if not element.has_annotation_type(claripy.annotation.RegionAnnotation):
+            comparison = not claripy.vsa.identical(element.intersection(target), claripy.ESI(element.length))
+            concrete_comparison = claripy.vsa.identical(element, target)
 
         return comparison, concrete_comparison
 
     def _find_are_bytes_symbolic(self, b):
         # we only support strided intervals
-        return not isinstance(b._model_vsa, claripy.vsa.StridedInterval)  # pylint:disable=protected-access
+        return b.has_annotation_type(claripy.annotation.RegionAnnotation)

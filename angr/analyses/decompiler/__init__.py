@@ -1,13 +1,51 @@
-from .region_identifier import RegionIdentifier
-from .structurer import Structurer
-from .structured_codegen import CStructuredCodeGenerator, ImportSourceCode
-from .clinic import Clinic
-from .region_simplifiers import RegionSimplifier
-from .decompiler import Decompiler
-from .decompilation_options import options, options_by_category
+from __future__ import annotations
+
+from . import optimization_passes, structuring
+from .ail_simplifier import AILSimplifier
 from .block_simplifier import BlockSimplifier
 from .callsite_maker import CallSiteMaker
-from .ail_simplifier import AILSimplifier
-from . import optimization_passes
+from .clinic import Clinic, ClinicMode
+from .decompilation_cache import DecompilationCache
+from .decompilation_options import options, options_by_category
+from .decompiler import Decompiler
+from .dephication import GraphDephication, SeqNodeDephication
+from .known_patterns import KnownPattern, KnownPatternFinder, KnownPatternMatch
+from .presets import DECOMPILATION_PRESETS
+from .region_identifier import RegionIdentifier
+from .region_overlay import RegionOverlay
+from .region_simplifiers import RegionSimplifier
+from .ssailification import Ssailification
+from .structured_codegen import BaseStructuredCodeGenerator, CStructuredCodeGenerator, ImportSourceCode
+from .variable_map import VariableMap
 
 StructuredCodeGenerator = CStructuredCodeGenerator
+
+
+__all__ = (
+    "DECOMPILATION_PRESETS",
+    "AILSimplifier",
+    "BaseStructuredCodeGenerator",
+    "BlockSimplifier",
+    "CStructuredCodeGenerator",
+    "CallSiteMaker",
+    "Clinic",
+    "ClinicMode",
+    "DecompilationCache",
+    "Decompiler",
+    "GraphDephication",
+    "ImportSourceCode",
+    "KnownPattern",
+    "KnownPatternFinder",
+    "KnownPatternMatch",
+    "RegionIdentifier",
+    "RegionOverlay",
+    "RegionSimplifier",
+    "SeqNodeDephication",
+    "Ssailification",
+    "StructuredCodeGenerator",
+    "VariableMap",
+    "optimization_passes",
+    "options",
+    "options_by_category",
+    "structuring",
+)

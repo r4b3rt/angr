@@ -1,6 +1,8 @@
 # pylint:disable=unused-import
-from ..models import DbCFGModel, DbKnowledgeBase
-from ...knowledge_plugins.cfg.cfg_model import CFGModel
+from __future__ import annotations
+
+from angr.angrdb.models import DbCFGModel
+from angr.knowledge_plugins.cfg.cfg_model import CFGModel
 
 
 class CFGModelSerializer:
@@ -33,10 +35,8 @@ class CFGModelSerializer:
 
     @staticmethod
     def load(session, db_kb, ident, cfg_manager, loader=None):
-
-        db_cfg = session.query(DbCFGModel).filter_by(kb=db_kb, ident=ident).scalar()  # type: DbCFGModel
+        db_cfg: DbCFGModel = session.query(DbCFGModel).filter_by(kb=db_kb, ident=ident).scalar()
         if db_cfg is None:
             return None
 
-        cfg_model = CFGModel.parse(db_cfg.blob, cfg_manager=cfg_manager, loader=loader)
-        return cfg_model
+        return CFGModel.parse(db_cfg.blob, cfg_manager=cfg_manager, loader=loader)

@@ -1,4 +1,7 @@
-from . import SimConcretizationStrategy
+from __future__ import annotations
+
+from .base import SimConcretizationStrategy
+
 
 class SimConcretizationStrategyUnlimitedRange(SimConcretizationStrategy):
     """
@@ -6,7 +9,7 @@ class SimConcretizationStrategyUnlimitedRange(SimConcretizationStrategy):
     within the limit.
     """
 
-    def __init__(self, limit, **kwargs): #pylint:disable=redefined-builtin
+    def __init__(self, limit, **kwargs):  # pylint:disable=redefined-builtin
         super().__init__(**kwargs)
         self._limit = limit
 

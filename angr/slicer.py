@@ -1,10 +1,23 @@
+# pylint:disable=no-self-use
+from __future__ import annotations
 
 import pyvex
 
 from .errors import SimSlicerError
 
 
-class SimLightState(object):
+class SimLightState:
+    """
+    Represents a program state. Only used in SimSlicer.
+    """
+
+    __slots__ = (
+        "options",
+        "regs",
+        "stack_offsets",
+        "temps",
+    )
+
     def __init__(self, temps=None, regs=None, stack_offsets=None, options=None):
         self.temps = temps if temps is not None else set()
         self.regs = regs if regs is not None else set()
@@ -12,12 +25,22 @@ class SimLightState(object):
         self.options = {} if options is None else options
 
 
-class SimSlicer(object):
+class SimSlicer:
     """
     A super lightweight intra-IRSB slicing class.
     """
-    def __init__(self, arch, statements, target_tmps=None, target_regs=None, target_stack_offsets=None,
-                 inslice_callback=None, inslice_callback_infodict=None):
+
+    def __init__(
+        self,
+        arch,
+        statements,
+        target_tmps=None,
+        target_regs=None,
+        target_stack_offsets=None,
+        inslice_callback=None,
+        inslice_callback_infodict=None,
+        include_imarks: bool = True,
+    ):
         self._arch = arch
         self._statements = statements
         self._target_tmps = target_tmps if target_tmps is not None else set()
@@ -25,18 +48,21 @@ class SimSlicer(object):
         self._target_stack_offsets = target_stack_offsets if target_stack_offsets is not None else set()
 
         self._inslice_callback = inslice_callback
+        self._include_imarks = include_imarks
 
         # It could be accessed publicly
         self.inslice_callback_infodict = inslice_callback_infodict
 
-        self.stmts = [ ]
-        self.stmt_indices = [ ]
+        self.stmts = []
+        self.stmt_indices = []
         self.final_regs = set()
         self.final_stack_offsets = set()
 
         if not self._target_tmps and not self._target_regs and not self._target_stack_offsets:
-            raise SimSlicerError('You must specify at least one of the following: "'
-                                 'target temps, target registers, and/or target stack offsets.')
+            raise SimSlicerError(
+                'You must specify at least one of the following: "'
+                "target temps, target registers, and/or target stack offsets."
+            )
 
         # convert target registers to base registers
         target_base_regs = set()
@@ -48,7 +74,7 @@ class SimSlicer(object):
                 target_base_regs.add(base_reg[0])
         self._target_regs = target_base_regs
 
-        self._aliases = { }
+        self._aliases = {}
 
         self._alias_analysis()
         self._slice()
@@ -69,16 +95,17 @@ class SimSlicer(object):
         state = SimLightState(
             regs={
                 self._arch.sp_offset: self._arch.initial_sp,
-                self._arch.bp_offset: self._arch.initial_sp + 0x2000, # TODO: take care of the relation between sp and bp
+                # TODO: take care of the relation between sp and bp
+                self._arch.bp_offset: self._arch.initial_sp + 0x2000,
             },
             temps={},
             options={
-            'mock_sp': mock_sp,
-            'mock_bp': mock_bp,
-            }
+                "mock_sp": mock_sp,
+                "mock_bp": mock_bp,
+            },
         )
 
-        for stmt_idx, stmt in list(enumerate(self._statements)):
+        for stmt in self._statements:
             self._forward_handler_stmt(stmt, state)
 
     #
@@ -93,7 +120,7 @@ class SimSlicer(object):
         :return:
         """
 
-        funcname = "_forward_handler_stmt_%s" % type(stmt).__name__
+        funcname = f"_forward_handler_stmt_{type(stmt).__name__}"
 
         if hasattr(self, funcname):
             getattr(self, funcname)(stmt, state)
@@ -119,7 +146,7 @@ class SimSlicer(object):
         :return:
         """
 
-        funcname = "_forward_handler_expr_%s" % type(expr).__name__
+        funcname = f"_forward_handler_expr_{type(expr).__name__}"
 
         if hasattr(self, funcname):
             return getattr(self, funcname)(expr, state)
@@ -129,10 +156,9 @@ class SimSlicer(object):
     def _forward_handler_expr_Get(self, expr, state):
         reg = expr.offset
 
-        if state.options['mock_sp'] and reg == self._arch.sp_offset:
-            return state.regs[reg]
-
-        elif state.options['mock_bp'] and reg == self._arch.bp_offset:
+        if (state.options["mock_sp"] and reg == self._arch.sp_offset) or (
+            state.options["mock_bp"] and reg == self._arch.bp_offset
+        ):
             return state.regs[reg]
 
         return None
@@ -145,13 +171,11 @@ class SimSlicer(object):
 
         return None
 
-    def _forward_handler_expr_Const(self, expr, state):
-
+    def _forward_handler_expr_Const(self, expr, state):  # pylint:disable=unused-argument
         return expr.con.value
 
     def _forward_handler_expr_Binop(self, expr, state):
-
-        funcname = "_forward_handler_expr_binop_%s" % expr.op.strip("Iop_")
+        funcname = "_forward_handler_expr_binop_{}".format(expr.op.strip("Iop_"))
 
         if hasattr(self, funcname):
             op0_val = self._forward_handler_expr(expr.args[0], state)
@@ -161,13 +185,11 @@ class SimSlicer(object):
 
         return None
 
-    def _forward_handler_expr_binop_Add64(self, op0, op1, state):
+    def _forward_handler_expr_binop_Add64(self, op0, op1, state):  # pylint:disable=unused-argument
+        return (op0 + op1) & (2**64 - 1)
 
-        return (op0 + op1) & (2 ** 64 - 1)
-
-    def _forward_handler_expr_binop_Add32(self, op0, op1, state):
-
-        return (op0 + op1) & (2 ** 32 - 1)
+    def _forward_handler_expr_binop_Add32(self, op0, op1, state):  # pylint:disable=unused-argument
+        return (op0 + op1) & (2**32 - 1)
 
     #
     # Backward slicing
@@ -203,13 +225,17 @@ class SimSlicer(object):
     #
 
     def _backward_handler_stmt(self, stmt, state):
-        funcname = "_backward_handler_stmt_%s" % type(stmt).__name__
+        funcname = f"_backward_handler_stmt_{type(stmt).__name__}"
 
         in_slice = False
         if hasattr(self, funcname):
             in_slice = getattr(self, funcname)(stmt, state)
 
         return in_slice
+
+    def _backward_handler_stmt_IMark(self, stmt, state) -> bool:  # pylint:disable=unused-argument
+        # include all IMark statements
+        return self._include_imarks
 
     def _backward_handler_stmt_WrTmp(self, stmt, state):
         tmp = stmt.tmp
@@ -223,7 +249,7 @@ class SimSlicer(object):
 
         return True
 
-    def _backward_handler_stmt_Put(self, stmt : pyvex.IRStmt.Put, state):
+    def _backward_handler_stmt_Put(self, stmt: pyvex.IRStmt.Put, state):
         reg = stmt.offset
         # convert it to its base register
         base_reg = self._arch.get_base_register(reg)
@@ -237,11 +263,9 @@ class SimSlicer(object):
 
             return True
 
-        else:
-            return False
+        return False
 
     def _backward_handler_stmt_Store(self, stmt, state):
-
         addr = stmt.addr
 
         if type(addr) is pyvex.IRExpr.RdTmp:
@@ -261,7 +285,6 @@ class SimSlicer(object):
         return False
 
     def _backward_handler_stmt_LoadG(self, expr, state):
-
         if expr.dst not in state.temps:
             return False
 
@@ -278,7 +301,7 @@ class SimSlicer(object):
     #
 
     def _backward_handler_expr(self, expr, state):
-        funcname = "_backward_handler_expr_%s" % type(expr).__name__
+        funcname = f"_backward_handler_expr_{type(expr).__name__}"
         if hasattr(self, funcname):
             getattr(self, funcname)(expr, state)
 
@@ -315,19 +338,16 @@ class SimSlicer(object):
             self._backward_handler_expr(arg, state)
 
     def _backward_handler_expr_CCall(self, expr, state):
-
         for arg in expr.args:
             if type(arg) is pyvex.IRExpr.RdTmp:
                 self._backward_handler_expr(arg, state)
 
     def _backward_handler_expr_Binop(self, expr, state):
-
         for arg in expr.args:
             if type(arg) is pyvex.IRExpr.RdTmp:
                 self._backward_handler_expr(arg, state)
 
     def _backward_handler_expr_ITE(self, expr, state):
-
         self._backward_handler_expr(expr.cond, state)
         self._backward_handler_expr(expr.iftrue, state)
         self._backward_handler_expr(expr.iffalse, state)

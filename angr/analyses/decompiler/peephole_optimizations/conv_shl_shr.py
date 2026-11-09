@@ -1,4 +1,6 @@
-from ailment.expression import Convert, BinaryOp, Const
+from __future__ import annotations
+
+from angr.ailment.expression import BinaryOp, Const, Convert
 
 from .base import PeepholeOptimizationExprBase
 
@@ -7,10 +9,9 @@ class ConvShlShr(PeepholeOptimizationExprBase):
     __slots__ = ()
 
     NAME = "(expr << P) >> Q => (expr & mask) >> R"
-    expr_classes = (BinaryOp, )  # all expressions are allowed
+    expr_classes = (BinaryOp,)  # all expressions are allowed
 
-    def optimize(self, expr: BinaryOp):
-
+    def optimize(self, expr: BinaryOp, **kwargs):
         # (Conv(M->N, expr) << P) >> Q  ==>  (Conv(M->N, expr) & bitmask) >> (Q-P), where
         #       Q >= P, and
         #       M < N, and
@@ -27,23 +28,21 @@ class ConvShlShr(PeepholeOptimizationExprBase):
                     if m < n and n >= p:
                         bitmask = (1 << (n - p)) - 1
                         and_expr = BinaryOp(
-                            None,
-                            'And',
+                            self.manager.next_atom(),
+                            "And",
                             (
                                 Convert(expr_a.idx, m, n, False, expr_a.operand, **expr_a.tags),
-                                Const(None, None, bitmask, n),
+                                Const(self.manager.next_atom(), bitmask, n),
                             ),
                             False,
-                            variable=None,
-                            variable_offset=None,
                             **expr.tags,
                         )
                         return BinaryOp(
-                            None,
-                            'Shr',
+                            self.manager.next_atom(),
+                            "Shr",
                             (
                                 and_expr,
-                                Const(None, None, q - p, and_expr.bits),
+                                Const(self.manager.next_atom(), q - p, and_expr.bits),
                             ),
                             False,
                             **expr.tags,

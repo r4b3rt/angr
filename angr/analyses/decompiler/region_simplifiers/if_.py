@@ -1,11 +1,18 @@
 # pylint:disable=unused-argument,arguments-differ
+from __future__ import annotations
+
 import logging
 
-import ailment
-
-from ..sequence_walker import SequenceWalker
-from ..structurer_nodes import SequenceNode, CodeNode, MultiNode, LoopNode, ConditionNode, CascadingConditionNode
-
+from angr import ailment
+from angr.analyses.decompiler.sequence_walker import SequenceWalker
+from angr.analyses.decompiler.structurer_nodes import (
+    CascadingConditionNode,
+    CodeNode,
+    ConditionNode,
+    LoopNode,
+    MultiNode,
+    SequenceNode,
+)
 
 l = logging.getLogger(name=__name__)
 
@@ -36,7 +43,7 @@ class IfSimplifier(SequenceWalker):
         :return:
         """
 
-        for n0, n1 in zip(node.nodes, node.nodes[1:] + [successor]):
+        for n0, n1 in zip(node.nodes, [*node.nodes[1:], successor]):
             self._handle(n0, successor=n1)
 
     def _handle_codenode(self, node, successor=None, **kwargs):
@@ -62,11 +69,10 @@ class IfSimplifier(SequenceWalker):
             self._handle(node.false_node, successor=successor)
 
     def _handle_cascadingconditionnode(self, node: CascadingConditionNode, successor=None, **kwargs):
-
         for _, child_node in node.condition_and_nodes:
             self._handle(child_node, successor=successor)
         if node.else_node is not None:
-            self._handle(node.else_node,successor=successor)
+            self._handle(node.else_node, successor=successor)
 
     def _handle_loopnode(self, node, successor=None, **kwargs):
         """
@@ -85,7 +91,7 @@ class IfSimplifier(SequenceWalker):
         :return:
         """
 
-        for n0, n1 in zip(node.nodes, node.nodes[1:] + [successor]):
+        for n0, n1 in zip(node.nodes, [*node.nodes[1:], successor]):
             self._handle(n0, successor=n1)
 
     def _handle_block(self, block, successor=None, **kwargs):  # pylint:disable=no-self-use
@@ -98,35 +104,31 @@ class IfSimplifier(SequenceWalker):
 
         if block.statements and isinstance(block.statements[-1], ailment.Stmt.ConditionalJump):
             cond_stmt = block.statements[-1]  # ailment.Stmt.ConditionalJump
-            if isinstance(successor, ConditionNode):
-                true_cond = False
-                if cond_stmt.true_target is not None and successor.true_node is not None:
-                    # True branch exists. Test if the true target is the address
-                    if isinstance(cond_stmt.true_target, ailment.Expr.Const) \
-                            and cond_stmt.true_target.value == successor.true_node.addr:
-                        true_cond = True
-                if cond_stmt.true_target is not None and successor.false_node is not None:
-                    # True branch exists. Test if the true target is the address
-                    if isinstance(cond_stmt.true_target, ailment.Expr.Const) \
-                            and cond_stmt.true_target.value == successor.false_node.addr:
-                        true_cond = True
-
-                false_cond = False
-                if cond_stmt.false_target is not None and successor.false_node is not None:
-                    # False branch exists. Test if the false target is the address
-                    if isinstance(cond_stmt.true_target, ailment.Expr.Const) \
-                            and cond_stmt.false_target.value == successor.false_node.addr:
-                        false_cond = True
-                if cond_stmt.false_target is not None and successor.true_node is not None:
-                    # True branch exists. Test if the true target is the address
-                    if isinstance(cond_stmt.true_target, ailment.Expr.Const) \
-                            and cond_stmt.false_target.value == successor.true_node.addr:
-                        false_cond = True
-
-                if true_cond or false_cond:
-                    # We can safely remove this statement
-                    block.statements = block.statements[:-1]
-                else:
-                    l.error("An unexpected successor %s follows the conditional statement %s.",
-                            successor, cond_stmt
+            if (
+                isinstance(successor, ConditionNode)
+                and isinstance(cond_stmt.true_target, ailment.Expr.Const)
+                and (
+                    (
+                        (successor.true_node is not None and cond_stmt.true_target.value == successor.true_node.addr)
+                        or (
+                            successor.false_node is not None
+                            and cond_stmt.true_target.value == successor.false_node.addr
+                        )
+                    )
+                    or (
+                        cond_stmt.false_target is not None
+                        and (
+                            (
+                                successor.false_node is not None
+                                and cond_stmt.false_target.value == successor.false_node.addr
                             )
+                            or (
+                                successor.true_node is not None
+                                and cond_stmt.false_target.value == successor.true_node.addr
+                            )
+                        )
+                    )
+                )
+            ):
+                # We can safely remove this statement
+                block.statements = block.statements[:-1]

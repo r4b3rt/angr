@@ -1,16 +1,52 @@
+from __future__ import annotations
 
-from .functions import FunctionManager, Function
-from .variables import VariableManager
-from .comments import Comments
-from .data import Data
-from .indirect_jumps import IndirectJumps
-from .labels import Labels
+from .bookmarks import Bookmark, Bookmarks
+from .callsite_prototypes import CallsitePrototypes
 from .cfg import CFGManager
-from .xrefs import XRefManager
-from .plugin import KnowledgeBasePlugin
-from .sync import SyncController
-from .patches import PatchManager
+from .comments import Comment, CommentKind, Comments
+from .custom_strings import CustomStrings
+from .data import Data
+from .debug_variables import DebugVariableManager
+from .functions import Function, FunctionManager
+from .indirect_jumps import IndirectJumps
 from .key_definitions import KeyDefinitionManager
-from .propagations import Propagations
+from .labels import Labels
+from .obfuscations import Obfuscations
+from .patches import PatchManager
+from .patterns import Patterns, StoredPattern
+from .plugin import KnowledgeBasePlugin
+from .propagations import PropagationManager
+from .rtdb import RuntimeDb
 from .structured_code import StructuredCodeManager
 from .types import TypesStore
+from .variables import VariableManager
+from .xrefs import XRefManager
+
+__all__ = (
+    "Bookmark",
+    "Bookmarks",
+    "CFGManager",
+    "CallsitePrototypes",
+    "Comment",
+    "CommentKind",
+    "Comments",
+    "CustomStrings",
+    "Data",
+    "DebugVariableManager",
+    "Function",
+    "FunctionManager",
+    "IndirectJumps",
+    "KeyDefinitionManager",
+    "KnowledgeBasePlugin",
+    "Labels",
+    "Obfuscations",
+    "PatchManager",
+    "Patterns",
+    "PropagationManager",
+    "RuntimeDb",
+    "StoredPattern",
+    "StructuredCodeManager",
+    "TypesStore",
+    "VariableManager",
+    "XRefManager",
+)

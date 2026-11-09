@@ -1,39 +1,126 @@
-# pylint:disable=no-member,raise-missing-from
+# pylint:disable=no-member,raise-missing-from,protected-access
+from __future__ import annotations
+
+import json
 import logging
-import pickle
+from typing import TYPE_CHECKING
 
-from collections import defaultdict
+import angr
+from angr.calling_conventions import CC_NAMES, SimCC, SimCCUsercall
+from angr.enums import Flavors
+from angr.protos import function_pb2
+from angr.rustylib.function_graph import FunctionGraph  # pylint:disable=import-error,no-name-in-module
+from angr.sim_type import SimType, SimTypeFunction
+from angr.utils.types import make_type_reference, type_collections_for_lib
 
-from ...codenode import BlockNode, HookNode
-from ...utils.enums_conv import func_edge_type_to_pb, func_edge_type_from_pb
-from ...protos import primitives_pb2, function_pb2
+if TYPE_CHECKING:
+    from .function import PrototypeSource
 
 l = logging.getLogger(name=__name__)
+
+# Function.info is tiny and highly repetitive (e.g. {"bp_as_gpr": true}); memoize its decoding across loads.
+# Only flat dicts of immutable values are cached, so a shallow copy fully isolates each Function's info.
+_INFO_SCALARS = (str, int, float, bool, type(None))
+_INFO_CACHE_MAX = 256
+_info_cache: dict[bytes, dict] = {}
+
+
+def _decode_info(raw: bytes) -> dict:
+    cached = _info_cache.get(raw)
+    if cached is not None:
+        return cached.copy()
+    data = json.loads(raw.decode("utf-8"))
+    if (
+        isinstance(data, dict)
+        and len(_info_cache) < _INFO_CACHE_MAX
+        and all(isinstance(v, _INFO_SCALARS) for v in data.values())
+    ):
+        _info_cache[raw] = data.copy()
+    return data
+
+
+_prototype_sources: dict[int, PrototypeSource] = {}
+
+
+def _prototype_source(value: int) -> PrototypeSource:
+    source = _prototype_sources.get(value)
+    if source is None:
+        source = angr.knowledge_plugins.functions.PrototypeSource(value)
+        _prototype_sources[value] = source
+    return source
+
+
+class CallingConventionSerializer:
+    """
+    Serialize/deserialize SimCC classes.
+    """
+
+    @staticmethod
+    def to_json(cc: SimCC) -> dict:
+        if isinstance(cc, SimCCUsercall):
+            return {
+                "t": "SimCCUsercall",
+                # TODO: Deserialize the rest of the fields
+            }
+        if cc.x87_args:
+            return {"t": cc.__class__.__name__, "x87_args": cc.x87_args}
+        return {"t": cc.__class__.__name__}
+
+    @staticmethod
+    def from_json(data: dict, arch) -> SimCC | None:
+        cc_type = data.get("t")
+        if cc_type == "SimCCUsercall":
+            return SimCCUsercall(arch, [], None)  # TODO: Deserialize the rest of the fields
+        if cc_type not in CC_NAMES:
+            l.warning("Unknown calling convention type %s", cc_type)
+            return None
+        cc = CC_NAMES[cc_type](arch)
+        cc.x87_args = data.get("x87_args", 0)
+        return cc
 
 
 class FunctionParser:
     """
     The implementation of the serialization methods for the <Function> class.
     """
+
     @staticmethod
     def serialize(function):
         """
         :return :
         """
-        # delayed import
-        from .function import Function  # pylint:disable=import-outside-toplevel
-
-        obj = Function._get_cmsg()
+        obj = angr.knowledge_plugins.Function._get_cmsg()
         obj.ea = function.addr
         obj.is_entrypoint = False  # TODO: Set this up accordingly
         obj.name = function.name
+        obj.is_default_name = function.is_default_name
         obj.is_plt = function.is_plt
         obj.is_syscall = function.is_syscall
         obj.is_simprocedure = function.is_simprocedure
-        obj.returning = function.returning
-        obj.alignment = function.alignment
-        obj.binary_name = function.binary_name
+        if function.returning is not None:
+            obj.returning = function.returning
+        obj.alignment = function.is_alignment
+        obj.binary_name = function.binary_name or ""
         obj.normalized = function.normalized
+        obj.calling_convention = (
+            json.dumps(CallingConventionSerializer.to_json(function.calling_convention)).encode("utf-8")
+            if function.calling_convention is not None
+            else b""
+        )
+        obj.prototype = FunctionParser._serialize_prototype(function.prototype, function.prototype_libname)
+        obj.prototype_libname = (function.prototype_libname or "").encode()
+        obj.prototype_source = function.prototype_source.value
+        # the default-flavor prototype lives in the fields above; every other flavor is stored separately
+        for flavor, proto in function.prototypes.items():
+            if flavor == Flavors.DEFAULT_FLAVOR:
+                continue
+            flavored = obj.flavored_prototypes.add()
+            flavored.flavor = flavor
+            flavored.prototype = FunctionParser._serialize_prototype(proto, function.prototype_libname)
+            flavored.prototype_source = function.prototype_sources[flavor].value
+        obj.info = function.info.to_json().encode("utf-8") if function.info else b""
+        obj.ran_cca = function.ran_cca
+        obj.previous_names.extend(function.previous_names)
 
         # signature matched?
         if not function.from_signature:
@@ -42,231 +129,133 @@ class FunctionParser:
             if function.from_signature == "flirt":
                 obj.matched_from = function_pb2.Function.FLIRT
             else:
-                raise ValueError(f"Cannot convert from_signature {function.from_signature} into a SignatureSource "
-                                 f"enum.")
+                raise ValueError(
+                    f"Cannot convert from_signature {function.from_signature} into a SignatureSource enum."
+                )
 
-        # blocks
-        blocks_list = [ b.serialize_to_cmessage() for b in function.blocks ]
-        obj.blocks.extend(blocks_list)  # pylint:disable=no-member
-
-        block_addrs_set = function.block_addrs_set
-        # graph
-        edges = []
-        external_addrs = set()
-        TRANSITION_JK = func_edge_type_to_pb('transition')  # default edge type
-        for src, dst, data in function.transition_graph.edges(data=True):
-            edge = primitives_pb2.Edge()
-            edge.src_ea = src.addr
-            edge.dst_ea = dst.addr
-            if src.addr not in block_addrs_set:
-                # this is a Block in another function, or just another Function instance.
-                external_addrs.add(src.addr)
-            if dst.addr not in block_addrs_set:
-                external_addrs.add(dst.addr)
-            edge.jumpkind = TRANSITION_JK
-            for key, value in data.items():
-                if key == "type":
-                    edge.jumpkind = func_edge_type_to_pb(value)
-                elif key == "ins_addr":
-                    if value is not None:
-                        edge.ins_addr = value
-                elif key == "stmt_idx":
-                    if value is not None:
-                        edge.stmt_idx = value
-                elif key == "outside":
-                    edge.is_outside = value
-                else:
-                    edge.data[key] = pickle.dumps(value)  # pylint:disable=no-member
-            edges.append(edge)
-        obj.graph.edges.extend(edges)  # pylint:disable=no-member
-        # referenced functions
-        obj.external_functions.extend(external_addrs)  # pylint:disable=no-member
+        obj.graph_blob = function._graph.to_bytes()
 
         return obj
 
     @staticmethod
-    def parse_from_cmsg(cmsg, function_manager=None, project=None, all_func_addrs=None):
+    def local_block_addrs_from_cmsg(cmsg) -> set[int]:
         """
-        :param cmsg: The data to instanciate the <Function> from.
+        Get the addresses of the local blocks of a serialized function without building the Function object.
+        """
+        if cmsg.graph_blob:
+            return set(FunctionGraph.local_block_addrs_from_bytes(cmsg.graph_blob))
+        from angr.angrdb.v1 import AngrDbV1  # pylint:disable=import-outside-toplevel
+
+        return AngrDbV1.local_block_addrs(cmsg)
+
+    @staticmethod
+    def _serialize_prototype(proto: SimTypeFunction | None, libname: str | None) -> bytes:
+        if proto is None:
+            return b""
+        # convert library-defined structs in the prototype to typerefs; Function dereferences them lazily
+        prototype_ref = make_type_reference(proto, type_collections=type_collections_for_lib(libname))
+        return json.dumps(prototype_ref.to_json()).encode("utf-8")
+
+    @staticmethod
+    def _parse_prototype(raw: bytes, project) -> SimTypeFunction | None:
+        if not raw:
+            return None
+        proto = SimType.from_json(json.loads(raw.decode("utf-8")))
+        if not isinstance(proto, SimTypeFunction):
+            l.warning("Unexpected type of function prototype deserialized: %s", type(proto))
+            return None
+        if project is None:
+            return None  # we cannot assign an arch-less prototype to a function
+        return proto.with_arch(project.arch)
+
+    @staticmethod
+    def parse_from_cmsg(cmsg, function_manager=None, project=None, meta_only: bool = False):
+        """
+        :param cmsg: The data to instantiate the <Function> from.
 
         :return Function:
         """
-        # delayed import
-        from .function import Function  # pylint:disable=import-outside-toplevel
+        proto = FunctionParser._parse_prototype(cmsg.prototype, project)
 
-        obj = Function(
+        cc = (
+            CallingConventionSerializer.from_json(json.loads(cmsg.calling_convention.decode("utf-8")), project.arch)
+            if cmsg.calling_convention and project is not None
+            else None
+        )
+
+        returning = None
+        if cmsg.HasField("returning"):
+            returning = cmsg.returning
+
+        if cmsg.graph_blob:
+            graph = FunctionGraph.from_bytes(cmsg.graph_blob)
+            if graph.func_addr != cmsg.ea:
+                raise ValueError(f"Function graph of {graph.func_addr:#x} stored under {cmsg.ea:#x}")
+        else:
+            graph = FunctionGraph(cmsg.ea)
+
+        # every stored field is known, so skip Function.__init__ (which would derive them from the project again)
+        function_cls = angr.knowledge_plugins.functions.Function
+        obj = function_cls.__new__(function_cls)
+        obj._init_slots(
             function_manager,
             cmsg.ea,
-            name=cmsg.name,
-            is_plt=cmsg.is_plt,
-            syscall=cmsg.is_syscall,
-            is_simprocedure=cmsg.is_simprocedure,
-            returning=cmsg.returning,
-            alignment=cmsg.alignment,
-            binary_name=cmsg.binary_name,
+            graph,
+            cc,
+            proto,
+            cmsg.prototype_libname or None,
+            _prototype_source(cmsg.prototype_source),
+            cmsg.alignment,
         )
+        obj._is_syscall = cmsg.is_syscall
+        obj._is_simprocedure = cmsg.is_simprocedure
+        obj._is_plt = cmsg.is_plt
+        obj._name = cmsg.name
+        obj.binary_name = cmsg.binary_name or obj._get_initial_binary_name()
+        if returning is not None:
+            obj.returning = returning
+        for flavored in cmsg.flavored_prototypes:
+            obj.set_prototype(
+                flavored.flavor,
+                FunctionParser._parse_prototype(flavored.prototype, project),
+                source=_prototype_source(flavored.prototype_source),
+            )
+        if cmsg.is_syscall or cmsg.is_simprocedure:
+            # a SimProcedure (or syscall) overrides the stored prototype and calling convention
+            obj._init_prototype_and_calling_convention()
         obj._project = project
         obj.normalized = cmsg.normalized
+        if cmsg.info:
+            info = _decode_info(cmsg.info)
+            obj._info.data = info
+            if function_manager is not None:
+                for key, value in info.items():
+                    if key.startswith("is_") and value is True:
+                        function_manager.add_key_func_addr(key[3:], cmsg.ea)
+        obj.is_default_name = cmsg.is_default_name
+        obj.ran_cca = cmsg.ran_cca
+        obj.previous_names = list(cmsg.previous_names)
 
         # signature matched?
+        # set the backing slot directly so that loading a function from LMDB does not mark it dirty or
+        # trigger the FunctionManager cache hook
         if cmsg.matched_from == function_pb2.Function.UNMATCHED:
-            obj.from_signature = None
+            obj._from_signature = None
         elif cmsg.matched_from == function_pb2.Function.FLIRT:
-            obj.from_signature = "flirt"
+            obj._from_signature = "flirt"
         else:
             raise ValueError(f"Cannot convert SignatureSource enum {cmsg.matched_from} to Function.from_signature.")
 
-        # blocks
-        blocks = {}
-        for b in cmsg.blocks:
-            if project is not None and project.is_hooked(b.ea):
-                # create a HookNode
-                block = HookNode(b.ea, 0, project.hooked_by(b.ea))
+        if cmsg.graph_blob:
+            obj._block_addrs_cache = None
+            if meta_only:
+                obj.meta_only = True  # can't be serialized again when evicted from the cache
             else:
-                block = BlockNode(b.ea, b.size, bytestr=b.bytes)
-            blocks[block.addr] = block
-        external_addrs = set(cmsg.external_functions)  # addresses of referenced blocks or nodes that are not inside
-                                                       # the current function
+                obj.update_func_block_count()
+            obj._dirty = False
+            return obj
 
-        # edges
-        edges = {}
-        fake_return_edges = defaultdict(list)
-        for edge_cmsg in cmsg.graph.edges:
-            try:
-                src = FunctionParser._get_block_or_func(
-                    edge_cmsg.src_ea,
-                    blocks,
-                    external_addrs,
-                    function_manager,
-                    project,
-                    all_func_addrs=all_func_addrs,
-                )
-            except KeyError:
-                raise KeyError("Address of the edge source %#x is not found." % edge_cmsg.src_ea)
+        # Fall back to angrDb V1 legacy function record.
+        from angr.angrdb.v1 import AngrDbV1  # pylint:disable=import-outside-toplevel
 
-            edge_type = func_edge_type_from_pb(edge_cmsg.jumpkind)
-            assert edge_type is not None
-
-            dst = None
-            dst_addr = edge_cmsg.dst_ea
-            if dst_addr not in blocks:
-                if (edge_type == 'call' # call has to go to either a HookNode or a function
-                    or (all_func_addrs is not None and dst_addr in all_func_addrs)  # jumps to another function
-                ):
-                    if function_manager is not None:
-                        # get a function
-                        dst = FunctionParser._get_func(dst_addr, function_manager)
-                    else:
-                        l.warning("About to get or create a function at %#x, but function_manager is not provided. "
-                                  "Will create a block instead.", dst_addr)
-
-            if dst is None:
-                # create a block instead
-                try:
-                    dst = FunctionParser._get_block_or_func(
-                        dst_addr,
-                        blocks,
-                        external_addrs,
-                        function_manager,
-                        project,
-                        all_func_addrs=all_func_addrs,
-                    )
-                except KeyError:
-                    raise KeyError("Address of the edge destination %#x is not found." % edge_cmsg.dst_ea)
-
-            data = dict((k, pickle.loads(v)) for k, v in edge_cmsg.data.items())
-            data['outside'] = edge_cmsg.is_outside
-            data['ins_addr'] = edge_cmsg.ins_addr
-            data['stmt_idx'] = edge_cmsg.stmt_idx
-            if edge_type == 'fake_return':
-                fake_return_edges[edge_cmsg.src_ea].append((src, dst, data))
-            else:
-                edges[(edge_cmsg.src_ea, dst_addr, edge_type)] = (src, dst, data)
-
-        added_nodes = set()
-        for k, v in edges.items():
-            src_addr, dst_addr, edge_type = k
-            src, dst, data = v
-
-            outside = data.get('outside', False)
-            ins_addr = data.get('ins_addr', None)
-            stmt_idx = data.get('stmt_idx', None)
-            added_nodes.add(src)
-            added_nodes.add(dst)
-            if edge_type in ('transition', 'exception'):
-                obj._transit_to(src, dst, outside=outside, ins_addr=ins_addr, stmt_idx=stmt_idx,
-                                is_exception=edge_type == 'exception')
-            elif edge_type == 'call':
-                # find the corresponding fake_ret edge
-                fake_ret_edge = next(iter(edge_ for edge_ in fake_return_edges[src_addr]
-                                          if edge_[1].addr == src.addr + src.size), None)
-                if dst is None:
-                    l.warning("The destination function %#x does not exist, and it cannot be created since function "
-                              "manager is not provided. Please consider passing in a function manager to rebuild this "
-                              "graph.", dst_addr)
-                else:
-                    if isinstance(dst, Function):
-                        obj._call_to(src, dst, None if fake_ret_edge is None else fake_ret_edge[1],
-                                     stmt_idx=stmt_idx,
-                                     ins_addr=ins_addr,
-                                     return_to_outside=fake_ret_edge is None,
-                                     )
-                    if fake_ret_edge is not None:
-                        fakeret_src, fakeret_dst, fakeret_data = fake_ret_edge
-                        added_nodes.add(fakeret_dst)
-                        obj._fakeret_to(fakeret_src, fakeret_dst,
-                                        confirmed=fakeret_data.get('confirmed'),
-                                        to_outside=fakeret_data.get('outside', None))
-            elif edge_type == 'fake_return':
-                pass
-
-        # add leftover blocks
-        for block in blocks.values():
-            if block not in added_nodes:
-                obj._register_nodes(True, block)
-
-        return obj
-
-    @staticmethod
-    def _get_block_or_func(addr, blocks, external_addrs, function_manager, project, all_func_addrs=None):
-
-        # should we get a block or a function?
-        try:
-            r = blocks[addr]
-            # it's a block. just return it
-            return r
-        except KeyError:
-            pass
-
-        if addr in external_addrs:
-            if project is not None and project.is_hooked(addr):
-                # get a hook node instead
-                r = HookNode(addr, 0, project.hooked_by(addr))
-                return r
-            if all_func_addrs is not None and addr in all_func_addrs:
-                # get a function (which is yet to be created in the function manager)
-                r = function_manager.function(addr=addr, create=True)
-                return r
-            else:
-                # create a block
-                # TODO: We are deciding the size by re-lifting the block from project. This is usually fine except for
-                # TODO: the cases where the block does not exist in project (e.g., when the block was dynamically
-                # TODO: created). The correct solution is to store the size and bytes of the block, too.
-                if project is not None:
-                    block = project.factory.block(addr)
-                    block_size = block.size
-                    bytestr = block.bytes
-                else:
-                    l.warning("The Project instance is not specified. Use a dummy block size of 1 byte for block %#x.",
-                              addr)
-                    block_size = 1
-                    bytestr = b"\x00"
-                r = BlockNode(addr, block_size, bytestr=bytestr)
-                return r
-        raise ValueError("Unsupported case: The block %#x is not in external_addrs and is not in local blocks. "
-                         "This probably indicates a bug in angrdb generation.")
-
-    @staticmethod
-    def _get_func(addr, function_manager):
-        func = function_manager.function(addr=addr, create=True)
-        return func
+        return AngrDbV1.parse_function(cmsg, obj, project, meta_only)

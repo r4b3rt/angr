@@ -1,31 +1,32 @@
+from __future__ import annotations
 
 import logging
 
-from .plugin import SimStatePlugin
+from angr.sim_state import SimState
+
+from .plugin import SimStatePlugin, SupportsMerge
 
 l = logging.getLogger(name=__name__)
 
 
-class SimStateGlobals(SimStatePlugin):
+class SimStateGlobals(SimStatePlugin, SupportsMerge):
     def __init__(self, backer=None):
-        super(SimStateGlobals, self).__init__()
+        super().__init__()
         self._backer = backer if backer is not None else {}
 
     def set_state(self, state):
         pass
 
-    def merge(self, others, merge_conditions, common_ancestor=None): # pylint: disable=unused-argument
-
+    def merge(self, others, merge_conditions, common_ancestor=None):  # pylint: disable=unused-argument
         for other in others:
-            for k in other.keys():
+            for k in other:
                 if k not in self:
                     self[k] = other[k]
 
         return True
 
-    def widen(self, others): # pylint: disable=unused-argument
-        l.warning("Widening is unimplemented for globals")
-        return False
+    def __iter__(self):
+        return iter(self._backer)
 
     def __getitem__(self, k):
         return self._backer[k]
@@ -55,9 +56,8 @@ class SimStateGlobals(SimStatePlugin):
         return self._backer.pop(k, alt)
 
     @SimStatePlugin.memo
-    def copy(self, memo):   # pylint: disable=unused-argument
+    def copy(self, memo):  # pylint: disable=unused-argument
         return SimStateGlobals(dict(self._backer))
 
 
-from angr.sim_state import SimState
-SimState.register_default('globals', SimStateGlobals)
+SimState.register_default("globals", SimStateGlobals)

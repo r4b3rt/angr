@@ -1,8 +1,8 @@
+from __future__ import annotations
 
+from . import constants, enums_conv, graph, lazy_import
+from .env import is_pyinstaller
 from .timing import timethis
-from . import graph
-from . import constants
-from . import enums_conv
 
 
 def looks_like_sql(s: str) -> bool:
@@ -13,7 +13,7 @@ def looks_like_sql(s: str) -> bool:
     :return:        True if the string looks like an SQL, False otherwise.
     """
 
-    sql_keywords = {'select', 'update', 'union', 'delete', 'from', 'table', 'insert', 'into'}
+    sql_keywords = {"select", "update", "union", "delete", "from", "table", "insert", "into"}
 
     s = s.lower()
     for k in sql_keywords:
@@ -25,8 +25,19 @@ def looks_like_sql(s: str) -> bool:
                 if before not in " /;":
                     continue
             # what's after k? is it a whitespace?
-            following = s[k_index + len(k) : ]
+            following = s[k_index + len(k) :]
             if not following or following.startswith(" "):
                 return True
 
     return False
+
+
+__all__ = (
+    "constants",
+    "enums_conv",
+    "graph",
+    "is_pyinstaller",
+    "lazy_import",
+    "looks_like_sql",
+    "timethis",
+)

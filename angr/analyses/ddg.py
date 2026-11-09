@@ -1,19 +1,27 @@
+from __future__ import annotations
+
 import logging
 from collections import defaultdict
 
 import networkx
 import pyvex
-from . import Analysis
 
-from ..code_location import CodeLocation
-from ..errors import SimSolverModeError, SimUnsatError, AngrDDGError
-from ..sim_variable import SimRegisterVariable, SimMemoryVariable, SimTemporaryVariable, SimConstantVariable, \
-    SimStackVariable
+from angr import claripy
+from angr.analyses.analysis import AnalysesHub, Analysis
+from angr.code_location import CodeLocation
+from angr.errors import AngrDDGError, SimSolverModeError, SimUnsatError
+from angr.sim_variable import (
+    SimConstantVariable,
+    SimMemoryVariable,
+    SimRegisterVariable,
+    SimStackVariable,
+    SimTemporaryVariable,
+)
 
 l = logging.getLogger(name=__name__)
 
 
-class AST(object):
+class AST:
     """
     A mini implementation for AST
     """
@@ -26,29 +34,27 @@ class AST(object):
         return hash((self.op, self.operands))
 
     def __eq__(self, other):
-        return type(other) is AST and \
-                other.op == self.op and \
-                other.operands == self.operands
+        return type(other) is AST and other.op == self.op and other.operands == self.operands
 
     def __repr__(self):
-
-        _short_repr = lambda a: a.short_repr
+        def _short_repr(a):
+            return a.short_repr
 
         if len(self.operands) == 1:
-            return "%s%s" % (self.op, _short_repr(self.operands[0]))
-        elif len(self.operands) == 2:
-            return "%s %s %s" % (_short_repr(self.operands[0]), self.op, _short_repr(self.operands[1]))
-        else:
-            return "%s (%s)" % (self.op, self.operands)
+            return f"{self.op}{_short_repr(self.operands[0])}"
+        if len(self.operands) == 2:
+            return f"{_short_repr(self.operands[0])} {self.op} {_short_repr(self.operands[1])}"
+        return f"{self.op} ({self.operands})"
 
 
-class ProgramVariable(object):
+class ProgramVariable:
     """
     Describes a variable in the program at a specific location.
 
     :ivar SimVariable variable: The variable.
     :ivar CodeLocation location: Location of the variable.
     """
+
     def __init__(self, variable, location, initial=False, arch=None):
         self.variable = variable
         self.location = location
@@ -69,33 +75,34 @@ class ProgramVariable(object):
 
     def __repr__(self):
         if self._arch is not None:
-            s = "{%s @ %s}" % (self.variable, self.location)
+            s = f"{{{self.variable} @ {self.location}}}"
         else:
-            s = "{%s @ %s}" % (self.variable, self.location)
+            s = f"{{{self.variable} @ {self.location}}}"
         return s
 
     @property
     def short_repr(self):
         if self._arch is not None:
-            s = "{%s@%s}" % (self.variable, self.location.short_repr)
+            s = f"{{{self.variable}@{self.location.short_repr}}}"
         else:
-            s = "{%s@%s}" % (self.variable, self.location.short_repr)
+            s = f"{{{self.variable}@{self.location.short_repr}}}"
         return s
 
 
-class DDGJob(object):
+class DDGJob:
     def __init__(self, cfg_node, call_depth):
         self.cfg_node = cfg_node
         self.call_depth = call_depth
 
     def __repr__(self):
-        return "<DDGJob %s, call_depth %d>" % (self.cfg_node, self.call_depth)
+        return f"<DDGJob {self.cfg_node}, call_depth {self.call_depth}>"
 
 
 class LiveDefinitions:
     """
     A collection of live definitions with some handy interfaces for definition killing and lookups.
     """
+
     def __init__(self):
         """
         Constructor.
@@ -154,7 +161,7 @@ class LiveDefinitions:
         Add a new definition of variable.
 
         :param SimVariable variable: The variable being defined.
-        :param CodeLocation location: Location of the varaible being defined.
+        :param CodeLocation location: Location of the variable being defined.
         :param int size_threshold: The maximum bytes to consider for the variable.
         :return: True if the definition was new, False otherwise
         :rtype: bool
@@ -164,7 +171,7 @@ class LiveDefinitions:
 
         if isinstance(variable, SimRegisterVariable):
             if variable.reg is None:
-                l.warning('add_def: Got a None for a SimRegisterVariable. Consider fixing.')
+                l.warning("add_def: Got a None for a SimRegisterVariable. Consider fixing.")
                 return new_defs_added
 
             size = min(variable.size, size_threshold)
@@ -223,25 +230,25 @@ class LiveDefinitions:
 
         if isinstance(variable, SimRegisterVariable):
             if variable.reg is None:
-                l.warning('kill_def: Got a None for a SimRegisterVariable. Consider fixing.')
-                return None
+                l.warning("kill_def: Got a None for a SimRegisterVariable. Consider fixing.")
+                return
 
             size = min(variable.size, size_threshold)
             offset = variable.reg
             while offset < variable.reg + size:
-                self._register_map[offset] = { location }
+                self._register_map[offset] = {location}
                 offset += 1
 
-            self._defs[variable] = { location }
+            self._defs[variable] = {location}
 
         elif isinstance(variable, SimMemoryVariable):
             size = min(variable.size, size_threshold)
             offset = variable.addr
             while offset < variable.addr + size:
-                self._memory_map[offset] = { location }
+                self._memory_map[offset] = {location}
                 offset += 1
 
-            self._defs[variable] = { location }
+            self._defs[variable] = {location}
 
         else:
             l.error('Unsupported variable type "%s".', type(variable))
@@ -260,9 +267,8 @@ class LiveDefinitions:
         live_def_locs = set()
 
         if isinstance(variable, SimRegisterVariable):
-
             if variable.reg is None:
-                l.warning('lookup_defs: Got a None for a SimRegisterVariable. Consider fixing.')
+                l.warning("lookup_defs: Got a None for a SimRegisterVariable. Consider fixing.")
                 return live_def_locs
 
             size = min(variable.size, size_threshold)
@@ -307,7 +313,7 @@ class LiveDefinitions:
         return self._defs.keys()
 
 
-class DDGViewItem(object):
+class DDGViewItem:
     def __init__(self, ddg, variable, simplified=False):
         self._ddg = ddg
         self._variable = variable
@@ -317,27 +323,42 @@ class DDGViewItem(object):
     def depends_on(self):
         graph = self._ddg.simplified_data_graph if self._simplified else self._ddg.data_graph
         if self._variable in graph:
-            return [ self._to_viewitem(n) for n, _, data in graph.in_edges(self._variable, data=True) if data.get('type', None) != 'kill' ]
+            return [
+                self._to_viewitem(n)
+                for n, _, data in graph.in_edges(self._variable, data=True)
+                if data.get("type", None) != "kill"
+            ]
         return None
 
     @property
     def dependents(self):
         graph = self._ddg.simplified_data_graph if self._simplified else self._ddg.data_graph
         if self._variable in graph:
-            return [ self._to_viewitem(n) for _, n, data in graph.in_edges(self._variable, data=True) if data.get('type', None) != 'kill' ]
+            return [
+                self._to_viewitem(n)
+                for _, n, data in graph.in_edges(self._variable, data=True)
+                if data.get("type", None) != "kill"
+            ]
         return None
 
     def __repr__(self):
-        s = "[%s, %d dependents, depends on %d]" % (
-            self._variable,
-            len(self.dependents),
-            len(self.depends_on),
-        )
-        return s
+        return f"[{self._variable}, {len(self.dependents)} dependents, depends on {len(self.depends_on)}]"
 
     def __eq__(self, other):
-        return isinstance(other, DDGViewItem) and self._variable == other._variable and \
-               self._simplified == other._simplified
+        return (
+            isinstance(other, DDGViewItem)
+            and self._variable == other._variable
+            and self._simplified == other._simplified
+        )
+
+    def __hash__(self):
+        return hash(
+            (
+                self._ddg,
+                self._variable,
+                self._simplified,
+            )
+        )
 
     def _to_viewitem(self, prog_var):
         """
@@ -351,7 +372,7 @@ class DDGViewItem(object):
         return DDGViewItem(self._ddg, prog_var, simplified=self._simplified)
 
 
-class DDGViewInstruction(object):
+class DDGViewInstruction:
     def __init__(self, cfg, ddg, insn_addr, simplified=False):
         self._cfg = cfg
         self._ddg = ddg
@@ -371,13 +392,12 @@ class DDGViewInstruction(object):
             cfg_node = self._cfg.model.get_any_node(self._insn_addr, anyaddr=True)
             if cfg_node is None:
                 # not found
-                raise KeyError('CFGNode for instruction %#x is not found.' % self._insn_addr)
+                raise KeyError(f"CFGNode for instruction {self._insn_addr:#x} is not found.")
 
             # determine the statement ID
-            vex_block = self._project.factory.block(cfg_node.addr,
-                                                    size=cfg_node.size,
-                                                    opt_level=self._cfg._iropt_level
-                                                    ).vex
+            vex_block = self._project.factory.block(
+                cfg_node.addr, size=cfg_node.size, opt_level=self._cfg._iropt_level
+            ).vex
             stmt_idx = None
             insn_addr = cfg_node.addr
             for i, stmt in enumerate(vex_block.statements):
@@ -391,7 +411,7 @@ class DDGViewInstruction(object):
                     break
 
             if stmt_idx is None:
-                raise KeyError('Cannot find the statement.')
+                raise KeyError("Cannot find the statement.")
 
             # create a program variable
             variable = SimRegisterVariable(reg_offset, size)
@@ -399,34 +419,33 @@ class DDGViewInstruction(object):
             pv = ProgramVariable(variable, location, arch=self._project.arch)
 
             return DDGViewItem(self._ddg, pv, simplified=self._simplified)
+        return None
 
     @property
-    def definitions(self):
+    def definitions(self) -> list[DDGViewItem]:
         """
         Get all definitions located at the current instruction address.
 
         :return: A list of ProgramVariable instances.
-        :rtype:  list
         """
 
         defs = set()
 
-        if self._simplified:
-            graph = self._ddg.simplified_data_graph
-        else:
-            graph = self._ddg.data_graph
+        graph = self._ddg.simplified_data_graph if self._simplified else self._ddg.data_graph
 
-        for n in graph.nodes():  # type: ProgramVariable
+        n: ProgramVariable
+        for n in graph.nodes():
             if n.location.ins_addr == self._insn_addr:
                 defs.add(DDGViewItem(self._ddg, n, simplified=self._simplified))
 
         return list(defs)
 
 
-class DDGView(object):
+class DDGView:
     """
     A view of the data dependence graph.
     """
+
     def __init__(self, cfg, ddg, simplified=False):
         self._cfg = cfg
         self._ddg = ddg
@@ -439,6 +458,7 @@ class DDGView(object):
         if isinstance(key, int):
             # instruction address
             return DDGViewInstruction(self._cfg, self._ddg, key, simplified=self._simplified)
+        return None
 
 
 class DDG(Analysis):
@@ -460,10 +480,12 @@ class DDG(Analysis):
     Also note that since we are using states from CFG, any improvement in analysis performed on CFG (like a points-to
     analysis) will directly benefit the DDG.
     """
+
     def __init__(self, cfg, start=None, call_depth=None, block_addrs=None):
         """
         :param cfg:         Control flow graph. Please make sure each node has an associated `state` with it, e.g. by
-                            passing the keep_state=True and state_add_options=angr.options.refs arguments to CFGEmulated.
+                            passing the keep_state=True and state_add_options=angr.options.refs arguments to
+                            CFGEmulated.
         :param start:       An address, Specifies where we start the generation of this data dependence graph.
         :param call_depth:  None or integers. A non-negative integer specifies how deep we would like to track in the
                             call tree. None disables call_depth limit.
@@ -546,7 +568,6 @@ class DDG(Analysis):
 
     @property
     def ast_graph(self):
-
         return self._ast_graph
 
     #
@@ -559,7 +580,7 @@ class DDG(Analysis):
         """
         # TODO: make it prettier
         for src, dst, data in self.graph.edges(data=True):
-            print("%s <-- %s, %s" % (src, dst, data))
+            print(f"{src} <-- {dst}, {data}")
 
     def dbg_repr(self):
         """
@@ -625,7 +646,7 @@ class DDG(Analysis):
             return result
 
         # traverse all edges and add them to the result graph if needed
-        queue = [ pv ]
+        queue = [pv]
         traversed = set()
         while queue:
             elem = queue[0]
@@ -638,12 +659,14 @@ class DDG(Analysis):
 
             if not killing_edges:
                 # remove killing edges
-                out_edges = [ (a, b, data) for a, b, data in out_edges if 'type' not in data or data['type'] != 'kill']
+                out_edges = [(a, b, data) for a, b, data in out_edges if "type" not in data or data["type"] != "kill"]
 
             if excluding_types:
-                out_edges = [ (a, b, data) for a, b, data in out_edges if
-                              'type' not in data or data['type'] not in excluding_types
-                              ]
+                out_edges = [
+                    (a, b, data)
+                    for a, b, data in out_edges
+                    if "type" not in data or data["type"] not in excluding_types
+                ]
 
             for src, dst, data in out_edges:
                 result.add_edge(src, dst, **data)
@@ -704,7 +727,7 @@ class DDG(Analysis):
             ddg_job = worklist[0]
             l.debug("Processing %s.", ddg_job)
             node, call_depth = ddg_job.cfg_node, ddg_job.call_depth
-            worklist = worklist[ 1 : ]
+            worklist = worklist[1:]
             worklist_set.remove(node)
 
             # Grab all final states. There are usually more than one (one state for each successor), and we gotta
@@ -733,7 +756,7 @@ class DDG(Analysis):
                             matched = True
                     except (SimUnsatError, SimSolverModeError, ZeroDivisionError):
                         # ignore
-                        matched = matched
+                        pass
                 if not matched:
                     break
 
@@ -741,40 +764,37 @@ class DDG(Analysis):
             matches = len(match_suc) == len(successing_nodes) and len(match_state) == len(final_states)
 
             for state in final_states:
-                if state.history.jumpkind == 'Ijk_FakeRet' and len(final_states) > 1:
+                if state.history.jumpkind == "Ijk_FakeRet" and len(final_states) > 1:
                     # Skip fakerets if there are other control flow transitions available
                     continue
 
                 new_call_depth = call_depth
-                if state.history.jumpkind == 'Ijk_Call':
+                if state.history.jumpkind == "Ijk_Call":
                     new_call_depth += 1
-                elif state.history.jumpkind == 'Ijk_Ret':
+                elif state.history.jumpkind == "Ijk_Ret":
                     new_call_depth -= 1
 
                 if self._call_depth is not None and call_depth > self._call_depth:
-                    l.debug('Do not trace into %s due to the call depth limit', state.ip)
+                    l.debug("Do not trace into %s due to the call depth limit", state.ip)
                     continue
 
                 new_defs = self._track(state, live_defs, node.irsb.statements if node.irsb is not None else None)
 
-                #corresponding_successors = [n for n in successing_nodes if
+                # corresponding_successors = [n for n in successing_nodes if
                 #                            not state.ip.symbolic and n.addr == state.solver.eval(state.ip)]
-                #if not corresponding_successors:
+                # if not corresponding_successors:
                 #    continue
 
                 changed = False
 
                 # if every successor can be matched with one or more final states (by IP address),
                 # only take over the LiveDefinition of matching states
-                if matches:
-                    add_state_to_sucs = match_state[state]
-                else:
-                    add_state_to_sucs = successing_nodes
+                add_state_to_sucs = match_state[state] if matches else successing_nodes
 
                 for successing_node in add_state_to_sucs:
-
-                    if (state.history.jumpkind == 'Ijk_Call' or state.history.jumpkind.startswith('Ijk_Sys')) and \
-                            (state.ip.symbolic or successing_node.addr != state.solver.eval(state.ip)):
+                    if (state.history.jumpkind == "Ijk_Call" or state.history.jumpkind.startswith("Ijk_Sys")) and (
+                        state.ip.symbolic or successing_node.addr != state.solver.eval(state.ip)
+                    ):
                         suc_new_defs = self._filter_defs_at_call_sites(new_defs)
                     else:
                         suc_new_defs = new_defs
@@ -789,13 +809,14 @@ class DDG(Analysis):
                         # l.debug("Adding %d new definitions for variable %s.", len(code_loc_set), var)
                         changed |= defs_for_next_node.add_defs(var, code_loc_set)
 
-                if changed:
-                    if (self._call_depth is None) or \
-                            (self._call_depth is not None and 0 <= new_call_depth <= self._call_depth):
-                        # Put all reachable successors back to our work-list again
-                        for successor in self._cfg.model.get_all_successors(node):
-                            nw = DDGJob(successor, new_call_depth)
-                            self._worklist_append(nw, worklist, worklist_set)
+                if changed and (
+                    (self._call_depth is None)
+                    or (self._call_depth is not None and 0 <= new_call_depth <= self._call_depth)
+                ):
+                    # Put all reachable successors back to our work-list again
+                    for successor in self._cfg.model.get_all_successors(node):
+                        nw = DDGJob(successor, new_call_depth)
+                        self._worklist_append(nw, worklist, worklist_set)
 
     def _track(self, state, live_defs, statements):
         """
@@ -815,8 +836,8 @@ class DDG(Analysis):
         action_list = list(state.history.recent_actions)
 
         # Since all temporary variables are local, we simply track them in a dict
-        self._temp_variables = { }
-        self._temp_register_symbols = { }
+        self._temp_variables = {}
+        self._temp_register_symbols = {}
 
         # All dependence edges are added to the graph either at the end of this method, or when they are going to be
         # overwritten by a new edge. This is because we sometimes have to modify a previous edge (e.g. add new labels
@@ -825,18 +846,22 @@ class DDG(Analysis):
         self._register_edges = defaultdict(list)
 
         last_statement_id = None
-        self._variables_per_statement = None  # program variables read out in the same statement. we keep a copy of those variables here so
-                                              # we can link it to the tmp_write action right afterwards
+        self._variables_per_statement = (
+            None  # program variables read out in the same statement. we keep a copy of those variables here so
+        )
+        # we can link it to the tmp_write action right afterwards
         self._custom_data_per_statement = None
 
         for a in action_list:
             if last_statement_id is None or last_statement_id != a.stmt_idx:
                 # update statement ID
                 last_statement_id = a.stmt_idx
-                statement = statements[last_statement_id] if statements and last_statement_id < len(statements) else None
+                statement = (
+                    statements[last_statement_id] if statements and last_statement_id < len(statements) else None
+                )
 
                 # initialize all per-statement data structures
-                self._variables_per_statement = [ ]
+                self._variables_per_statement = []
                 self._custom_data_per_statement = None
 
             if a.sim_procedure is None:
@@ -844,14 +869,14 @@ class DDG(Analysis):
             else:
                 current_code_location = CodeLocation(None, None, sim_procedure=a.sim_procedure)
 
-            if a.type == 'exit':
+            if a.type == "exit":
                 self._handle_exit(a, current_code_location, state, statement)
-            elif a.type == 'operation':
+            elif a.type == "operation":
                 self._handle_operation(a, current_code_location, state, statement)
-            elif a.type == 'constraint':
+            elif a.type == "constraint":
                 pass
             else:
-                handler_name = "_handle_%s_%s" % (a.type, a.action)
+                handler_name = f"_handle_{a.type}_{a.action}"
                 if hasattr(self, handler_name):
                     getattr(self, handler_name)(a, current_code_location, state, statement)
                 else:
@@ -876,16 +901,13 @@ class DDG(Analysis):
         for code_loc in self._live_defs.lookup_defs(variable):
             # Label edges with cardinality or actual sets of addresses
             if isinstance(variable, SimMemoryVariable):
-                type_ = 'mem'
+                type_ = "mem"
             elif isinstance(variable, SimRegisterVariable):
-                type_ = 'reg'
+                type_ = "reg"
             else:
-                raise AngrDDGError('Unknown variable type %s' % type(variable))
+                raise AngrDDGError(f"Unknown variable type {type(variable)}")
 
-            prevdefs[code_loc] = {
-                'type': type_,
-                'data': variable
-            }
+            prevdefs[code_loc] = {"type": type_, "data": variable}
 
         return prevdefs
 
@@ -903,7 +925,7 @@ class DDG(Analysis):
         if variable in self._live_defs:
             for loc in self._live_defs.lookup_defs(variable):
                 pv = ProgramVariable(variable, loc, arch=self.project.arch)
-                self._data_graph_add_edge(pv, ProgramVariable(variable, code_loc, arch=self.project.arch), type='kill')
+                self._data_graph_add_edge(pv, ProgramVariable(variable, code_loc, arch=self.project.arch), type="kill")
 
         self._live_defs.kill_def(variable, code_loc)
 
@@ -919,11 +941,13 @@ class DDG(Analysis):
         # TODO: support registers that are not aligned
         if reg_offset in self.project.arch.register_names:
             reg_name = self.project.arch.register_names[reg_offset]
-            reg_size = self.project.arch.registers[reg_name][1]
-            return reg_size
+            return self.project.arch.registers[reg_name][1]
 
-        l.warning("_get_register_size(): unsupported register offset %d. Assum size 1. "
-                  "More register name mappings should be implemented in archinfo.", reg_offset)
+        l.warning(
+            "_get_register_size(): unsupported register offset %d. Assume size 1. "
+            "More register name mappings should be implemented in archinfo.",
+            reg_offset,
+        )
         return 1
 
     #
@@ -966,13 +990,13 @@ class DDG(Analysis):
 
         variable = None
         if len(addrs) == 1 and len(action.addr.tmp_deps) == 1:
-            addr_tmp = list(action.addr.tmp_deps)[0]
+            addr_tmp = next(iter(action.addr.tmp_deps))
             if addr_tmp in self._temp_register_symbols:
                 # it must be a stack variable
                 sort, offset = self._temp_register_symbols[addr_tmp]
                 base_addr = addr - offset
                 if base_addr < 0:
-                    base_addr += (1 << self.project.arch.bits)
+                    base_addr += 1 << self.project.arch.bits
                 variable = SimStackVariable(offset, action.size.ast // 8, base=sort, base_addr=base_addr)
 
         if variable is None:
@@ -990,48 +1014,47 @@ class DDG(Analysis):
 
         # For each of its register dependency and data dependency, we annotate the corresponding edge
         for reg_offset in action.addr.reg_deps:
-            self._stmt_graph_annotate_edges(self._register_edges[reg_offset], subtype='mem_addr')
+            self._stmt_graph_annotate_edges(self._register_edges[reg_offset], subtype="mem_addr")
             reg_variable = SimRegisterVariable(reg_offset, self._get_register_size(reg_offset))
             prev_defs = self._def_lookup(reg_variable)
-            for loc, _ in prev_defs.items():
+            for loc in prev_defs:
                 v = ProgramVariable(reg_variable, loc, arch=self.project.arch)
-                self._data_graph_add_edge(v, prog_var, type='mem_addr')
+                self._data_graph_add_edge(v, prog_var, type="mem_addr")
 
         for tmp in action.addr.tmp_deps:
-            self._stmt_graph_annotate_edges(self._temp_edges[tmp], subtype='mem_addr')
+            self._stmt_graph_annotate_edges(self._temp_edges[tmp], subtype="mem_addr")
             if tmp in self._temp_variables:
-                self._data_graph_add_edge(self._temp_variables[tmp], prog_var, type='mem_addr')
+                self._data_graph_add_edge(self._temp_variables[tmp], prog_var, type="mem_addr")
 
         if not action.data.reg_deps and not action.data.tmp_deps:
             # might be a constant assignment
-            v = action.data.ast
+            v: claripy.ast.BV = action.data.ast
             if not v.symbolic:
-                const_var = SimConstantVariable(v._model_concrete.value)
+                const_var = SimConstantVariable(value=v.concrete_value, size=v.size())
                 const_progvar = ProgramVariable(const_var, prog_var.location)
-                self._data_graph_add_edge(const_progvar, prog_var, type='mem_data')
+                self._data_graph_add_edge(const_progvar, prog_var, type="mem_data")
 
         else:
             for reg_offset in action.data.reg_deps:
-                self._stmt_graph_annotate_edges(self._register_edges[reg_offset], subtype='mem_data')
+                self._stmt_graph_annotate_edges(self._register_edges[reg_offset], subtype="mem_data")
                 reg_variable = SimRegisterVariable(reg_offset, self._get_register_size(reg_offset))
                 prev_defs = self._def_lookup(reg_variable)
-                for loc, _ in prev_defs.items():
+                for loc in prev_defs:
                     v = ProgramVariable(reg_variable, loc, arch=self.project.arch)
-                    self._data_graph_add_edge(v, prog_var, type='mem_data')
+                    self._data_graph_add_edge(v, prog_var, type="mem_data")
 
             for tmp in action.data.tmp_deps:
-                self._stmt_graph_annotate_edges(self._temp_edges[tmp], subtype='mem_data')
+                self._stmt_graph_annotate_edges(self._temp_edges[tmp], subtype="mem_data")
                 if tmp in self._temp_variables:
-                    self._data_graph_add_edge(self._temp_variables[tmp], prog_var, type='mem_data')
+                    self._data_graph_add_edge(self._temp_variables[tmp], prog_var, type="mem_data")
 
     def _handle_mem_read(self, action, code_location, state, statement):  # pylint:disable=unused-argument
-
         addrs = self._get_actual_addrs(action, state)
 
         for addr in addrs:
             variable = self._create_memory_variable(action, addr, addrs)
 
-            variables = [ ]
+            variables = []
 
             # get all definitions
             defs = self._def_lookup(variable)
@@ -1057,7 +1080,6 @@ class DDG(Analysis):
                 self._variables_per_statement.append(var)
 
     def _handle_mem_write(self, action, location, state, statement):
-
         addrs = self._get_actual_addrs(action, state)
 
         for addr in addrs:
@@ -1076,16 +1098,19 @@ class DDG(Analysis):
                 if isinstance(statement.data, pyvex.IRExpr.RdTmp):
                     # assignment
                     src_tmp_idx = statement.data.tmp
-                    src_tmp_def = next(s for s in self._variables_per_statement if
-                                       isinstance(s.variable, SimTemporaryVariable) and s.variable.tmp_id == src_tmp_idx)
+                    src_tmp_def = next(
+                        s
+                        for s in self._variables_per_statement
+                        if isinstance(s.variable, SimTemporaryVariable) and s.variable.tmp_id == src_tmp_idx
+                    )
                     self._ast_graph.add_edge(src_tmp_def, pv)
                 elif isinstance(statement.data, pyvex.IRExpr.Const):
                     # assignment
                     const = statement.data.con.value
-                    self._ast_graph.add_edge(ProgramVariable(SimConstantVariable(const), location), pv)
+                    size = statement.data.con.size
+                    self._ast_graph.add_edge(ProgramVariable(SimConstantVariable(value=const, size=size), location), pv)
 
     def _handle_reg_read(self, action, location, state, statement):  # pylint:disable=unused-argument
-
         reg_offset = action.offset
         variable = SimRegisterVariable(reg_offset, action.data.ast.size() // 8)
 
@@ -1103,17 +1128,18 @@ class DDG(Analysis):
 
         if not definitions:
             # the register was never defined before - it must be passed in as an argument
-            self._variables_per_statement.append(ProgramVariable(variable, location, initial=True, arch=self.project.arch))
+            self._variables_per_statement.append(
+                ProgramVariable(variable, location, initial=True, arch=self.project.arch)
+            )
             # make sure to put it into the killing set
             self._kill(variable, location)
 
         if reg_offset == self.project.arch.sp_offset:
-            self._custom_data_per_statement = ('sp', 0)
+            self._custom_data_per_statement = ("sp", 0)
         elif reg_offset == self.project.arch.bp_offset:
-            self._custom_data_per_statement = ('bp', 0)
+            self._custom_data_per_statement = ("bp", 0)
 
-    def _handle_reg_write(self, action, location, state, statement):  # pylint:disable=unused-argument
-
+    def _handle_reg_write(self, action, location, state, statement: pyvex.stmt.Put):  # pylint:disable=unused-argument
         reg_offset = action.offset
         variable = SimRegisterVariable(reg_offset, action.data.ast.size() // 8)
 
@@ -1130,10 +1156,11 @@ class DDG(Analysis):
         if not action.reg_deps and not action.tmp_deps:
             # moving a constant into the register
             # try to parse out the constant from statement
-            const_variable = SimConstantVariable()
-            if statement is not None:
-                if isinstance(statement.data, pyvex.IRExpr.Const):
-                    const_variable = SimConstantVariable(value=statement.data.con.value)
+            if statement is not None and isinstance(statement.data, pyvex.IRExpr.Const):
+                const_variable = SimConstantVariable(value=statement.data.con.value, size=statement.data.con.size)
+            else:
+                # use a default value of 0 if we cannot find the constant
+                const_variable = SimConstantVariable(1, value=0)
             const_pv = ProgramVariable(const_variable, location, arch=self.project.arch)
             self._data_graph_add_edge(const_pv, pv)
 
@@ -1142,13 +1169,12 @@ class DDG(Analysis):
                 self._data_graph_add_edge(self._temp_variables[tmp], pv)
 
     def _handle_tmp_read(self, action, location, state, statement):  # pylint:disable=unused-argument
-
         tmp = action.tmp
         tmp_var = self._temp_variables[tmp]
 
         def_loc = tmp_var.location
 
-        self._stmt_graph_add_edge(def_loc, location, type='tmp', data=action.tmp)
+        self._stmt_graph_add_edge(def_loc, location, type="tmp", data=action.tmp)
         # record the edge
         edge_tuple = (def_loc, location)
         self._temp_edges[action.tmp].append(edge_tuple)
@@ -1159,11 +1185,10 @@ class DDG(Analysis):
         self._variables_per_statement.append(tmp_var)
 
     def _handle_tmp_write(self, action, location, state, statement):  # pylint:disable=unused-argument
-
         ast = None
 
         tmp = action.tmp
-        pv = ProgramVariable(SimTemporaryVariable(tmp), location, arch=self.project.arch)
+        pv = ProgramVariable(SimTemporaryVariable(tmp, len(action.data)), location, arch=self.project.arch)
 
         if ast is not None:
             for operand in ast.operands:
@@ -1189,7 +1214,10 @@ class DDG(Analysis):
         if isinstance(statement, pyvex.IRStmt.WrTmp) and self._variables_per_statement:
             if isinstance(statement.data, pyvex.IRExpr.RdTmp):
                 # assignment: dst_tmp = src_tmp
-                for s in filter(lambda x: isinstance(x.variable, SimTemporaryVariable) and x.variable.tmp_id != tmp, self._variables_per_statement):
+                for s in filter(
+                    lambda x: isinstance(x.variable, SimTemporaryVariable) and x.variable.tmp_id != tmp,
+                    self._variables_per_statement,
+                ):
                     self._ast_graph.add_edge(s, pv)
             elif isinstance(statement.data, pyvex.IRExpr.Get):
                 # assignment: dst_tmp = src_reg
@@ -1203,31 +1231,29 @@ class DDG(Analysis):
         if not action.tmp_deps and not self._variables_per_statement and not ast:
             # read in a constant
             # try to parse out the constant from statement
-            const_variable = SimConstantVariable()
+            const_variable = SimConstantVariable(size=1, value=0)  # default value if we can't find the constant
             if statement is not None:
                 if isinstance(statement, pyvex.IRStmt.Dirty):
-                    l.warning('Dirty statements are not supported in DDG for now.')
+                    l.warning("Dirty statements are not supported in DDG for now.")
                 elif isinstance(statement.data, pyvex.IRExpr.Const):
-                    const_variable = SimConstantVariable(value=statement.data.con.value)
+                    const_variable = SimConstantVariable(value=statement.data.con.value, size=statement.data.con.size)
             const_pv = ProgramVariable(const_variable, location, arch=self.project.arch)
             self._data_graph_add_edge(const_pv, pv)
 
     def _handle_exit(self, action, location, state, statement):  # pylint:disable=unused-argument
-
         # exits should only depend on tmps
         for tmp in action.tmp_deps:
             prev_code_loc = self._temp_variables[tmp].location
 
             # add the edge to the graph
-            self._stmt_graph_add_edge(prev_code_loc, location, type='exit', data='tmp')
+            self._stmt_graph_add_edge(prev_code_loc, location, type="exit", data="tmp")
 
             # log the edge
             edge_tuple = (prev_code_loc, location)
             self._temp_edges[tmp].append(edge_tuple)
 
     def _handle_operation(self, action, location, state, statement):  # pylint:disable=unused-argument
-
-        if action.op.endswith('Sub32') or action.op.endswith('Sub64'):
+        if action.op.endswith("Sub32") or action.op.endswith("Sub64"):
             # subtract
             expr_0, expr_1 = action.exprs
 
@@ -1241,10 +1267,10 @@ class DDG(Analysis):
                     sort, offset = self._temp_register_symbols[tmp]
                     offset -= const_value
                     if offset < 0:
-                        offset += (1 << self.project.arch.bits)
+                        offset += 1 << self.project.arch.bits
                     self._custom_data_per_statement = (sort, offset)
 
-        elif action.op.endswith('Add32') or action.op.endswith('Add64'):
+        elif action.op.endswith("Add32") or action.op.endswith("Add64"):
             # add
 
             expr_0, expr_1 = action.exprs
@@ -1258,12 +1284,11 @@ class DDG(Analysis):
                     sort, offset = self._temp_register_symbols[tmp]
                     offset += const_value
                     if offset >= (1 << self.project.arch.bits):
-                        offset -= (1 << self.project.arch.bits)
+                        offset -= 1 << self.project.arch.bits
                     self._custom_data_per_statement = (sort, offset)
 
     def _process_operation(self, action, location, state, statement):  # pylint:disable=unused-argument
-
-        if action.op.endswith('Sub32') or action.op.endswith('Sub64'):
+        if action.op.endswith("Sub32") or action.op.endswith("Sub64"):
             # subtract
             expr_0, expr_1 = action.exprs
 
@@ -1272,12 +1297,11 @@ class DDG(Analysis):
                 const_value = expr_1.ast.args[0]
                 tmp = next(iter(expr_0.tmp_deps))
 
-                const_def = ProgramVariable(SimConstantVariable(const_value), location)
+                const_def = ProgramVariable(SimConstantVariable(value=const_value, size=len(expr_1.ast)), location)
                 tmp_def = self._temp_variables[tmp]
-                ast = AST('-', tmp_def, const_def)
-                return ast
+                return AST("-", tmp_def, const_def)
 
-        elif action.op.endswith('Add32') or action.op.endswith('Add64'):
+        elif action.op.endswith("Add32") or action.op.endswith("Add64"):
             # add
 
             expr_0, expr_1 = action.exprs
@@ -1287,10 +1311,9 @@ class DDG(Analysis):
                 const_value = expr_1.ast.args[0]
                 tmp = next(iter(expr_0.tmp_deps))
 
-                const_def = ProgramVariable(SimConstantVariable(const_value), location)
+                const_def = ProgramVariable(SimConstantVariable(value=const_value, size=len(expr_1.ast)), location)
                 tmp_def = self._temp_variables[tmp]
-                ast = AST('+', tmp_def, const_def)
-                return ast
+                return AST("+", tmp_def, const_def)
 
         return None
 
@@ -1300,7 +1323,7 @@ class DDG(Analysis):
 
     def _data_graph_add_node(self, node):
         """
-        Add a noe in the data dependence graph.
+        Add a node in the data dependence graph.
 
         :param ProgramVariable node: The node to add.
         :return: None
@@ -1356,7 +1379,6 @@ class DDG(Analysis):
         graph = self.graph
 
         for src, dst in edges_to_annotate:
-
             if src not in graph:
                 continue
             if dst not in graph[src]:
@@ -1383,7 +1405,7 @@ class DDG(Analysis):
 
         graph = networkx.MultiDiGraph(data_graph)
 
-        all_nodes = [ n for n in graph.nodes() if isinstance(n.variable, SimTemporaryVariable) ]
+        all_nodes = [n for n in graph.nodes() if isinstance(n.variable, SimTemporaryVariable)]
 
         for tmp_node in all_nodes:
             # remove each tmp node by linking their successors and predecessors directly
@@ -1397,11 +1419,10 @@ class DDG(Analysis):
 
             for pred, _, data_in in in_edges:
                 for _, suc, data_out in out_edges:
-                    if pred is not tmp_node and suc is not tmp_node:
-                        if suc not in graph[pred]:
-                            data = data_in.copy()
-                            data.update(data_out)
-                            graph.add_edge(pred, suc, **data)
+                    if pred is not tmp_node and suc is not tmp_node and suc not in graph[pred]:
+                        data = data_in.copy()
+                        data.update(data_out)
+                        graph.add_edge(pred, suc, **data)
 
             graph.remove_node(tmp_node)
 
@@ -1420,14 +1441,14 @@ class DDG(Analysis):
 
         if node_wrapper.cfg_node in worklist_set:
             # It's already in the work-list
-            return
+            return None
 
         worklist.append(node_wrapper)
         worklist_set.add(node_wrapper.cfg_node)
 
-        stack = [ node_wrapper ]
-        traversed_nodes = { node_wrapper.cfg_node }
-        inserted = { node_wrapper.cfg_node }
+        stack = [node_wrapper]
+        traversed_nodes = {node_wrapper.cfg_node}
+        inserted = {node_wrapper.cfg_node}
 
         while stack:
             nw = stack.pop()
@@ -1437,19 +1458,21 @@ class DDG(Analysis):
             edges = self._cfg.graph.out_edges(n, data=True)
 
             for _, dst, data in edges:
-                if (dst not in traversed_nodes # which means we haven't touch this node in this appending procedure
-                        and dst not in worklist_set): # which means this node is not in the work-list
+                if (
+                    dst not in traversed_nodes  # which means we haven't touch this node in this appending procedure
+                    and dst not in worklist_set
+                ):  # which means this node is not in the work-list
                     # We see a new node!
                     traversed_nodes.add(dst)
 
-                    if data['jumpkind'] == 'Ijk_Call':
+                    if data["jumpkind"] == "Ijk_Call":
                         if self._call_depth is None or call_depth < self._call_depth:
                             inserted.add(dst)
                             new_nw = DDGJob(dst, call_depth + 1)
                             worklist.append(new_nw)
                             worklist_set.add(dst)
                             stack.append(new_nw)
-                    elif data['jumpkind'] == 'Ijk_Ret':
+                    elif data["jumpkind"] == "Ijk_Ret":
                         if call_depth > 0:
                             inserted.add(dst)
                             new_nw = DDGJob(dst, call_depth - 1)
@@ -1475,8 +1498,8 @@ class DDG(Analysis):
 
         # Group all dependencies first
 
-        block_addr_to_func = { }
-        for _, func in self.kb.functions.items():
+        block_addr_to_func = {}
+        for func in self.kb.functions.values():
             for block in func.blocks:
                 block_addr_to_func[block.addr] = func
 
@@ -1488,7 +1511,7 @@ class DDG(Analysis):
 
             if dst.block_addr in block_addr_to_func:
                 dst_target_func = block_addr_to_func[dst.block_addr]
-                if not dst_target_func is src_target_func:
+                if dst_target_func is not src_target_func:
                     self._function_data_dependencies[dst_target_func].add_edge(src, dst, **data)
 
     #
@@ -1510,14 +1533,17 @@ class DDG(Analysis):
         # TODO: use information from a calling convention analysis
         filtered_defs = LiveDefinitions()
         for variable, locs in defs.items():
-            if isinstance(variable, SimRegisterVariable):
-                if self.project.arch.name == 'X86':
-                    if variable.reg in (self.project.arch.registers['eax'][0],
-                                        self.project.arch.registers['ecx'][0],
-                                        self.project.arch.registers['edx'][0]):
-                        continue
-
-            filtered_defs.add_defs(variable, locs)
+            if not (
+                isinstance(variable, SimRegisterVariable)
+                and self.project.arch.name == "X86"
+                and variable.reg
+                in (
+                    self.project.arch.registers["eax"][0],
+                    self.project.arch.registers["ecx"][0],
+                    self.project.arch.registers["edx"][0],
+                )
+            ):
+                filtered_defs.add_defs(variable, locs)
 
         return filtered_defs
 
@@ -1533,14 +1559,12 @@ class DDG(Analysis):
         :rtype: list
         """
 
-        if simplified_graph:
-            graph = self.simplified_data_graph
-        else:
-            graph = self.data_graph
+        graph = self.simplified_data_graph if simplified_graph else self.data_graph
 
         defs = []
 
-        for n in graph.nodes():  # type: ProgramVariable
+        n: ProgramVariable
+        for n in graph.nodes():
             if n.variable == variable:
                 if location is None:
                     defs.append(n)
@@ -1550,7 +1574,6 @@ class DDG(Analysis):
                         defs.append(n)
 
         return defs
-
 
     def find_consumers(self, var_def, simplified_graph=True):
         """
@@ -1562,10 +1585,7 @@ class DDG(Analysis):
         :rtype: list
         """
 
-        if simplified_graph:
-            graph = self.simplified_data_graph
-        else:
-            graph = self.data_graph
+        graph = self.simplified_data_graph if simplified_graph else self.data_graph
 
         if var_def not in graph:
             return []
@@ -1578,7 +1598,7 @@ class DDG(Analysis):
             src = srcs.pop()
             out_edges = graph.out_edges(src, data=True)
             for _, dst, data in out_edges:
-                if 'type' in data and data['type'] == 'kill':
+                if "type" in data and data["type"] == "kill":
                     # skip killing edges
                     continue
                 if isinstance(dst.variable, SimTemporaryVariable):
@@ -1591,7 +1611,6 @@ class DDG(Analysis):
 
         return consumers
 
-
     def find_killers(self, var_def, simplified_graph=True):
         """
         Find all killers to the specified variable definition.
@@ -1602,10 +1621,7 @@ class DDG(Analysis):
         :rtype: list
         """
 
-        if simplified_graph:
-            graph = self.simplified_data_graph
-        else:
-            graph = self.data_graph
+        graph = self.simplified_data_graph if simplified_graph else self.data_graph
 
         if var_def not in graph:
             return []
@@ -1613,11 +1629,10 @@ class DDG(Analysis):
         killers = []
         out_edges = graph.out_edges(var_def, data=True)
         for _, dst, data in out_edges:
-            if 'type' in data and data['type'] == 'kill':
+            if "type" in data and data["type"] == "kill":
                 killers.append(dst)
 
         return killers
-
 
     def find_sources(self, var_def, simplified_graph=True):
         """
@@ -1629,23 +1644,20 @@ class DDG(Analysis):
         :rtype: list
         """
 
-        if simplified_graph:
-            graph = self.simplified_data_graph
-        else:
-            graph = self.data_graph
+        graph = self.simplified_data_graph if simplified_graph else self.data_graph
 
         if var_def not in graph:
             return []
 
         sources = []
-        defs = [ var_def ]
+        defs = [var_def]
         traversed = set()
 
         while defs:
             definition = defs.pop()
             in_edges = graph.in_edges(definition, data=True)
             for src, _, data in in_edges:
-                if 'type' in data and data['type'] == 'kill':
+                if "type" in data and data["type"] == "kill":
                     continue
                 if isinstance(src.variable, SimTemporaryVariable):
                     if src not in traversed:
@@ -1657,5 +1669,5 @@ class DDG(Analysis):
 
         return sources
 
-from angr.analyses import AnalysesHub
-AnalysesHub.register_default('DDG', DDG)
+
+AnalysesHub.register_default("DDG", DDG)

@@ -1,60 +1,258 @@
-import os
-import logging
-import networkx
-import string
+# pylint:disable=too-many-boolean-expressions,protected-access
+from __future__ import annotations
+
+import contextlib
 import itertools
-from collections import defaultdict
-from typing import Union, Optional, Iterable, Set, Generator
-from typing import Type # For some reasons the linter doesn't recognize the use in apply_definition but PyCharm needs it imported to correctly recognize it # pylint: disable=unused-import
+import json
+import logging
+import os
+import re
+from collections import UserDict, defaultdict
+from collections.abc import Iterable, Iterator, Mapping
+from enum import Enum
+from functools import wraps
+from typing import TYPE_CHECKING, Any
 
-from itanium_demangler import parse
-
+import networkx
+import pydemumble
+from archinfo.arch_arm import is_arm_arch
 from cle.backends.symbol import Symbol
-from archinfo.arch_arm import get_real_address_if_arm
-import claripy
 
-from ...codenode import CodeNode, BlockNode, HookNode, SyscallNode
-from ...serializable import Serializable
-from ...errors import AngrValueError, SimEngineError, SimMemoryError
-from ...procedures import SIM_LIBRARIES
-from ...procedures.definitions import SimSyscallLibrary
-from ...protos import function_pb2
-from ...calling_conventions import DEFAULT_CC
+from angr import claripy
+from angr.calling_conventions import DEFAULT_CC, SimCC, default_cc_for_project
+from angr.codenode import BlockNode, CodeNode, FuncNode, HookNode, SyscallNode
+from angr.enums import Flavors
+from angr.errors import AngrValueError, SimEngineError, SimMemoryError
+from angr.knowledge_plugins.cfg.memory_data import MemoryDataSort
+from angr.knowledge_plugins.xrefs.xref import XRef
+from angr.procedures import SIM_LIBRARIES
+from angr.procedures.definitions import SimLibrary, SimSyscallLibrary
+from angr.protos import function_pb2
+from angr.rust.utils.demangler import demangle
+from angr.rustylib.function_graph import (  # pylint:disable=import-error,no-name-in-module
+    PRESENT_CONFIRMED,
+    PRESENT_INS_ADDR,
+    PRESENT_OUTSIDE,
+    PRESENT_STMT_IDX,
+    PRESENT_TYPE,
+    EdgeKind,
+    EndpointKind,
+    FunctionGraph,
+    NodeKind,
+    SiteKind,
+)
+from angr.serializable import Serializable
+from angr.sim_type import SimTypeFunction, parse_defns
+from angr.utils.library import get_cpp_function_name_and_metadata
+from angr.utils.types import dereference_simtype, find_type_refs, type_collections_for_lib
+from angr.utils.vex import block_branch_ins_addr
+
 from .function_parser import FunctionParser
+from .transition_graph import TransitionGraph
+
+if TYPE_CHECKING:
+    from angr.knowledge_plugins.functions.function_manager import FunctionManager
+    from angr.project import Project
 
 l = logging.getLogger(name=__name__)
 
-from ...sim_type import SimTypeFunction, parse_defns
-from ...calling_conventions import SimCC
-from ...project import Project
+
+def _flavor_key(flavor: str | None) -> str:
+    return Flavors.DEFAULT_FLAVOR if flavor is None else flavor
+
+
+_NODE_KINDS: dict[type, NodeKind] = {
+    BlockNode: NodeKind.BLOCK,
+    FuncNode: NodeKind.FUNC,
+    HookNode: NodeKind.HOOK,
+    SyscallNode: NodeKind.SYSCALL,
+}
+_EDGE_KINDS: dict[str, EdgeKind] = {
+    "transition": EdgeKind.TRANSITION,
+    "call": EdgeKind.CALL,
+    "fake_return": EdgeKind.FAKE_RETURN,
+    "return": EdgeKind.RETURN,
+    "exception": EdgeKind.EXCEPTION,
+    "syscall": EdgeKind.SYSCALL,
+}
+_EDGE_KIND_NAMES: dict[EdgeKind, str] = {v: k for k, v in _EDGE_KINDS.items()}
+_ENDPOINT_KINDS: dict[str, EndpointKind] = {
+    "call": EndpointKind.CALL,
+    "return": EndpointKind.RETURN,
+    "transition": EndpointKind.TRANSITION,
+    "exception": EndpointKind.EXCEPTION,
+}
+_ENDPOINT_SORTS: dict[EndpointKind, str] = {v: k for k, v in _ENDPOINT_KINDS.items()}
+
+
+def _node_key(node: CodeNode) -> tuple[NodeKind, int, int, bool]:
+    kind = _NODE_KINDS.get(type(node))
+    if kind is None:
+        if isinstance(node, BlockNode):
+            kind = NodeKind.BLOCK
+        elif isinstance(node, SyscallNode):
+            kind = NodeKind.SYSCALL
+        elif isinstance(node, HookNode):
+            kind = NodeKind.HOOK
+        elif isinstance(node, FuncNode):
+            kind = NodeKind.FUNC
+        else:
+            raise TypeError(f"{node!r} is not a CodeNode")
+    size = node.size
+    # hook nodes that are built from CFGNodes may have size=None
+    return kind, node.addr, 0 if size is None else size, bool(node.thumb)
+
+
+_UNSET = object()
+
+
+def _node_delta(node: CodeNode) -> int:
+    return node.delta if isinstance(node, BlockNode) else 0
+
+
+def dirty_func(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        self._dirty = True
+        return func(self, *args, **kwargs)
+
+    return wrapper
+
+
+class PrototypeSource(int, Enum):
+    """
+    An enumeration to represent the source of a function prototype. The values are ordered by certainty, with higher
+    values indicating more certainty.
+    """
+
+    # guessed
+    NONE = 0
+    GUESSED = 1
+    CCA_LOW = 2  # low-level IR (VEX or P-Code) based CCA
+    # slightly more certain
+    CALLSITE_LOW = 3  # low-level IR (VEX or P-Code) based call-site analysis
+    CALLSITE_DECOMPILER = 6
+    # more certain
+    CCA_DECOMPILER = 20
+    SIMPROC = 21  # SimProcedures
+    SIGNATURES = 25  # function matching, e.g., FLIRT
+    USER = 100
+
+
+class FunctionInfo(UserDict):
+    """
+    A dictionary that updates the .dirty field of the Function object when modified.
+    """
+
+    def __init__(self, func: Function):
+        super().__init__()
+        self._func = func
+
+    def __setitem__(self, key, value):
+        if not isinstance(value, (str, int, float, bool, list, dict)):
+            raise TypeError(
+                "FunctionInfo only supports JSON-serializable values (str, int, float, bool, list, and dict)."
+            )
+        if not isinstance(key, str):
+            raise TypeError("FunctionInfo only supports str keys.")
+        self._func._dirty = True
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._func._dirty = True
+        super().__delitem__(key)
+
+    def copy(self, owner: Function) -> FunctionInfo:  # type: ignore[reportIncompatibleMethodOverride]
+        new_info = FunctionInfo(owner)
+        new_info.data = self.data.copy()
+        return new_info
+
+    def to_json(self) -> str:
+        return json.dumps(self.data)
+
+    @classmethod
+    def from_json(cls, json_str: str, owner: Function) -> FunctionInfo:
+        info = cls(owner)
+        info.data = json.loads(json_str)
+        return info
 
 
 class Function(Serializable):
     """
     A representation of a function and various information about it.
+
+    :ivar meta_only:            Whether this function only contains meta-information and in read-only mode.
+    :ivar _dirty:                Whether this function has been modified since last serialization.
+    :ivar evicted:              Whether this function has been evicted from FunctionManager to external storage.
     """
 
-    __slots__ = ('transition_graph', '_local_transition_graph', 'normalized', '_ret_sites', '_jumpout_sites',
-                 '_callout_sites', '_endpoints', '_call_sites', '_retout_sites', 'addr', '_function_manager',
-                 'is_syscall', '_project', 'is_plt', 'addr', 'is_simprocedure', '_name', 'is_default_name',
-                 'from_signature', 'binary_name',
-                 '_argument_registers', '_argument_stack_variables',
-                 'bp_on_stack', 'retaddr_on_stack', 'sp_delta', 'calling_convention', 'prototype', '_returning',
-                 'prepared_registers', 'prepared_stack_variables', 'registers_read_afterwards',
-                 'startpoint', '_addr_to_block_node', '_block_sizes', '_block_cache', '_local_blocks',
-                 '_local_block_addrs', 'info', 'tags', 'alignment', 'is_prototype_guessed', 'ran_cca',
-                 )
+    __slots__ = (
+        "__weakref__",
+        "_argument_registers",
+        "_argument_stack_variables",
+        "_block_addrs_cache",
+        "_calling_convention",
+        "_cyclomatic_complexity",
+        "_dirty",
+        "_from_signature",
+        "_function_manager",
+        "_graph",
+        "_info",
+        "_is_alignment",
+        "_is_plt",
+        "_is_simprocedure",
+        "_is_syscall",
+        "_local_transition_graph",
+        "_name",
+        "_node_objs",
+        "_project",
+        "_prototype_libname",
+        "_prototype_ref_warned",
+        "_prototype_sources",
+        "_prototypes",
+        "_prototypes_resolved",
+        "_returning",
+        "_transition_graph",
+        "addr",
+        "binary_name",
+        "bp_on_stack",
+        "evicted",
+        "is_default_name",
+        "meta_only",
+        "normalized",
+        "previous_names",
+        "ran_cca",
+        "retaddr_on_stack",
+        "sp_delta",
+        "tags",
+    )
 
-    def __init__(self, function_manager, addr, name=None, syscall=None, is_simprocedure=None, binary_name=None,
-                 is_plt=None, returning=None, alignment=False):
+    _prototypes: dict[str, SimTypeFunction | None]
+    _prototype_sources: dict[str, PrototypeSource]
+
+    def __init__(
+        self,
+        function_manager: FunctionManager | None,
+        addr: int,
+        name=None,
+        syscall=None,
+        is_simprocedure: bool | None = None,
+        binary_name=None,
+        is_plt: bool | None = None,
+        returning=None,
+        alignment=False,
+        calling_convention: SimCC | None = None,
+        prototype: SimTypeFunction | None = None,
+        prototype_libname: str | None = None,
+        prototype_source: PrototypeSource | None = None,
+        # deprecated
+        is_prototype_guessed: bool = True,
+    ):
         """
         Function constructor. If the optional parameters are not provided, they will be automatically determined upon
         the creation of a Function object.
 
         :param addr:            The address of the function.
-
-        The following parameters are optional.
-
         :param str name:        The name of the function.
         :param bool syscall:    Whether this function is a syscall or not.
         :param bool is_simprocedure:    Whether this function is a SimProcedure or not.
@@ -63,103 +261,68 @@ class Function(Serializable):
         :param bool returning:  If this function returns.
         :param bool alignment:  If this function acts as an alignment filler. Such functions usually only contain nops.
         """
-        self.transition_graph = networkx.DiGraph()
-        self._local_transition_graph = None
-        self.normalized = False
-
-        # block nodes at whose ends the function returns
-        self._ret_sites = set()
-        # block nodes at whose ends the function jumps out to another function (jumps outside)
-        self._jumpout_sites = set()
-        # block nodes at whose ends the function calls out to another non-returning function
-        self._callout_sites = set()
-        # block nodes that ends the function by returning out to another function (returns outside). This is rare.
-        self._retout_sites = set()
-        # block nodes (basic block nodes) at whose ends the function terminates
-        # in theory, if everything works fine, endpoints == ret_sites | jumpout_sites | callout_sites
-        self._endpoints = defaultdict(set)
-
-        self._call_sites = {}
-        self.addr = addr
-        # startpoint can be None if the corresponding CFGNode is a syscall node
-        self.startpoint = None
-        self._function_manager = function_manager
-        self.is_syscall = None
-        self.is_plt = None
-        self.is_simprocedure = False
-        self.alignment = alignment
-
-        # These properties are set by VariableManager
-        self.bp_on_stack = False
-        self.retaddr_on_stack = False
-        self.sp_delta = 0
-        # Calling convention
-        self.calling_convention = None  # type: Optional[SimCC]
-        # Function prototype
-        self.prototype = None  # type: Optional[SimTypeFunction]
-        self.is_prototype_guessed: bool = True
-        # Whether this function returns or not. `None` means it's not determined yet
-        self._returning = None
-        self.prepared_registers = set()
-        self.prepared_stack_variables = set()
-        self.registers_read_afterwards = set()
-
-        self._addr_to_block_node = {}  # map addresses to nodes. it's a cache of blocks. if a block is removed from the
-                                       # function, it may not be removed from _addr_to_block_node. if you want to list
-                                       # all blocks of a function, access .blocks.
-        self._block_sizes = {}  # map addresses to block sizes
-        self._block_cache = {}  # a cache of real, hard data Block objects
-        self._local_blocks = {}  # a dict of all blocks inside the function
-        self._local_block_addrs = set()  # a set of addresses of all blocks inside the function
-
-        self.info = {}  # storing special information, like $gp values for MIPS32
-        self.tags = tuple()  # store function tags. can be set manually by performing CodeTagging analysis.
-
-        # TODO: Can we remove the following two members?
-        # Register offsets of those arguments passed in registers
-        self._argument_registers = []
-        # Stack offsets of those arguments passed in stack variables
-        self._argument_stack_variables = []
-
-        self._project = None  # type: Optional[Project] # will be initialized upon the first access to self.project
-
-        self.ran_cca = False  # this is set by CompleteCallingConventions to avoid reprocessing failed functions
+        if prototype_source is None:
+            prototype_source = (
+                PrototypeSource.NONE
+                if prototype is None
+                else PrototypeSource.GUESSED
+                if is_prototype_guessed
+                else PrototypeSource.USER
+            )
+        self._init_slots(
+            function_manager,
+            addr,
+            FunctionGraph(addr),
+            calling_convention,
+            prototype,
+            prototype_libname,
+            prototype_source,
+            alignment,
+        )
 
         #
         # Initialize unspecified properties
         #
 
         if syscall is not None:
-            self.is_syscall = syscall
+            self._is_syscall = syscall
         else:
             if self.project is None:
-                raise ValueError("'syscall' must be specified if you do not specify a function manager for this new"
-                                 " function." )
+                raise ValueError(
+                    "'syscall' must be specified if you do not specify a function manager for this new function."
+                )
 
             # Determine whether this function is a syscall or not
-            self.is_syscall = self.project.simos.is_syscall_addr(addr)
+            self._is_syscall = self.project.simos.is_syscall_addr(addr)
 
         # Determine whether this function is a SimProcedure
         if is_simprocedure is not None:
-            self.is_simprocedure = is_simprocedure
+            self._is_simprocedure = is_simprocedure
         else:
             if self.project is None:
-                raise ValueError("'is_simprocedure' must be specified if you do not specify a function manager for this"
-                                 " new function.")
+                raise ValueError(
+                    "'is_simprocedure' must be specified if you do not specify a function manager for this new "
+                    "function."
+                )
 
             if self.is_syscall or self.project.is_hooked(addr):
-                self.is_simprocedure = True
+                self._is_simprocedure = True
 
         # Determine if this function is a PLT entry
         if is_plt is not None:
-            self.is_plt = is_plt
+            self._is_plt = is_plt
         else:
-            # Whether this function is a PLT entry or not is fully relying on the PLT detection in CLE
-            if self.project is None:
-                raise ValueError("'is_plt' must be specified if you do not specify a function manager for this new"
-                                 " function.")
-
-            self.is_plt = self.project.loader.find_plt_stub_name(addr) is not None
+            if self._function_manager is not None:
+                # use the faster cached version
+                self._is_plt = self._function_manager.is_plt_cached(addr)
+            else:
+                # Whether this function is a PLT entry or not is primarily relying on the PLT detection in CLE; it may
+                # also be updated (to True) during CFG recovery.
+                if self.project is None:
+                    raise ValueError(
+                        "'is_plt' must be specified if you do not specify a function manager for this new function."
+                    )
+                self._is_plt = self.project.loader.find_plt_stub_name(addr) is not None
 
         # Determine the name of this function
         if name is None:
@@ -167,7 +330,6 @@ class Function(Serializable):
         else:
             self.is_default_name = False
             self._name = name
-        self.from_signature = None
 
         # Determine the name the binary where this function is.
         if binary_name is not None:
@@ -177,27 +339,88 @@ class Function(Serializable):
 
         # Determine returning status for SimProcedures and Syscalls
         if returning is not None:
-            self._returning = returning
+            self.returning = returning
         else:
             if self.project is None:
-                raise ValueError("'returning' must be specified if you do not specify a functio nmnager for this new"
-                                 " function.")
+                raise ValueError(
+                    "'returning' must be specified if you do not specify a function manager for this new function."
+                )
 
-            self._returning = self._get_initial_returning()
+            self.returning = self._get_initial_returning()
 
-        # Determine a calling convention
-        # If it is a SimProcedure it might have a CC already defined which can be used
-        if self.is_simprocedure and self.project is not None and self.addr in self.project._sim_procedures:
-            simproc = self.project._sim_procedures[self.addr]
-            cc = simproc.cc
-            if cc is None:
-                arch = self.project.arch
-                if self.project.arch.name in DEFAULT_CC:
-                    cc = DEFAULT_CC[arch.name](arch)
+        self._init_prototype_and_calling_convention()
 
-            self.calling_convention = cc
-        else:
-            self.calling_convention = None
+    def _init_slots(
+        self,
+        function_manager: FunctionManager | None,
+        addr: int,
+        graph: FunctionGraph,
+        calling_convention: SimCC | None,
+        prototype: SimTypeFunction | None,
+        prototype_libname: str | None,
+        prototype_source: PrototypeSource,
+        alignment: bool,
+    ) -> None:
+        """
+        Initialize every slot to its default. Shared by __init__ and FunctionParser, which fills in the stored values
+        afterwards instead of letting __init__ derive them from the project.
+        """
+        self._graph = graph
+        # the networkx view of the store, created on-demand
+        self._transition_graph: TransitionGraph | None = None
+        # CodeNode objects, created on demand
+        self._node_objs: dict[int, CodeNode] = {}
+        self._block_addrs_cache: set[int] | None = None
+        self._local_transition_graph = None
+        self.normalized = False
+
+        self.addr = addr
+        self._function_manager = function_manager
+        self._is_syscall = False
+        self._is_simprocedure = False
+        self._is_plt = False
+        self._is_alignment = alignment
+        self._name = ""
+        self.is_default_name = False
+        self.previous_names = []
+        self._from_signature: str | None = None
+        self.binary_name = None
+
+        # These properties are set by VariableManager
+        self.bp_on_stack = False
+        self.retaddr_on_stack = False
+        self.sp_delta = 0
+        # Calling convention
+        self._calling_convention = calling_convention
+        # Function prototypes, keyed by decompilation flavor. The default-flavor entry always exists; other
+        # flavors have an entry only once a flavored decompilation writes one. Prototypes may contain SimTypeRefs
+        # (e.g., when loaded from a library definition or an angrdb); they are dereferenced lazily on the first read.
+        self._prototypes = {Flavors.DEFAULT_FLAVOR: prototype}
+        self._prototype_sources = {Flavors.DEFAULT_FLAVOR: prototype_source}
+        self._prototypes_resolved: set[str] = set()
+        self._prototype_ref_warned: set[str] = set()
+        self._prototype_libname = prototype_libname
+        # Whether this function returns or not. `None` means it's not determined yet
+        self._returning = None
+
+        self._info = FunctionInfo(self)  # storing special information, like $gp values for MIPS32
+        self.tags = ()  # store function tags. can be set manually by performing CodeTagging analysis.
+
+        # Initialize _cyclomatic_complexity to None
+        self._cyclomatic_complexity = None
+
+        # TODO: Can we remove the following two members?
+        # Register offsets of those arguments passed in registers
+        self._argument_registers = []
+        # Stack offsets of those arguments passed in stack variables
+        self._argument_stack_variables = []
+
+        self._project: Project | None = None  # will be initialized upon the first access to self.project
+
+        self.ran_cca = False  # this is set by CompleteCallingConventions to avoid reprocessing failed functions
+        self._dirty: bool = True
+        self.meta_only: bool = False
+        self.evicted: bool = False
 
     @property
     def name(self):
@@ -205,15 +428,36 @@ class Function(Serializable):
 
     @name.setter
     def name(self, v):
+        if v == self._name:
+            return
+        if self._name not in self.previous_names:
+            self.previous_names.append(self._name)
+        if self._function_manager is not None:
+            self._function_manager.function_name_changed(self.addr, self._name, v)
+            self._function_manager._kb.labels[self.addr] = v
         self._name = v
-        self._function_manager._kb.labels[self.addr] = v
+        self.mark_dirty()
 
     @property
-    def project(self):
-        if self._project is None:
+    def from_signature(self) -> str | None:
+        return self._from_signature
+
+    @from_signature.setter
+    def from_signature(self, v: str | None):
+        if self._from_signature == v:
+            return
+        self._from_signature = v
+        self.mark_dirty()
+
+        # update the cache
+        if self._function_manager is not None:
+            self._function_manager.set_from_signature(self.addr, v)
+
+    @property
+    def project(self) -> Project | None:
+        if self._project is None and self._function_manager is not None:
             # try to set it from function manager
-            if self._function_manager is not None:
-                self._project = self._function_manager._kb._project #type: Optional[Project]
+            self._project = self._function_manager._kb._project
         return self._project
 
     @property
@@ -222,7 +466,491 @@ class Function(Serializable):
 
     @returning.setter
     def returning(self, v):
+        if self._returning == v:
+            return
         self._returning = v
+        self.mark_dirty()
+
+        # update the cache
+        if self._function_manager is not None:
+            self._function_manager.set_function_returning(self.addr, v)
+
+    @property
+    def calling_convention(self) -> SimCC | None:
+        return self._calling_convention
+
+    @calling_convention.setter
+    @dirty_func
+    def calling_convention(self, cc: SimCC | None):
+        self._calling_convention = cc
+
+    #
+    # Prototypes
+    #
+
+    @property
+    def prototypes(self) -> dict[str, SimTypeFunction | None]:
+        """
+        A snapshot of every flavor's prototype, keyed by decompilation flavor. Write through set_prototype(); the
+        default-flavor entry is also exposed as .prototype.
+        """
+        return {flavor: self._resolved_prototype(flavor) for flavor in self._prototypes}
+
+    @property
+    def prototype_sources(self) -> dict[str, PrototypeSource]:
+        """A snapshot of every flavor's prototype source; the default-flavor entry is also exposed as .prototype_source."""
+        return dict(self._prototype_sources)
+
+    @property
+    def prototype(self) -> SimTypeFunction | None:
+        return self._resolved_prototype(Flavors.DEFAULT_FLAVOR)
+
+    @prototype.setter
+    def prototype(self, proto: SimTypeFunction | None):
+        self.set_prototype(Flavors.DEFAULT_FLAVOR, proto)
+
+    def get_prototype(self, flavor: str | None) -> SimTypeFunction | None:
+        """
+        The prototype a decompilation of the given flavor should use: the flavor's own entry, or the C prototype when
+        the flavor has none. The C flavor never falls back to another flavor.
+        """
+        key = _flavor_key(flavor)
+        if key not in self._prototypes:
+            key = Flavors.DEFAULT_FLAVOR
+        return self._resolved_prototype(key)
+
+    def has_prototype_for_flavor(self, flavor: str | None) -> bool:
+        """Whether the flavor has its own entry (as opposed to falling back to the C prototype)."""
+        return _flavor_key(flavor) in self._prototypes
+
+    def uses_default_prototype_for(self, flavor: str | None) -> bool:
+        """Whether get_prototype(flavor) is the default flavor's (C) prototype, e.g., to dereference it by library."""
+        key = _flavor_key(flavor)
+        return key == Flavors.DEFAULT_FLAVOR or key not in self._prototypes
+
+    def get_prototype_source(self, flavor: str | None) -> PrototypeSource:
+        """The source of the prototype get_prototype(flavor) returns."""
+        key = _flavor_key(flavor)
+        if key not in self._prototypes:
+            key = Flavors.DEFAULT_FLAVOR
+        return self._prototype_sources[key]
+
+    @dirty_func
+    def set_prototype(
+        self, flavor: str | None, proto: SimTypeFunction | None, source: PrototypeSource | None = None
+    ) -> None:
+        """
+        Set the prototype of a flavor. A flavor's first entry starts with the source of the prototype it used to fall
+        back to (the C one) unless ``source`` is given.
+        """
+        key = _flavor_key(flavor)
+        # if an argument does not have a name, assign it with the name of the exiting argument or a default name
+        if (
+            proto is not None
+            and proto.args
+            and (len(proto.arg_names) < len(proto.args) or any(not arg_name for arg_name in proto.arg_names))
+        ):
+            existing = self._prototypes.get(key)
+            proto = proto.copy()
+            arg_names = list(proto.arg_names)
+            for i in range(len(proto.args)):
+                if i < len(arg_names):
+                    if not arg_names[i]:
+                        if existing is not None and i < len(existing.arg_names):
+                            arg_names[i] = existing.arg_names[i]
+                        else:
+                            arg_names[i] = f"a{i}"
+                else:
+                    if existing is not None and i < len(existing.arg_names):
+                        arg_names.append(existing.arg_names[i])
+                    else:
+                        arg_names.append(f"a{i}")
+            proto.arg_names = tuple(arg_names)
+        if key not in self._prototype_sources:
+            self._prototype_sources[key] = self._prototype_sources[Flavors.DEFAULT_FLAVOR]
+        self._prototypes[key] = proto
+        self._prototypes_resolved.discard(key)
+        self._prototype_ref_warned.discard(key)
+        if source is not None:
+            self._prototype_sources[key] = source
+
+    def set_prototype_source(self, flavor: str | None, source: PrototypeSource) -> None:
+        """Set the source of a flavor's prototype; a flavor without an entry gets one that falls back to C's."""
+        key = _flavor_key(flavor)
+        if key not in self._prototypes:
+            c_proto = self._prototypes[Flavors.DEFAULT_FLAVOR]
+            self._prototypes[key] = c_proto.copy() if c_proto is not None else None
+        if self._prototype_sources.get(key) == source:
+            return
+        self._prototype_sources[key] = source
+        self.mark_dirty()
+
+    @dirty_func
+    def clear_prototype(self, flavor: str | None) -> None:
+        """Drop a flavor's own entry so that it falls back to the C prototype; clearing C sets it to None."""
+        key = _flavor_key(flavor)
+        if key == Flavors.DEFAULT_FLAVOR:
+            self._prototypes[key] = None
+            self._prototype_sources[key] = PrototypeSource.NONE
+        else:
+            self._prototypes.pop(key, None)
+            self._prototype_sources.pop(key, None)
+        self._prototypes_resolved.discard(key)
+        self._prototype_ref_warned.discard(key)
+
+    def _resolved_prototype(self, key: str) -> SimTypeFunction | None:
+        proto = self._prototypes[key]
+        if proto is None or key in self._prototypes_resolved:
+            return proto
+        self._resolve_prototype(key)
+        return self._prototypes[key]
+
+    def _resolve_prototype(self, key: str) -> None:
+        """
+        Dereference SimTypeRefs in the prototype using the loaded type collections. Unresolvable references are kept
+        and retried on the next read.
+        """
+        proto = self._prototypes[key]
+        assert proto is not None
+        refs = find_type_refs(proto)
+        if refs:
+            proto = dereference_simtype(proto, type_collections_for_lib(self._prototype_libname), keep_missing=True)
+            assert isinstance(proto, SimTypeFunction)
+            self._prototypes[key] = proto
+            refs = find_type_refs(proto)
+        if refs:
+            if key not in self._prototype_ref_warned:
+                self._prototype_ref_warned.add(key)
+                l.warning(
+                    "Prototype of function %s references unknown types %s; load the type library that defines them.",
+                    self.name,
+                    sorted(refs),
+                )
+        else:
+            self._prototypes_resolved.add(key)
+
+    @property
+    def prototype_libname(self):
+        return self._prototype_libname
+
+    @prototype_libname.setter
+    def prototype_libname(self, libname: str | None):
+        if self._prototype_libname == libname:
+            return
+        self._prototype_libname = libname
+        self._prototypes_resolved.clear()
+        self._prototype_ref_warned.clear()
+        self.mark_dirty()
+
+    @property
+    def is_prototype_guessed(self) -> bool:
+        return self.is_prototype_guessed_for(Flavors.DEFAULT_FLAVOR)
+
+    def is_prototype_guessed_for(self, flavor: str | None) -> bool:
+        return self.get_prototype_source(flavor) in {
+            PrototypeSource.NONE,
+            PrototypeSource.GUESSED,
+            PrototypeSource.CCA_LOW,
+        }
+
+    @property
+    def is_prototype_groundtruth(self) -> bool:
+        """
+        True if the prototype comes from outside of the decompiler (SimProcedures, signatures, or the user) and may be
+        fed back into type inference as ground truth. Prototypes inferred by the decompiler itself are excluded so that
+        re-decompiling a function does not freeze its own earlier guess.
+        """
+        return self.is_prototype_groundtruth_for(Flavors.DEFAULT_FLAVOR)
+
+    def is_prototype_groundtruth_for(self, flavor: str | None) -> bool:
+        """is_prototype_groundtruth for the prototype get_prototype(flavor) returns."""
+        return (
+            self.get_prototype(flavor) is not None
+            and self.get_prototype_source(flavor) > PrototypeSource.CCA_DECOMPILER
+        )
+
+    @property
+    def prototype_source(self) -> PrototypeSource:
+        return self._prototype_sources[Flavors.DEFAULT_FLAVOR]
+
+    @prototype_source.setter
+    def prototype_source(self, source: PrototypeSource) -> None:
+        self.set_prototype_source(Flavors.DEFAULT_FLAVOR, source)
+
+    @property
+    def info(self) -> FunctionInfo:
+        return self._info
+
+    @info.setter
+    @dirty_func
+    def info(self, info: FunctionInfo | dict):
+        if not isinstance(info, FunctionInfo):
+            o = FunctionInfo(self)
+            o.update(info)
+            info = o
+        self._info = info
+        # update the owner
+        self._info._func = self
+        if self._function_manager is not None:
+            self._function_manager.index_key_func_addrs(self)
+
+    @property
+    def is_plt(self) -> bool:
+        return self._is_plt
+
+    @is_plt.setter
+    def is_plt(self, v: bool):
+        if self._is_plt == v:
+            return
+        self._is_plt = v
+        self.mark_dirty()
+
+    @property
+    def is_simprocedure(self) -> bool:
+        return self._is_simprocedure
+
+    @is_simprocedure.setter
+    def is_simprocedure(self, v: bool):
+        if self._is_simprocedure == v:
+            return
+        self._is_simprocedure = v
+        self.mark_dirty()
+
+    @property
+    def is_syscall(self) -> bool:
+        return self._is_syscall
+
+    @is_syscall.setter
+    def is_syscall(self, v: bool):
+        if self._is_syscall == v:
+            return
+        self._is_syscall = v
+        self.mark_dirty()
+
+    @property
+    def is_alignment(self) -> bool:
+        return self._is_alignment
+
+    @is_alignment.setter
+    def is_alignment(self, v: bool):
+        if self._is_alignment == v:
+            return
+        self._is_alignment = v
+        self.mark_dirty()
+
+    #
+    # Graph store access
+    #
+
+    def _node_obj(self, idx: int) -> CodeNode:
+        """
+        Get a CodeNode object for a given node ID.
+        """
+        obj = self._node_objs.get(idx)
+        if obj is None:
+            kind, addr, size, thumb = self._graph.node(idx)
+            project = self.project
+            if kind == NodeKind.BLOCK:
+                obj = BlockNode(
+                    addr, size, bytestr=self._graph.node_bytes(idx), thumb=thumb, delta=self._graph.node_delta(idx)
+                )
+            elif kind == NodeKind.FUNC:
+                obj = FuncNode(addr)
+            elif kind == NodeKind.HOOK:
+                obj = HookNode(addr, size, project.hooked_by(addr) if project is not None else None, thumb=thumb)
+            else:
+                obj = SyscallNode(
+                    addr, size, project.simos.syscall_from_addr(addr) if project is not None else None, thumb=thumb
+                )
+            obj.set_owner(self)
+            self._node_objs[idx] = obj
+        return obj
+
+    def _store_manual_bytes(self, idx: int, node: CodeNode) -> None:
+        if isinstance(node, BlockNode) and node._bytestr is not None:
+            self._graph.set_node_bytes(idx, node._bytestr)
+
+    def _node_objs_of(self, idxs: Iterable[int]) -> list[CodeNode]:
+        return [self._node_obj(i) for i in idxs]
+
+    def _graph_node(self, node: CodeNode) -> int:
+        """
+        Add a node to the graph if necessary. Return the ID of the node.
+        """
+        kind, addr, size, thumb = _node_key(node)
+        idx, created = self._graph.add_node(kind, addr, size, thumb, _node_delta(node))
+        node.set_owner(self)
+        if created:
+            self._store_manual_bytes(idx, node)
+        if created or idx not in self._node_objs:
+            self._node_objs[idx] = node
+        if self._transition_graph is not None:
+            self._transition_graph._mirror_add_node(self._node_objs[idx])
+        return idx
+
+    def _find_node(self, node: CodeNode) -> int | None:
+        return self._graph.find_node(*_node_key(node))
+
+    def _add_edge(self, src: int, dst: int, kind: EdgeKind, present: int, **data) -> None:
+        self._graph.add_edge(src, dst, kind, present, **data)
+        if self._transition_graph is not None:
+            attrs = dict(data)
+            if present & PRESENT_TYPE:
+                attrs["type"] = _EDGE_KIND_NAMES[kind]
+            self._transition_graph._mirror_add_edge(self._node_obj(src), self._node_obj(dst), attrs)
+
+    def _node_index(self, node: CodeNode) -> int:
+        idx = self._find_node(node)
+        if idx is None or not self._graph.contains_node(idx):
+            raise networkx.NetworkXError(f"The node {node} is not in the graph.")
+        return idx
+
+    def _successors_of(self, node: CodeNode) -> list[CodeNode]:
+        """
+        The successors of a node in the transition graph.
+        """
+        return self._node_objs_of(self._graph.successors(self._node_index(node)))
+
+    def _predecessors_of(self, node: CodeNode) -> list[CodeNode]:
+        return self._node_objs_of(self._graph.predecessors(self._node_index(node)))
+
+    def transition_out_edges(self, node: CodeNode) -> list[tuple[CodeNode, Mapping[str, Any]]]:
+        """
+        (successor, edge data) pairs of a node, in the order of ``transition_graph.out_edges(node, data=True)``,
+        without building the networkx transition graph when it does not exist yet.
+        """
+        tg = self._transition_graph
+        if tg is not None:
+            return [(dst, data) for _, dst, data in tg.out_edges(node, data=True)]
+        idx = self._node_index(node)
+        g = self._graph
+        objs = self._node_obj
+        return [(objs(dst), g.edge_data(idx, dst) or {}) for dst in g.successors(idx)]
+
+    def transition_in_edges(self, node: CodeNode) -> list[tuple[CodeNode, Mapping[str, Any]]]:
+        """
+        (predecessor, edge data) pairs of a node, in the order of ``transition_graph.in_edges(node, data=True)``,
+        without building the networkx transition graph when it does not exist yet.
+        """
+        tg = self._transition_graph
+        if tg is not None:
+            return [(src, data) for src, _, data in tg.in_edges(node, data=True)]
+        idx = self._node_index(node)
+        g = self._graph
+        objs = self._node_obj
+        # a freshly built transition graph lists predecessors in node order
+        return [(objs(src), g.edge_data(src, idx) or {}) for src in sorted(g.predecessors(idx))]
+
+    def has_node(self, node: CodeNode) -> bool:
+        idx = self._find_node(node)
+        return idx is not None and self._graph.contains_node(idx)
+
+    def set_edge_outside(self, src: CodeNode, dst: CodeNode, outside: bool) -> None:
+        s, d = self._find_node(src), self._find_node(dst)
+        if s is None or d is None or not self._graph.has_edge(s, d):
+            raise networkx.NetworkXError(f"The edge {src}-{dst} is not in the graph.")
+        self._add_edge(s, d, EdgeKind.TRANSITION, PRESENT_OUTSIDE, outside=outside)
+        self.mark_dirty()
+        self._local_transition_graph = None
+
+    def _set_edge_confirmed(self, src: int, dst: int, confirmed: bool) -> None:
+        self._graph.set_edge_confirmed(src, dst, confirmed)
+        if self._transition_graph is not None:
+            self._transition_graph._mirror_set_edge_attr(
+                self._node_obj(src), self._node_obj(dst), "confirmed", confirmed
+            )
+
+    # Direct graph edits.
+    #
+    # The networkx views are read-only. The methods below are the equivalents of
+    # DiGraph.add_node, add_edge, remove_node, and remove_edge on the transition graph.
+
+    def add_graph_node(self, node: CodeNode) -> None:
+        """
+        Add a node to the transition graph without registering it as a local block.
+        """
+        self._graph_node(node)
+        self.mark_dirty()
+        self._local_transition_graph = None
+
+    def add_graph_edge(
+        self,
+        src: CodeNode,
+        dst: CodeNode,
+        type: str | None = None,  # pylint:disable=redefined-builtin
+        outside: bool | None = None,
+        ins_addr: int | None = _UNSET,  # type: ignore[assignment]
+        stmt_idx: int | None = _UNSET,  # type: ignore[assignment]
+        confirmed: bool | None = None,
+    ) -> None:
+        """
+        Add or update an edge of the transition graph.
+        """
+        present = 0
+        kind = EdgeKind.TRANSITION
+        data = {}
+        if type is not None:
+            present |= PRESENT_TYPE
+            kind = _EDGE_KINDS[type]
+        if outside is not None:
+            present |= PRESENT_OUTSIDE
+            data["outside"] = bool(outside)
+        if ins_addr is not _UNSET:
+            present |= PRESENT_INS_ADDR
+            data["ins_addr"] = ins_addr
+        if stmt_idx is not _UNSET:
+            present |= PRESENT_STMT_IDX
+            data["stmt_idx"] = stmt_idx
+        if confirmed is not None:
+            present |= PRESENT_CONFIRMED
+            data["confirmed"] = bool(confirmed)
+        self._add_edge(self._graph_node(src), self._graph_node(dst), kind, present, **data)
+        self.mark_dirty()
+        self._local_transition_graph = None
+
+    def remove_graph_node(self, node: CodeNode) -> None:
+        """
+        Remove a node and its edges from the transition graph.
+        """
+        idx = self._find_node(node)
+        if idx is None or not self._graph.remove_node(idx):
+            raise networkx.NetworkXError(f"The node {node} is not in the graph.")
+        if self._transition_graph is not None:
+            self._transition_graph._mirror_remove_node(self._node_obj(idx))
+        self.mark_dirty()
+        self._local_transition_graph = None
+
+    def set_edge_confirmed(self, src: CodeNode, dst: CodeNode, confirmed: bool) -> None:
+        s, d = self._find_node(src), self._find_node(dst)
+        if s is None or d is None or not self._graph.has_edge(s, d):
+            raise networkx.NetworkXError(f"The edge {src}-{dst} is not in the graph.")
+        self._set_edge_confirmed(s, d, confirmed)
+        self.mark_dirty()
+        self._local_transition_graph = None
+
+    @property
+    def transition_graph(self) -> TransitionGraph:
+        """
+        A read-only networkx view of the transition graph, created on-demand and kept in sync with the
+        Function's updates.
+        """
+        tg = self._transition_graph
+        if tg is None:
+            tg = TransitionGraph()
+            objs = self._node_obj
+            tg._mirror_add_nodes(objs(i) for i in self._graph.nodes())
+            tg._mirror_add_edges((objs(u), objs(v), d) for u, v, d in self._graph.edges_with_data())
+            self._transition_graph = tg
+        return tg
+
+    @property
+    def startpoint(self) -> CodeNode | None:
+        idx = self._graph.startpoint
+        return None if idx is None else self._node_obj(idx)
+
+    @startpoint.setter
+    def startpoint(self, node: CodeNode | None) -> None:
+        self._graph.startpoint = None if node is None else self._graph_node(node)
 
     @property
     def blocks(self):
@@ -232,12 +960,51 @@ class Function(Serializable):
         :return: angr.lifter.Block instances.
         """
 
-        for block_addr, block in self._local_blocks.items():
-            try:
-                yield self.get_block(block_addr, size=block.size,
-                                      byte_string=block.bytestr if isinstance(block, BlockNode) else None)
-            except (SimEngineError, SimMemoryError):
-                pass
+        for block_addr, idx in self._graph.local_items():
+            node = self._node_objs.get(idx)
+            # bytestr is only set for user-supplied bytes
+            bytestr = node._bytestr if isinstance(node, BlockNode) else None
+            with contextlib.suppress(SimEngineError, SimMemoryError):
+                yield self.get_block(block_addr, size=self._graph.node_size(idx), byte_string=bytestr)
+
+    @property
+    def code_nodes(self) -> dict[int, CodeNode]:
+        return {addr: self._node_obj(idx) for addr, idx in self._graph.local_items()}
+
+    @property
+    def cyclomatic_complexity(self):
+        """
+        The cyclomatic complexity of the function.
+
+        Cyclomatic complexity is a software metric used to indicate the complexity of a program.
+        It is a quantitative measure of the number of linearly independent paths through a program's source code.
+        It is computed using the formula: M = E - N + 2P, where
+        E = the number of edges in the graph,
+        N = the number of nodes in the graph,
+        P = the number of connected components.
+
+        The cyclomatic complexity value is lazily computed and cached for future use.
+        Initially this value is None until it is computed for the first time
+
+        :return: The cyclomatic complexity of the function.
+        :rtype: int
+        """
+        if self._cyclomatic_complexity is None:
+            self._cyclomatic_complexity = self._graph.number_of_edges() - self._graph.number_of_nodes() + 2
+        return self._cyclomatic_complexity
+
+    @property
+    def xrefs(self) -> Iterator[XRef]:
+        """
+        An iterator of all xrefs of the current function.
+
+        :return: angr.knowledge_plugins.xrefs.xref.XRef instances.
+        """
+        assert self._function_manager is not None
+        for block in self.blocks:
+            yield from self._function_manager._kb.xrefs.get_xrefs_by_ins_addr_region(
+                block.addr, block.addr + block.size
+            )
 
     @property
     def block_addrs(self):
@@ -247,7 +1014,7 @@ class Function(Serializable):
         :return: block addresses.
         """
 
-        return self._local_blocks.keys()
+        return self._graph.local_addrs()
 
     @property
     def block_addrs_set(self):
@@ -258,9 +1025,11 @@ class Function(Serializable):
         :rtype: set
         """
 
-        return self._local_block_addrs
+        if self._block_addrs_cache is None:
+            self._block_addrs_cache = set(self._graph.local_addrs())
+        return self._block_addrs_cache
 
-    def get_block(self, addr: int, size: Optional[int]=None, byte_string: Optional[bytes]=None):
+    def get_block(self, addr: int, size: int | None = None, byte_string: bytes | None = None):
         """
         Getting a block out of the current function.
 
@@ -269,53 +1038,52 @@ class Function(Serializable):
         :param byte_string:
         :return:
         """
-        if addr in self._block_cache:
-            b = self._block_cache[addr]
-            if size is None or b.size == size:
-                return b
-            else:
-                # size seems to be updated. remove this cached entry from the block cache
-                del self._block_cache[addr]
-
-        if size is None and addr in self.block_addrs:
+        if size is None and self._graph.is_local(addr):
             # we know the size
-            size = self._block_sizes[addr]
+            size = self._graph.block_size(addr)
 
-        block = self._project.factory.block(addr, size=size, byte_string=byte_string)
+        assert self.project is not None
+        block = self.project.factory.block(addr, size=size, byte_string=byte_string)
         if size is None:
             # update block_size dict
-            self._block_sizes[addr] = block.size
-        self._block_cache[addr] = block
+            self._graph.set_block_size(addr, block.size)
         return block
 
     # compatibility
     _get_block = get_block
 
-    def get_block_size(self, addr: int) -> Optional[int]:
-        return self._block_sizes.get(addr, None)
+    def get_block_size(self, addr: int) -> int | None:
+        return self._graph.block_size(addr)
 
     @property
-    def nodes(self) -> Generator[CodeNode,None,None]:
+    def nodes(self) -> Iterable[CodeNode]:
         return self.transition_graph.nodes()
 
-    def get_node(self, addr):
-        return self._addr_to_block_node.get(addr, None)
+    def get_node(self, addr) -> BlockNode | None:
+        idx = self._graph.block_node_at(addr)
+        if idx is None:
+            return None
+        node = self._node_obj(idx)
+        assert isinstance(node, BlockNode)
+        return node
 
     @property
     def has_unresolved_jumps(self):
+        assert self._function_manager is not None
         for addr in self.block_addrs:
             if addr in self._function_manager._kb.unresolved_indirect_jumps:
                 b = self._function_manager._kb._project.factory.block(addr)
-                if b.vex.jumpkind == 'Ijk_Boring':
+                if b.vex.jumpkind == "Ijk_Boring":
                     return True
         return False
 
     @property
     def has_unresolved_calls(self):
+        assert self._function_manager is not None
         for addr in self.block_addrs:
             if addr in self._function_manager._kb.unresolved_indirect_jumps:
                 b = self._function_manager._kb._project.factory.block(addr)
-                if b.vex.jumpkind == 'Ijk_Call':
+                if b.vex.jumpkind == "Ijk_Call":
                     return True
         return False
 
@@ -336,7 +1104,7 @@ class Function(Serializable):
 
     @classmethod
     def _get_cmsg(cls):
-        return function_pb2.Function()
+        return function_pb2.Function()  # type: ignore  # pylint:disable=no-member
 
     def serialize_to_cmessage(self):
         return FunctionParser.serialize(self)
@@ -350,50 +1118,35 @@ class Function(Serializable):
         """
         return FunctionParser.parse_from_cmsg(cmsg, **kwargs)
 
-
-    def string_references(self, minimum_length=2, vex_only=False):
+    def string_references(self, minimum_length=2):
         """
         All of the constant string references used by this function.
 
         :param minimum_length:  The minimum length of strings to find (default is 1)
-        :param vex_only:        Only analyze VEX IR, don't interpret the entry state to detect additional constants.
-        :return:                A list of tuples of (address, string) where is address is the location of the string in
-                                memory.
+        :return:                A generator yielding tuples of (address, string) where is address
+                                is the location of the string in memory.
         """
-        strings = []
-        memory = self._project.loader.memory
 
-        # get known instruction addresses and call targets
-        # these addresses cannot be string references, but show up frequently in the runtime values
-        known_executable_addresses = set()
-        for block in self.blocks:
-            known_executable_addresses.update(block.instruction_addrs)
-        for function in self._function_manager.values():
-            known_executable_addresses.update(set(x.addr for x in function.graph.nodes()))
+        assert self._function_manager is not None
+        cfg = self._function_manager._kb.cfgs.get_most_accurate()
+        if cfg is None:
+            return
 
-        # loop over all local runtime values and check if the value points to a printable string
-        for addr in self.local_runtime_values if not vex_only else self.code_constants:
-            if not isinstance(addr, claripy.fp.FPV) and addr in memory:
-                # check that the address isn't an pointing to known executable code
-                # and that it isn't an indirect pointer to known executable code
-                try:
-                    possible_pointer = memory.unpack_word(addr)
-                    if addr not in known_executable_addresses and possible_pointer not in known_executable_addresses:
-                        # build string
-                        stn = ""
-                        offset = 0
-                        current_char = chr(memory[addr + offset])
-                        while current_char in string.printable:
-                            stn += current_char
-                            offset += 1
-                            current_char = chr(memory[addr + offset])
+        for x in self.xrefs:
+            if x.dst is None:
+                continue
+            try:
+                md = cfg.memory_data[x.dst]
+            except KeyError:
+                continue
+            if md.sort not in {MemoryDataSort.String, MemoryDataSort.UnicodeString}:
+                continue
+            if md.content is None:
+                continue
+            if len(md.content) < minimum_length:
+                continue
 
-                        # check that the string was a null terminated string with minimum length
-                        if current_char == "\x00" and len(stn) >= minimum_length:
-                            strings.append((addr, stn))
-                except KeyError:
-                    pass
-        return strings
+            yield md.addr, md.content
 
     @property
     def local_runtime_values(self):
@@ -407,21 +1160,22 @@ class Function(Serializable):
         """
         constants = set()
 
-        if not self._project.loader.main_object.contains_addr(self.addr):
+        assert self.project is not None
+        if not self.project.loader.main_object.contains_addr(self.addr):
             return constants
 
         # FIXME the old way was better for architectures like mips, but we need the initial irsb
         # reanalyze function with a new initial state (use persistent registers)
         # initial_state = self._function_manager._cfg.get_any_irsb(self.addr).initial_state
-        # fresh_state = self._project.factory.blank_state(mode="fastpath")
+        # fresh_state = self.project.factory.blank_state(mode="fastpath")
         # for reg in initial_state.arch.persistent_regs + ['ip']:
         #     fresh_state.registers.store(reg, initial_state.registers.load(reg))
 
         # reanalyze function with a new initial state
-        fresh_state = self._project.factory.blank_state(mode="fastpath")
+        fresh_state = self.project.factory.blank_state(mode="fastpath")
         fresh_state.regs.ip = self.addr
 
-        graph_addrs = set(x.addr for x in self.graph.nodes() if isinstance(x, BlockNode))
+        graph_addrs = {x.addr for x in self.graph.nodes() if isinstance(x, BlockNode)}
 
         # process the nodes in a breadth-first order keeping track of which nodes have already been analyzed
         analyzed = set()
@@ -433,22 +1187,27 @@ class Function(Serializable):
             if state.solver.eval(state.ip) not in graph_addrs:
                 continue
             # don't trace into simprocedures
-            if self._project.is_hooked(state.solver.eval(state.ip)):
+            if self.project.is_hooked(state.solver.eval(state.ip)):
                 continue
             # don't trace outside of the binary
-            if not self._project.loader.main_object.contains_addr(state.solver.eval(state.ip)):
+            if not self.project.loader.main_object.contains_addr(state.solver.eval(state.ip)):
                 continue
             # don't trace unreachable blocks
-            if state.history.jumpkind in {'Ijk_EmWarn', 'Ijk_NoDecode',
-                                          'Ijk_MapFail', 'Ijk_NoRedir',
-                                          'Ijk_SigTRAP', 'Ijk_SigSEGV',
-                                          'Ijk_ClientReq'}:
+            if state.history.jumpkind in {
+                "Ijk_EmWarn",
+                "Ijk_NoDecode",
+                "Ijk_MapFail",
+                "Ijk_NoRedir",
+                "Ijk_SigTRAP",
+                "Ijk_SigSEGV",
+                "Ijk_ClientReq",
+            }:
                 continue
 
             curr_ip = state.solver.eval(state.ip)
 
             # get runtime values from logs of successors
-            successors = self._project.factory.successors(state)
+            successors = self.project.factory.successors(state)
             for succ in successors.flat_successors + successors.unsat_successors:
                 for a in succ.history.recent_actions:
                     for ao in a.all_objects:
@@ -470,13 +1229,13 @@ class Function(Serializable):
             if node is None:
                 # the node does not exist. maybe it's not a block node.
                 continue
-            missing = set(x.addr for x in list(self.graph.successors(node))) - analyzed
+            missing = {x.addr for x in list(self.graph.successors(node))} - analyzed
             for succ_addr in missing:
                 l.info("Forcing jump to missing successor: %#x", succ_addr)
                 if succ_addr not in analyzed:
-                    all_successors = successors.unconstrained_successors + \
-                                     successors.flat_successors + \
-                                     successors.unsat_successors
+                    all_successors = (
+                        successors.unconstrained_successors + successors.flat_successors + successors.unsat_successors
+                    )
                     if len(all_successors) > 0:
                         # set the ip of a copied successor to the successor address
                         succ = all_successors[0].copy()
@@ -494,70 +1253,138 @@ class Function(Serializable):
 
     def __contains__(self, val):
         if isinstance(val, int):
-            return val in self._block_sizes
-        else:
-            return False
+            return self._graph.has_block_size(val)
+        return False
 
     def __str__(self):
-        s = 'Function %s [%s]\n' % (self.name, self.addr)
-        s += '  Syscall: %s\n' % self.is_syscall
-        s += '  SP difference: %d\n' % self.sp_delta
-        s += '  Has return: %s\n' % self.has_return
-        s += '  Returning: %s\n' % ('Unknown' if self.returning is None else self.returning)
-        s += '  Alignment: %s\n' % (self.alignment)
-        s += '  Arguments: reg: %s, stack: %s\n' % \
-            (self._argument_registers,
-             self._argument_stack_variables)
-        s += '  Blocks: [%s]\n' % ", ".join(['%#x' % i for i in self.block_addrs])
-        s += "  Calling convention: %s" % self.calling_convention
-        return s
+        return (
+            f"Function {self.name} [{self.addr:#x}]\n"
+            f"  Syscall: {self.is_syscall}\n"
+            f"  SP difference: {self.sp_delta}\n"
+            f"  Has return: {self.has_return}\n"
+            f"  Returning: {'Unknown' if self.returning is None else self.returning}\n"
+            f"  Alignment: {self.is_alignment}\n"
+            f"  Arguments: reg: {self._argument_registers}, stack: {self._argument_stack_variables}\n"
+            f"  Blocks: [{', '.join(f'{i:#x}' for i in self.block_addrs)}]\n"
+            f"  Cyclomatic Complexity: {self.cyclomatic_complexity}\n"
+            f"  Calling convention: {self.calling_convention}"
+        )
 
     def __repr__(self):
         if self.is_syscall:
-            return '<Syscall function %s (%s)>' % (self.name,
-                                                   hex(self.addr) if isinstance(self.addr, int) else self.addr)
-        return '<Function %s (%s)>' % (self.name, hex(self.addr) if isinstance(self.addr, int) else self.addr)
+            return f"<Syscall function {self.name} ({hex(self.addr) if isinstance(self.addr, int) else self.addr})>"
+        return f"<Function {self.name} ({hex(self.addr) if isinstance(self.addr, int) else self.addr})>"
 
     def __setstate__(self, state):
+        if "_prototype" in state:
+            # pickled before prototypes became per-flavor
+            state["_prototypes"] = {Flavors.DEFAULT_FLAVOR: state.pop("_prototype")}
+            state["_prototype_sources"] = {Flavors.DEFAULT_FLAVOR: state.pop("_prototype_source")}
+            state["_prototypes_resolved"] = set()
+            state["_prototype_ref_warned"] = set()
+            state.pop("_prototype_resolved", None)
+        if "_graph" not in state:
+            self._set_legacy_state(state)
+            return
         for k, v in state.items():
             setattr(self, k, v)
 
+    def _set_legacy_state(self, state: dict) -> None:
+        """
+        Restore legacy Function pickling result (before we migrate FunctionGraph into Rust).
+        """
+        graph_keys = {
+            "transition_graph",
+            "_local_transition_graph",
+            "_addr_to_block_node",
+            "_block_sizes",
+            "_local_blocks",
+            "_local_block_addrs",
+            "_ret_sites",
+            "_jumpout_sites",
+            "_callout_sites",
+            "_retout_sites",
+            "_endpoints",
+            "_call_sites",
+            "startpoint",
+        }
+        for k, v in state.items():
+            if k not in graph_keys:
+                setattr(self, k, v)
+        self._graph = FunctionGraph(self.addr)
+        self._transition_graph = None
+        self._node_objs = {}
+        self._block_addrs_cache = None
+        self._local_transition_graph = None
+        for node in state["_local_blocks"].values():
+            self.register(True, node, update_func_block_count=False)
+        old_graph = state["transition_graph"]
+        for node in old_graph.nodes():
+            self._graph_node(node)
+        for src, dst, data in old_graph.edges(data=True):
+            self.add_graph_edge(src, dst, **data)
+        for addr, size in state["_block_sizes"].items():
+            self._graph.set_block_size(addr, size)
+        for node in state["_addr_to_block_node"].values():
+            self._graph.set_block_node_at(node.addr, self._graph_node(node))
+        for sort, nodes in state["_endpoints"].items():
+            for node in nodes:
+                self.add_endpoint(node, sort)
+        for key, kind in (
+            ("_ret_sites", SiteKind.RET),
+            ("_jumpout_sites", SiteKind.JUMPOUT),
+            ("_callout_sites", SiteKind.CALLOUT),
+            ("_retout_sites", SiteKind.RETOUT),
+        ):
+            for node in state[key]:
+                self._graph.add_site(self._graph_node(node), kind)
+        for addr, (target, ret) in state["_call_sites"].items():
+            self._graph.add_call_site(addr, target, ret)
+        self.startpoint = state["startpoint"]
+
     def __getstate__(self):
-        # self._local_transition_graph is a cache. don't pickle it
-        d = dict((k, getattr(self, k)) for k in self.__slots__)
-        d['_local_transition_graph'] = None
-        d['_project'] = None
-        d['_function_manager'] = None
-        d['_block_cache'] = { }
+        # the networkx views and node objects are caches. don't pickle them
+        d = {k: getattr(self, k) for k in self.__slots__ if k != "__weakref__"}
+        d["_local_transition_graph"] = None
+        d["_transition_graph"] = None
+        d["_node_objs"] = {}
+        d["_block_addrs_cache"] = None
+        d["_project"] = None
+        d["_function_manager"] = None
         return d
 
     @property
-    def endpoints(self):
-        return list(itertools.chain(*self._endpoints.values()))
+    def endpoints(self) -> list[CodeNode]:
+        return list(itertools.chain.from_iterable(self.endpoints_with_type.values()))
 
     @property
-    def endpoints_with_type(self):
-        return self._endpoints
+    def endpoints_with_type(self) -> defaultdict[str, set[CodeNode]]:
+        d: defaultdict[str, set[CodeNode]] = defaultdict(set)
+        for kind, sort in _ENDPOINT_SORTS.items():
+            idxs = self._graph.endpoints(kind)
+            if idxs:
+                d[sort] = set(self._node_objs_of(idxs))
+        return d
 
     @property
-    def ret_sites(self):
-        return list(self._ret_sites)
+    def ret_sites(self) -> list[CodeNode]:
+        return self._node_objs_of(self._graph.sites(SiteKind.RET))
 
     @property
-    def jumpout_sites(self):
-        return list(self._jumpout_sites)
+    def jumpout_sites(self) -> list[CodeNode]:
+        return self._node_objs_of(self._graph.sites(SiteKind.JUMPOUT))
 
     @property
-    def retout_sites(self):
-        return list(self._retout_sites)
+    def retout_sites(self) -> list[CodeNode]:
+        return self._node_objs_of(self._graph.sites(SiteKind.RETOUT))
 
     @property
-    def callout_sites(self):
-        return list(self._callout_sites)
+    def callout_sites(self) -> list[CodeNode]:
+        return self._node_objs_of(self._graph.sites(SiteKind.CALLOUT))
 
     @property
     def size(self):
-        return sum([ b.size for b in self.blocks ])
+        return self._graph.local_size()
 
     @property
     def binary(self):
@@ -565,24 +1392,46 @@ class Function(Serializable):
         Get the object this function belongs to.
         :return: The object this function belongs to.
         """
-
-        return self._project.loader.find_object_containing(self.addr, membership_check=False)
+        assert self.project is not None
+        return self.project.loader.find_object_containing(self.addr, membership_check=False)
 
     @property
     def offset(self) -> int:
         """
         :return: the function's binary offset (i.e., non-rebased address)
         """
+        assert self.binary is not None
         return self.addr - self.binary.mapped_base
 
     @property
-    def symbol(self) -> Union[None, Symbol]:
+    def symbol(self) -> Symbol | None:
         """
         :return: the function's Symbol, if any
         """
+        assert self.binary is not None
         return self.binary.loader.find_symbol(self.addr)
 
-    def add_jumpout_site(self, node):
+    @property
+    def pseudocode(self) -> str | None:
+        """
+        :return: the function's pseudocode
+        """
+        if self.project is None:
+            l.error("Cannot generate pseudocode because the function is not associated with any angr project.")
+            return None
+        assert self._function_manager is not None
+        dec = self.project.analyses.Decompiler(self, cfg=self._function_manager._kb.cfgs.get_most_accurate())
+        return dec.codegen.text if dec.codegen else None
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    def mark_dirty(self) -> None:
+        self._dirty = True
+
+    @dirty_func
+    def add_jumpout_site(self, node: CodeNode):
         """
         Add a custom jumpout site.
 
@@ -590,11 +1439,12 @@ class Function(Serializable):
         :return:        None
         """
 
-        self._register_nodes(True, node)
-        self._jumpout_sites.add(node)
-        self._add_endpoint(node, 'transition')
+        idx = self.register(True, node)
+        self._graph.add_site(idx, SiteKind.JUMPOUT)
+        self._graph.add_endpoint(idx, EndpointKind.TRANSITION)
 
-    def add_retout_site(self, node):
+    @dirty_func
+    def add_retout_site(self, node: CodeNode):
         """
         Add a custom retout site.
 
@@ -610,9 +1460,9 @@ class Function(Serializable):
         :return:     None
         """
 
-        self._register_nodes(True, node)
-        self._retout_sites.add(node)
-        self._add_endpoint(node, 'return')
+        idx = self.register(True, node)
+        self._graph.add_site(idx, SiteKind.RETOUT)
+        self._graph.add_endpoint(idx, EndpointKind.RETURN)
 
     def _get_initial_name(self):
         """
@@ -627,28 +1477,29 @@ class Function(Serializable):
 
         self.is_default_name = False
         # Try to get a name from existing labels
-        if self._function_manager is not None:
-            if addr in self._function_manager._kb.labels:
-                name = self._function_manager._kb.labels[addr]
+        if self._function_manager is not None and addr in self._function_manager._kb.labels:
+            name = self._function_manager._kb.labels[addr]
 
         # try to get the name from a hook
         if name is None and self.project is not None:
             project = self.project
             if project.is_hooked(addr):
                 hooker = project.hooked_by(addr)
-                name = hooker.display_name
+                if hooker is not None:
+                    name = hooker.display_name
             elif project.simos.is_syscall_addr(addr):
                 syscall_inst = project.simos.syscall_from_addr(addr)
-                name = syscall_inst.display_name
+                if syscall_inst is not None:
+                    name = syscall_inst.display_name
 
         # generate an IDA-style sub_X name
         if name is None:
             self.is_default_name = True
-            name = 'sub_%x' % addr
+            name = f"sub_{addr:x}"
 
         return name
 
-    def _get_initial_binary_name(self):
+    def _get_initial_binary_name(self) -> str | None:
         """
         Determine the name of the binary where this function is.
 
@@ -665,8 +1516,13 @@ class Function(Serializable):
             if hooker is not None:
                 binary_name = hooker.library_name
 
-        if binary_name is None and self.binary is not None and self.binary.binary:
-            binary_name = os.path.basename(self.binary.binary)
+        if binary_name is None:
+            if self._function_manager is not None:
+                # use the faster cached version
+                binary_name = self._function_manager.get_binary_name_cached(self.addr)
+            else:
+                if self.binary is not None and self.binary.binary:
+                    binary_name = os.path.basename(self.binary.binary)
 
         return binary_name
 
@@ -679,183 +1535,260 @@ class Function(Serializable):
         """
 
         hooker = None
+        assert self.project is not None
         if self.is_syscall:
             hooker = self.project.simos.syscall_from_addr(self.addr)
         elif self.is_simprocedure:
             hooker = self.project.hooked_by(self.addr)
         if hooker:
-            if hasattr(hooker, 'DYNAMIC_RET') and hooker.DYNAMIC_RET:
+            if hasattr(hooker, "DYNAMIC_RET") and hooker.DYNAMIC_RET:
                 return True
-            elif hasattr(hooker, 'NO_RET'):
-                return not hooker.NO_RET
+            return hooker.returns
 
         # Cannot determine
         return None
 
-    def _clear_transition_graph(self):
-        self._block_cache = {}
-        self._block_sizes = {}
-        self.startpoint = None
-        self.transition_graph = networkx.DiGraph()
+    @dirty_func
+    def _init_prototype_and_calling_convention(self) -> None:
+        """
+        Initialize prototype and calling convention from a SimProcedure, if available.
+        """
+        hooker = None
+        if self.is_syscall and self.project is not None and self.project.simos.is_syscall_addr(self.addr):
+            hooker = self.project.simos.syscall_from_addr(self.addr)
+        elif self.is_simprocedure and self.project is not None:
+            hooker = self.project.hooked_by(self.addr)
+        if hooker is None or hooker.guessed_prototype:
+            return
+
+        if hooker.prototype:
+            self.prototype_libname = hooker.library_name
+            self.prototype = hooker.prototype
+            self.prototype_source = PrototypeSource.SIMPROC
+
+        cc = hooker.cc
+        if cc is None and self.project is not None:
+            arch = self.project.arch
+            if arch.name in DEFAULT_CC:
+                cc_cls = default_cc_for_project(self.project)
+                if cc_cls is not None:
+                    cc = cc_cls(arch)
+        self.calling_convention = cc
+
+    @dirty_func
+    def clear_transition_graph(self):
+        self._graph = FunctionGraph(self.addr)
+        self._transition_graph = None
+        self._node_objs = {}
+        self._block_addrs_cache = None
         self._local_transition_graph = None
 
-    def _confirm_fakeret(self, src, dst):
+    @dirty_func
+    def confirm_fakeret(self, src, dst):
+        s, d = self._find_node(src), self._find_node(dst)
+        if s is None or d is None or not self._graph.has_edge(s, d):
+            raise AngrValueError(f"FakeRet edge ({src}, {dst}) is not in transition graph.")
 
-        if src not in self.transition_graph or dst not in self.transition_graph[src]:
-            raise AngrValueError('FakeRet edge (%s, %s) is not in transition graph.' % (src, dst))
-
-        data = self.transition_graph[src][dst]
-
-        if 'type' not in data or data['type'] != 'fake_return':
-            raise AngrValueError('Edge (%s, %s) is not a FakeRet edge' % (src, dst))
+        if self._graph.edge_kind(s, d) != EdgeKind.FAKE_RETURN:
+            raise AngrValueError(f"Edge ({src}, {dst}) is not a FakeRet edge")
 
         # it's confirmed. register the node if needed
-        if 'outside' not in data or data['outside'] is False:
-            self._register_nodes(True, dst)
+        if not self._graph.edge_is_outside(s, d):
+            self.register(True, dst)
 
-        self.transition_graph[src][dst]['confirmed'] = True
+        self._set_edge_confirmed(s, d, True)
 
-    def _transit_to(self, from_node, to_node, outside=False, ins_addr=None, stmt_idx=None, is_exception=False):
+    @dirty_func
+    def transit_to(
+        self,
+        from_node: CodeNode,
+        to_node,
+        outside=False,
+        ins_addr=None,
+        stmt_idx=None,
+        is_exception=False,
+        update_func_block_count: bool = True,
+    ):
         """
         Registers an edge between basic blocks in this function's transition graph.
         Arguments are CodeNode objects.
 
-        :param from_node            The address of the basic block that control
+        :param from_node:           The address of the basic block that control
                                     flow leaves during this transition.
-        :param to_node              The address of the basic block that control
+        :param to_node:             The address of the basic block that control
                                     flow enters during this transition.
         :param bool outside:        If this is a transition to another function, e.g. tail call optimization
         :return: None
         """
 
-        if outside:
-            self._register_nodes(True, from_node)
-            if to_node is not None:
-                self._register_nodes(False, to_node)
-
-            self._jumpout_sites.add(from_node)
-        else:
-            if to_node is not None:
-                self._register_nodes(True, from_node, to_node)
-            else:
-                self._register_nodes(True, from_node)
-
-        type_ = 'transition' if not is_exception else 'exception'
+        src = self.register(True, from_node, update_func_block_count=update_func_block_count)
+        dst = None
         if to_node is not None:
-            self.transition_graph.add_edge(from_node, to_node, type=type_, outside=outside, ins_addr=ins_addr,
-                                           stmt_idx=stmt_idx
-                                           )
+            dst = self.register(not outside, to_node, update_func_block_count=update_func_block_count)
+        if outside:
+            self._graph.add_site(src, SiteKind.JUMPOUT)
+
+        kind = EdgeKind.EXCEPTION if is_exception else EdgeKind.TRANSITION
+        if dst is not None:
+            self._add_edge(
+                src,
+                dst,
+                kind,
+                PRESENT_TYPE | PRESENT_OUTSIDE | PRESENT_INS_ADDR | PRESENT_STMT_IDX,
+                outside=outside,
+                ins_addr=ins_addr,
+                stmt_idx=stmt_idx,
+            )
 
         if outside:
             # this node is an endpoint of the current function
-            self._add_endpoint(from_node, type_)
+            self._graph.add_endpoint(src, EndpointKind.EXCEPTION if is_exception else EndpointKind.TRANSITION)
 
         # clear the cache
         self._local_transition_graph = None
 
-    def _call_to(self, from_node, to_func, ret_node, stmt_idx=None, ins_addr=None, return_to_outside=False):
+    @dirty_func
+    def call_to(
+        self,
+        from_node,
+        to_func: FuncNode | HookNode,
+        ret_node,
+        stmt_idx=None,
+        ins_addr=None,
+        return_to_outside=False,
+        syscall: bool = False,
+        update_func_block_count: bool = True,
+    ):
         """
         Registers an edge between the caller basic block and callee function.
 
-        :param from_addr:   The basic block that control flow leaves during the transition.
-        :type  from_addr:   angr.knowledge.CodeNode
-        :param to_func:     The function that we are calling
-        :type  to_func:     Function
-        :param ret_node     The basic block that control flow should return to after the
+        :param from_node:   The basic block that control flow leaves during the transition.
+        :type  from_node:   angr.knowledge.CodeNode
+        :param to_func:     The function that we are calling, represented as a FuncNode.
+        :param ret_node:    The basic block that control flow should return to after the
                             function call.
-        :type  to_func:     angr.knowledge.CodeNode or None
+        :type  ret_node:    angr.knowledge.CodeNode or None
         :param stmt_idx:    Statement ID of this call.
         :type  stmt_idx:    int, str or None
         :param ins_addr:    Instruction address of this call.
         :type  ins_addr:    int or None
         """
 
-        self._register_nodes(True, from_node)
-
-        if to_func.is_syscall:
-            self.transition_graph.add_edge(from_node, to_func, type='syscall', stmt_idx=stmt_idx, ins_addr=ins_addr)
-        else:
-            self.transition_graph.add_edge(from_node, to_func, type='call', stmt_idx=stmt_idx, ins_addr=ins_addr)
-            if ret_node is not None:
-                self._fakeret_to(from_node, ret_node, to_outside=return_to_outside)
+        src = self.register(True, from_node, update_func_block_count=update_func_block_count)
+        dst = self._graph_node(to_func)
+        self._add_edge(
+            src,
+            dst,
+            EdgeKind.SYSCALL if syscall else EdgeKind.CALL,
+            PRESENT_TYPE | PRESENT_STMT_IDX | PRESENT_INS_ADDR,
+            stmt_idx=stmt_idx,
+            ins_addr=ins_addr,
+        )
+        if ret_node is not None and not syscall:
+            self.register(return_to_outside is False, ret_node, update_func_block_count=update_func_block_count)
+            self.fakeret_to(
+                from_node, ret_node, to_outside=return_to_outside, update_func_block_count=update_func_block_count
+            )
 
         self._local_transition_graph = None
 
-    def _fakeret_to(self, from_node, to_node, confirmed=None, to_outside=False):
-        self._register_nodes(True, from_node)
+    @dirty_func
+    def fakeret_to(self, from_node, to_node, confirmed=None, to_outside=False, update_func_block_count: bool = True):
+        src = self.register(True, from_node, update_func_block_count=update_func_block_count)
+        if confirmed:
+            dst = self.register(not to_outside, to_node, update_func_block_count=update_func_block_count)
+        else:
+            dst = self._graph_node(to_node)
 
         if confirmed is None:
-            self.transition_graph.add_edge(from_node, to_node, type='fake_return', outside=to_outside)
+            self._add_edge(src, dst, EdgeKind.FAKE_RETURN, PRESENT_TYPE | PRESENT_OUTSIDE, outside=to_outside)
         else:
-            self.transition_graph.add_edge(from_node, to_node, type='fake_return', confirmed=confirmed,
-                                           outside=to_outside
-                                           )
-            if confirmed:
-                self._register_nodes(not to_outside, to_node)
+            self._add_edge(
+                src,
+                dst,
+                EdgeKind.FAKE_RETURN,
+                PRESENT_TYPE | PRESENT_OUTSIDE | PRESENT_CONFIRMED,
+                outside=to_outside,
+                confirmed=confirmed,
+            )
 
         self._local_transition_graph = None
 
-    def _remove_fakeret(self, from_node, to_node):
-        self.transition_graph.remove_edge(from_node, to_node)
+    @dirty_func
+    def remove_fakeret(self, from_node, to_node):
+        self.remove_edge(from_node, to_node)
+
+    def remove_edge(self, from_node: CodeNode, to_node: CodeNode) -> None:
+        s, d = self._find_node(from_node), self._find_node(to_node)
+        if s is None or d is None or not self._graph.remove_edge(s, d):
+            raise networkx.NetworkXError(f"The edge {from_node}-{to_node} is not in the graph.")
+        if self._transition_graph is not None:
+            self._transition_graph._mirror_remove_edge(self._node_obj(s), self._node_obj(d))
+        self._local_transition_graph = None
+
+    @dirty_func
+    def return_from_call(self, from_func: FuncNode | HookNode, to_node, to_outside=False, confirm_fakeret: bool = True):
+        src = self._graph_node(from_func)
+        dst = self._graph_node(to_node)
+        self._add_edge(src, dst, EdgeKind.RETURN, PRESENT_TYPE | PRESENT_OUTSIDE, outside=to_outside)
+        if confirm_fakeret:
+            for pred in self._graph.predecessors(dst):
+                if self._graph.edge_kind(pred, dst) == EdgeKind.FAKE_RETURN:
+                    self._set_edge_confirmed(pred, dst, True)
 
         self._local_transition_graph = None
 
-    def _return_from_call(self, from_func, to_node, to_outside=False):
-        self.transition_graph.add_edge(from_func, to_node, type='return', to_outside=to_outside)
-        for _, _, data in self.transition_graph.in_edges(to_node, data=True):
-            if 'type' in data and data['type'] == 'fake_return':
-                data['confirmed'] = True
+    def update_func_block_count(self) -> None:
+        """Update the cached block count of this function in the function manager."""
+        if self._function_manager is not None:
+            self._function_manager.set_func_block_count(self.addr, self._graph.local_count())
 
+    def register(self, is_local: bool, node: CodeNode, update_func_block_count: bool = True) -> int:
+        """
+        Register a node with the function and return its ID. The first object that is registered
+        for a fresh ID becomes the ID's canonical CodeNode object.
+        """
+        kind, addr, size, thumb = _node_key(node)
+        idx, created, new_local, changed = self._graph.register_node(
+            is_local, kind, addr, size, thumb, _node_delta(node)
+        )
+        node.set_owner(self)
+        if created:
+            self._store_manual_bytes(idx, node)
+        if not changed:
+            return idx
+        if created or idx not in self._node_objs:
+            self._node_objs[idx] = node
+        self.mark_dirty()
         self._local_transition_graph = None
+        if new_local:
+            if self._block_addrs_cache is not None:
+                self._block_addrs_cache.add(addr)
+            if update_func_block_count:
+                self.update_func_block_count()
+        if self._transition_graph is not None and self._graph.contains_node(idx):
+            self._transition_graph._mirror_add_node(self._node_objs[idx])
+        return idx
 
-    def _update_local_blocks(self, node: CodeNode):
-        self._local_blocks[node.addr] = node
-        self._local_block_addrs.add(node.addr)
+    def register_node(self, is_local: bool, node: CodeNode, update_func_block_count: bool = True) -> CodeNode:
+        return self._node_obj(self.register(is_local, node, update_func_block_count=update_func_block_count))
 
-    def _update_addr_to_block_cache(self, node: BlockNode):
-        if node.addr not in self._addr_to_block_node:
-            self._addr_to_block_node[node.addr] = node
-
-    def _register_nodes(self, is_local, *nodes):
-        if not isinstance(is_local, bool):
-            raise AngrValueError('_register_nodes(): the "is_local" parameter must be a bool')
-
-        for node in nodes:
-            if node.addr not in self:
-                # only add each node once
-                self.transition_graph.add_node(node)
-
-            if not isinstance(node, CodeNode):
-                continue
-            node._graph = self.transition_graph
-            if self._block_sizes.get(node.addr, 0) == 0:
-                self._block_sizes[node.addr] = node.size
-            if node.addr == self.addr:
-                if self.startpoint is None or not self.startpoint.is_hook:
-                    self.startpoint = node
-            if is_local and node.addr not in self._local_blocks:
-                self._update_local_blocks(node)
-            # add BlockNodes to the addr_to_block_node cache if not already there
-            if isinstance(node, BlockNode):
-                self._update_addr_to_block_cache(node)
-                #else:
-                #    # checks that we don't have multiple block nodes at a single address
-                #    assert node == self._addr_to_block_node[node.addr]
-
-    def _add_return_site(self, return_site):
+    @dirty_func
+    def add_return_site(self, return_site: CodeNode):
         """
         Registers a basic block as a site for control flow to return from this function.
 
-        :param CodeNode return_site:     The block node that ends with a return.
+        :param return_site:     The block node that ends with a return.
         """
-        self._register_nodes(True, return_site)
+        idx = self.register(True, return_site)
 
-        self._ret_sites.add(return_site)
+        self._graph.add_site(idx, SiteKind.RET)
         # A return site must be an endpoint of the function - you cannot continue execution of the current function
         # after returning
-        self._add_endpoint(return_site, 'return')
+        self._graph.add_endpoint(idx, EndpointKind.RETURN)
 
-    def _add_call_site(self, call_site_addr, call_target_addr, retn_addr):
+    @dirty_func
+    def add_call_site(self, call_site_addr, call_target_addr, retn_addr):
         """
         Registers a basic block as calling a function and returning somewhere.
 
@@ -863,9 +1796,10 @@ class Function(Serializable):
         :param call_target_addr:     The address of the target of said call.
         :param retn_addr:            The address that said call will return to.
         """
-        self._call_sites[call_site_addr] = (call_target_addr, retn_addr)
+        self._graph.add_call_site(call_site_addr, call_target_addr, retn_addr)
 
-    def _add_endpoint(self, endpoint_node, sort):
+    @dirty_func
+    def add_endpoint(self, endpoint_node, sort):
         """
         Registers an endpoint with a type of `sort`. The type can be one of the following:
         - call: calling a function that does not return
@@ -880,32 +1814,32 @@ class Function(Serializable):
         .text:000000000002435A                 retn
 
         VEX code:
-           00 | ------ IMark(0x424350, 5, 0) ------
-           01 | PUT(rax) = 0x0000000000000001
-           02 | PUT(rip) = 0x0000000000424355
-           03 | ------ IMark(0x424355, 5, 0) ------
-           04 | t11 = GET:I64(rdi)
-           05 | t10 = Add64(t11,0x0000000000000004)
-           06 | t0 = LDle:I32(t10)
-           07 | t2 = Add32(t0,0x00000001)
-           08 | t(4,4294967295) = CASle(t10 :: (t0,None)->(t2,None))
-           09 | t14 = CasCmpNE32(t4,t0)
-           10 | if (t14) { PUT(rip) = 0x424355; Ijk_Boring }
-           11 | PUT(cc_op) = 0x0000000000000003
-           12 | t15 = 32Uto64(t0)
-           13 | PUT(cc_dep1) = t15
-           14 | PUT(cc_dep2) = 0x0000000000000001
-           15 | t17 = 32Uto64(t0)
-           16 | PUT(rax) = t17
-           17 | PUT(rip) = 0x000000000042435a
-           18 | ------ IMark(0x42435a, 1, 0) ------
-           19 | t6 = GET:I64(rsp)
-           20 | t7 = LDle:I64(t6)
-           21 | t8 = Add64(t6,0x0000000000000008)
-           22 | PUT(rsp) = t8
-           23 | t18 = Sub64(t8,0x0000000000000080)
-           24 | ====== AbiHint(0xt18, 128, t7) ======
-           NEXT: PUT(rip) = t7; Ijk_Ret
+            00 | ------ IMark(0x424350, 5, 0) ------
+            01 | PUT(rax) = 0x0000000000000001
+            02 | PUT(rip) = 0x0000000000424355
+            03 | ------ IMark(0x424355, 5, 0) ------
+            04 | t11 = GET:I64(rdi)
+            05 | t10 = Add64(t11,0x0000000000000004)
+            06 | t0 = LDle:I32(t10)
+            07 | t2 = Add32(t0,0x00000001)
+            08 | t(4,4294967295) = CASle(t10 :: (t0,None)->(t2,None))
+            09 | t14 = CasCmpNE32(t4,t0)
+            10 | if (t14) { PUT(rip) = 0x424355; Ijk_Boring }
+            11 | PUT(cc_op) = 0x0000000000000003
+            12 | t15 = 32Uto64(t0)
+            13 | PUT(cc_dep1) = t15
+            14 | PUT(cc_dep2) = 0x0000000000000001
+            15 | t17 = 32Uto64(t0)
+            16 | PUT(rax) = t17
+            17 | PUT(rip) = 0x000000000042435a
+            18 | ------ IMark(0x42435a, 1, 0) ------
+            19 | t6 = GET:I64(rsp)
+            20 | t7 = LDle:I64(t6)
+            21 | t8 = Add64(t6,0x0000000000000008)
+            22 | PUT(rsp) = t8
+            23 | t18 = Sub64(t8,0x0000000000000080)
+            24 | ====== AbiHint(0xt18, 128, t7) ======
+            NEXT: PUT(rip) = t7; Ijk_Ret
 
         This block acts as both a return endpoint and a transition endpoint (transitioning to 0x424355).
 
@@ -914,7 +1848,7 @@ class Function(Serializable):
         :return:                    None
         """
 
-        self._endpoints[sort].add(endpoint_node)
+        self._graph.add_endpoint(self._graph_node(endpoint_node), _ENDPOINT_KINDS[sort])
 
     def mark_nonreturning_calls_endpoints(self):
         """
@@ -927,16 +1861,64 @@ class Function(Serializable):
         :return: None
         """
 
-        for src, dst, data in self.transition_graph.edges(data=True):
-            if 'type' in data and data['type'] == 'call':
-                func_addr = dst.addr
-                if func_addr in self._function_manager:
-                    function = self._function_manager[func_addr]
-                    if function.returning is False:
-                        # the target function does not return
-                        the_node = self.get_node(src.addr)
-                        self._callout_sites.add(the_node)
-                        self._add_endpoint(the_node, 'call')
+        assert self._function_manager is not None
+
+        graph = self._graph
+        for src, dst in graph.edges_of_kind(EdgeKind.CALL):
+            func_addr = graph.node_addr(dst)
+            if self._function_manager.contains_addr(func_addr) and self._function_manager.is_func_nonreturning(
+                func_addr
+            ):
+                # the target function does not return
+                the_node = graph.block_node_at(graph.node_addr(src))
+                if the_node is not None:
+                    graph.add_site(the_node, SiteKind.CALLOUT)
+                    graph.add_endpoint(the_node, EndpointKind.CALL)
+                    self.mark_dirty()
+
+    @property
+    def call_sites(self) -> dict[int, tuple[int | None, int | None]]:
+        return {addr: (target, ret) for addr, target, ret in self._graph.call_sites()}
+
+    def call_edge_addrs(self) -> list[tuple[int, int]]:
+        """
+        (call-site block address, callee address) of every call edge, in transition-graph order. Unlike call_sites,
+        a block with several call targets contributes one pair per target.
+        """
+        graph = self._graph
+        return [(graph.node_addr(src), graph.node_addr(dst)) for src, dst in graph.edges_of_kind(EdgeKind.CALL)]
+
+    def jumpout_targets(self) -> list[tuple[int, int, int | None]]:
+        """
+        (jump-out site block address, target address, branch instruction address) of every transition that leaves
+        this function, such as a tail jump. The instruction address is None when the CFG did not record it.
+        """
+        graph = self._graph
+        out = []
+        for idx in graph.sites(SiteKind.JUMPOUT):
+            for src, dst in graph.out_edges(idx):
+                if graph.edge_is_outside(src, dst):
+                    data = graph.edge_data(src, dst) or {}
+                    out.append((graph.node_addr(src), graph.node_addr(dst), data.get("ins_addr")))
+        return out
+
+    def unconfirmed_fakeret_edges(self) -> list[tuple[CodeNode, CodeNode]]:
+        """
+        Fake-return edges that have not been confirmed by a return of the callee, in transition-graph order.
+        """
+        graph = self._graph
+        objs = self._node_obj
+        return [
+            (objs(src), objs(dst))
+            for src, dst in graph.edges_of_kind(EdgeKind.FAKE_RETURN)
+            if graph.edge_confirmed(src, dst) is not True
+        ]
+
+    def outgoing_function_targets(self) -> list[int]:
+        """
+        Addresses of the functions this function calls or jumps out to.
+        """
+        return [addr for addr, _ in self._graph.outgoing_function_targets()]
 
     def get_call_sites(self) -> Iterable[int]:
         """
@@ -944,7 +1926,7 @@ class Function(Serializable):
 
         :return:                    A view of the addresses of the blocks that end in calls.
         """
-        return self._call_sites.keys()
+        return self._graph.call_site_addrs()
 
     def get_call_target(self, callsite_addr):
         """
@@ -954,9 +1936,8 @@ class Function(Serializable):
         :return:                    The target of said call, or None if callsite_addr is not a
                                     callsite.
         """
-        if callsite_addr in self._call_sites:
-            return self._call_sites[callsite_addr][0]
-        return None
+        site = self._graph.call_site(callsite_addr) if isinstance(callsite_addr, int) else None
+        return None if site is None else site[0]
 
     def get_call_return(self, callsite_addr):
         """
@@ -966,69 +1947,58 @@ class Function(Serializable):
         :return:                    The likely return target of said call, or None if callsite_addr
                                     is not a callsite.
         """
-        if callsite_addr in self._call_sites:
-            return self._call_sites[callsite_addr][1]
-        return None
+        site = self._graph.call_site(callsite_addr) if isinstance(callsite_addr, int) else None
+        return None if site is None else site[1]
 
     @property
-    def graph(self):
+    def graph(self) -> TransitionGraph:
         """
         Get a local transition graph. A local transition graph is a transition graph that only contains nodes that
         belong to the current function. All edges, except for the edges going out from the current function or coming
         from outside the current function, are included.
 
-        The generated graph is cached in self._local_transition_graph.
+        The generated graph is a read-only view cached in self._local_transition_graph.
 
         :return:    A local transition graph.
-        :rtype:     networkx.DiGraph
         """
 
         if self._local_transition_graph is not None:
             return self._local_transition_graph
 
-        g = networkx.DiGraph()
-        if self.startpoint is not None:
-            g.add_node(self.startpoint)
-        for block in self._local_blocks.values():
-            g.add_node(block)
-        for src, dst, data in self.transition_graph.edges(data=True):
-            if 'type' in data:
-                if data['type'] in ('transition', 'exception') and ('outside' not in data or data['outside'] is False):
-                    g.add_edge(src, dst, **data)
-                elif data['type'] == 'fake_return' and 'confirmed' in data and \
-                        ('outside' not in data or data['outside'] is False):
-                    g.add_edge(src, dst, **data)
+        objs = self._node_obj
+        g = TransitionGraph()
+        startpoint = self._graph.startpoint
+        if startpoint is not None:
+            g._mirror_add_node(objs(startpoint))
+        g._mirror_add_nodes(objs(idx) for _, idx in self._graph.local_items())
+        g._mirror_add_edges((objs(u), objs(v), d) for u, v, d in self._graph.local_edges_with_data())
 
         self._local_transition_graph = g
 
         return g
 
-    def graph_ex(self, exception_edges=True):
+    def graph_ex(self, exception_edges=True) -> networkx.DiGraph[CodeNode]:
         """
         Get a local transition graph with a custom configuration. A local transition graph is a transition graph that
-        only contains nodes that belong to the current function. This method allows user to exclude certain types of
-        edges together with the nodes that are only reachable through such edges, such as exception edges.
+        only contains nodes that belong to the current function. This method allows user to include certain types of
+        edges and nodes, such as exception edges.
 
-        The generated graph is not cached.
+        The generated graph is not cached. It is a mutable copy.
 
         :param bool exception_edges:    Should exception edges and the nodes that are only reachable through exception
                                         edges be kept.
         :return:                        A local transition graph with a special configuration.
-        :rtype:                         networkx.DiGraph
         """
 
-        # graph_ex() should not impact any already cached graph
-        old_cached_graph = self._local_transition_graph
         graph = self.graph
-        self._local_transition_graph = old_cached_graph  # restore the cached graph
 
         # fast path
         if exception_edges:
-            return graph
+            return graph.copy()
 
         # BFS on local graph but ignoring certain types of graphs
-        g = networkx.DiGraph()
-        queue = [ n for n in graph if n is self.startpoint or graph.in_degree[n] == 0 ]
+        g = networkx.classes.digraph.DiGraph()
+        queue = [n for n in graph if n is self.startpoint or graph.in_degree[n] == 0]
         traversed = set(queue)
 
         while queue:
@@ -1036,8 +2006,8 @@ class Function(Serializable):
 
             g.add_node(node)
             for _, dst, edge_data in graph.out_edges(node, data=True):
-                edge_type = edge_data.get('type', None)
-                if not exception_edges and edge_type == 'exception':
+                edge_type = edge_data.get("type", None)
+                if not exception_edges and edge_type == "exception":
                     # ignore this edge
                     continue
                 g.add_edge(node, dst, **edge_data)
@@ -1068,8 +2038,8 @@ class Function(Serializable):
             return graph
 
         # BFS on local graph but ignoring certain types of graphs
-        g = networkx.DiGraph()
-        queue = [ n for n in graph if n is self.startpoint or graph.in_degree[n] == 0 ]
+        g = networkx.classes.digraph.DiGraph()
+        queue = [n for n in graph if n is self.startpoint or graph.in_degree[n] == 0]
         traversed = set(queue)
 
         while queue:
@@ -1078,8 +2048,8 @@ class Function(Serializable):
 
             g.add_node(node)
             for _, dst, edge_data in graph.out_edges(node, data=True):
-                edge_type = edge_data.get('type', None)
-                if not exception_edges and edge_type == 'exception':
+                edge_type = edge_data.get("type", None)
+                if not exception_edges and edge_type == "exception":
                     # ignore this edge
                     continue
                 g.add_edge(node, dst, **edge_data)
@@ -1102,33 +2072,33 @@ class Function(Serializable):
         blocks = []
         block_addr_to_insns = {}
 
-        for b in self._local_blocks.values():
+        for b in self.code_nodes.values():
             # TODO: should I call get_blocks?
-            block = self.get_block(b.addr, size=b.size, byte_string=b.bytestr)
+            block = self.get_block(b.addr, size=b.size, byte_string=b._bytestr if isinstance(b, BlockNode) else None)
             common_insns = set(block.instruction_addrs).intersection(ins_addrs)
             if common_insns:
                 blocks.append(b)
                 block_addr_to_insns[b.addr] = sorted(common_insns)
 
-        #subgraph = networkx.subgraph(self.graph, blocks)
+        # subgraph = networkx.subgraph(self.graph, blocks)
         subgraph = self.graph.subgraph(blocks).copy()
-        g = networkx.DiGraph()
+        assert isinstance(subgraph, networkx.DiGraph)
+        g = networkx.classes.digraph.DiGraph()
 
         for n in subgraph.nodes():
             insns = block_addr_to_insns[n.addr]
 
             in_edges = subgraph.in_edges(n)
             # out_edges = subgraph.out_edges(n)
-            if len(in_edges) > 1:
-                # the first instruction address should be included
-                if n.addr not in insns:
-                    insns = [n.addr] + insns
+            # the first instruction address should be included
+            if len(in_edges) > 1 and n.addr not in insns:
+                insns = [n.addr, *insns]
 
             for src, _ in in_edges:
                 last_instr = block_addr_to_insns[src.addr][-1]
                 g.add_edge(last_instr, insns[0])
 
-            for i in range(0, len(insns) - 1):
+            for i in range(len(insns) - 1):
                 g.add_edge(insns[i], insns[i + 1])
 
         return g
@@ -1168,9 +2138,9 @@ class Function(Serializable):
             if b.addr <= addr < b.addr + b.size:
                 # found it
                 for i, instr_addr in enumerate(b.instruction_addrs):
-                    if i < len(b.instruction_addrs) - 1 and instr_addr <= addr < b.instruction_addrs[i+1]:
-                        return instr_addr
-                    elif i == len(b.instruction_addrs) - 1 and instr_addr <= addr:
+                    if (i < len(b.instruction_addrs) - 1 and instr_addr <= addr < b.instruction_addrs[i + 1]) or (
+                        i == len(b.instruction_addrs) - 1 and instr_addr <= addr
+                    ):
                         return instr_addr
                 # Not covered by any instruction... why?
                 return None
@@ -1180,38 +2150,42 @@ class Function(Serializable):
         """
         Returns a representation of the list of basic blocks in this function.
         """
-        return "[%s]" % (', '.join(('%#08x' % n.addr) for n in self.transition_graph.nodes()))
+        return "[{}]".format(", ".join((f"{n.addr:#08x}") for n in self.transition_graph.nodes()))
 
     def dbg_draw(self, filename):
         """
         Draw the graph and save it to a PNG file.
         """
-        import matplotlib.pyplot as pyplot  # pylint: disable=import-error
-        from networkx.drawing.nx_agraph import graphviz_layout  # pylint: disable=import-error
+        from matplotlib import pyplot  # pylint: disable=import-error,import-outside-toplevel,consider-using-from-import
+        from networkx.drawing.nx_agraph import graphviz_layout  # pylint: disable=import-error,import-outside-toplevel
 
-        tmp_graph = networkx.DiGraph()
+        tmp_graph = networkx.classes.digraph.DiGraph()
+        ret_site_addrs = {n.addr for n in self.ret_sites}
+        call_site_addrs = set(self.get_call_sites())
         for from_block, to_block in self.transition_graph.edges():
-            node_a = "%#08x" % from_block.addr
-            node_b = "%#08x" % to_block.addr
-            if node_b in self._ret_sites:
+            node_a = f"{from_block.addr:#08x}"
+            node_b = f"{to_block.addr:#08x}"
+            if to_block.addr in ret_site_addrs:
                 node_b += "[Ret]"
-            if node_a in self._call_sites:
+            if from_block.addr in call_site_addrs:
                 node_a += "[Call]"
             tmp_graph.add_edge(node_a, node_b)
-        pos = graphviz_layout(tmp_graph, prog='fdp')   # pylint: disable=no-member
+        pos = graphviz_layout(tmp_graph, prog="fdp")  # pylint: disable=no-member
         networkx.draw(tmp_graph, pos, node_size=1200)
         pyplot.savefig(filename)
 
+    @dirty_func
     def _add_argument_register(self, reg_offset):
         """
         Registers a register offset as being used as an argument to the function.
 
         :param reg_offset:          The offset of the register to register.
         """
-        if reg_offset in self._function_manager._arg_registers and \
-                    reg_offset not in self._argument_registers:
+        assert self._function_manager is not None
+        if reg_offset in self._function_manager._arg_registers and reg_offset not in self._argument_registers:
             self._argument_registers.append(reg_offset)
 
+    @dirty_func
     def _add_argument_stack_variable(self, stack_var_offset):
         if stack_var_offset not in self._argument_stack_variables:
             self._argument_stack_variables.append(stack_var_offset)
@@ -1220,19 +2194,20 @@ class Function(Serializable):
     def arguments(self):
         if self.calling_convention is None:
             return self._argument_registers + self._argument_stack_variables
-        else:
-            if self.prototype is None:
-                return []
-            return self.calling_convention.arg_locs(self.prototype)
+        if self.prototype is None:
+            return []
+        return self.calling_convention.arg_locs(self.prototype)
 
     @property
     def has_return(self):
-        return len(self._ret_sites) > 0
+        return len(self._graph.sites(SiteKind.RET)) > 0
 
     @property
     def callable(self):
-        return self._project.factory.callable(self.addr)
+        assert self.project is not None
+        return self.project.factory.callable(self.addr)
 
+    @dirty_func
     def normalize(self):
         """
         Make sure all basic blocks in the transition graph of this function do not overlap. You will end up with a CFG
@@ -1242,121 +2217,30 @@ class Function(Serializable):
 
         :return: None
         """
+        assert self.project is not None
 
         # let's put a check here
         if self.startpoint is None:
             # this function is empty
-            l.debug('Unexpected error: %s does not have any blocks. normalize() fails.', repr(self))
+            l.debug("Unexpected error: %s does not have any blocks. normalize() fails.", repr(self))
             return
 
-        graph = self.transition_graph
-        end_addresses = defaultdict(list)
+        project = self.project
 
-        for block in self.nodes:
-            if isinstance(block, BlockNode):
-                end_addr = block.addr + block.size
-                end_addresses[end_addr].append(block)
+        def branch_ins_addr(addr: int, size: int) -> int | None:
+            block = project.factory.block(addr, size=size)
+            return block_branch_ins_addr(block.instruction_addrs, block.addr, block.size, project.arch)
 
-        while any(len(x) > 1 for x in end_addresses.values()):
-            end_addr, all_nodes = \
-                next((end_addr, x) for (end_addr, x) in end_addresses.items() if len(x) > 1)
+        self._graph.normalize(is_arm_arch(project.arch), branch_ins_addr)
 
-            all_nodes = sorted(all_nodes, key=lambda node: node.size)
-            smallest_node = all_nodes[0]
-            other_nodes = all_nodes[1:]
-
-            is_outside_node = False
-            if smallest_node not in graph:
-                is_outside_node = True
-
-            # Break other nodes
-            for n in other_nodes:
-                new_size = get_real_address_if_arm(self._project.arch, smallest_node.addr) - get_real_address_if_arm(self._project.arch, n.addr)
-                if new_size == 0:
-                    # This is the node that has the same size as the smallest one
-                    continue
-
-                new_end_addr = n.addr + new_size
-
-                # Does it already exist?
-                new_node = None
-                if new_end_addr in end_addresses:
-                    nodes = [i for i in end_addresses[new_end_addr] if i.addr == n.addr]
-                    if len(nodes) > 0:
-                        new_node = nodes[0]
-
-                if new_node is None:
-                    # TODO: Do this correctly for hook nodes
-                    # Create a new one
-                    new_node = BlockNode(n.addr, new_size, graph=graph, thumb=n.thumb)
-                    self._block_sizes[n.addr] = new_size
-                    self._addr_to_block_node[n.addr] = new_node
-                    # Put the newnode into end_addresses
-                    end_addresses[new_end_addr].append(new_node)
-
-                # Modify the CFG
-                original_predecessors = list(graph.in_edges([n], data=True))
-                original_successors = list(graph.out_edges([n], data=True))
-
-                for _, d, data in original_successors:
-                    ins_addr = data.get('ins_addr', data.get('pseudo_ins_addr', None))
-                    if ins_addr is not None and ins_addr < d.addr:
-                        continue
-                    if d not in graph[smallest_node]:
-                        if d is n:
-                            graph.add_edge(smallest_node, new_node, **data)
-                        else:
-                            graph.add_edge(smallest_node, d, **data)
-
-                for p, _, _ in original_predecessors:
-                    graph.remove_edge(p, n)
-                graph.remove_node(n)
-
-                # update local_blocks
-                if n.addr in self._local_blocks and self._local_blocks[n.addr].size != new_node.size:
-                    del self._local_blocks[n.addr]
-                    self._local_blocks[n.addr] = new_node
-
-                # update block_cache and block_sizes
-                if (n.addr in self._block_cache and self._block_cache[n.addr].size != new_node.size) or \
-                        (n.addr in self._block_sizes and self._block_sizes[n.addr] != new_node.size):
-                    # the cache needs updating
-                    self._block_cache.pop(n.addr, None)
-                    self._block_sizes[n.addr] = new_node.size
-
-                for p, _, data in original_predecessors:
-                    if p not in other_nodes:
-                        graph.add_edge(p, new_node, **data)
-
-                # We should find the correct successor
-                new_successors = [i for i in all_nodes
-                                  if i.addr == smallest_node.addr]
-                if new_successors:
-                    new_successor = new_successors[0]
-                    graph.add_edge(new_node, new_successor,
-                                   type="transition",
-                                   outside=is_outside_node,
-                                   # it's named "pseudo_ins_addr" because we have no way to know what the actual last
-                                   # instruction is at this moment (without re-lifting the block, which would be a
-                                   # waste of time).
-                                   pseudo_ins_addr=new_node.addr + new_node.size - 1,
-                                   )
-                else:
-                    # We gotta create a new one
-                    l.error('normalize(): Please report it to Fish/maybe john.')
-
-            end_addresses[end_addr] = [smallest_node]
-
-        # Rebuild startpoint
-        if self.startpoint.size != self._block_sizes[self.startpoint.addr]:
-            self.startpoint = self.get_node(self.startpoint.addr)
-
-        # Clear the cache
+        # Clear the caches
+        self._transition_graph = None
         self._local_transition_graph = None
+        self._block_addrs_cache = None
 
         self.normalized = True
 
-    def find_declaration(self, ignore_binary_name: bool=False, binary_name_hint: str=None) -> bool:
+    def find_declaration(self, ignore_binary_name: bool = False, binary_name_hint: str | None = None) -> bool:
         """
         Find the most likely function declaration from the embedded collection of prototypes, set it to self.prototype,
         and update self.calling_convention with the declaration.
@@ -1372,6 +2256,8 @@ class Function(Serializable):
                                     self.prototype or self.calling_convention will be kept untouched.
         """
 
+        libraries: set[SimLibrary]
+
         if not ignore_binary_name:
             # determine the library name
             if not self.is_plt:
@@ -1386,10 +2272,10 @@ class Function(Serializable):
                 if len(edges) == 0:
                     return False
                 node = next(iter(edges))[1]
-                if len(edges) == 1 and (type(node) is HookNode or type(node) is SyscallNode):
+                if len(edges) == 1 and isinstance(node, (FuncNode, HookNode, SyscallNode)):
                     target = node.addr
-                    if target in self._function_manager:
-                        target_func = self._function_manager[target]
+                    if self._function_manager is not None and self._function_manager.contains_addr(target):
+                        target_func = self._function_manager.get_by_addr(target)
                         binary_name = target_func.binary_name
 
             # cannot determine the binary name. since we are forced to respect binary name, we give up in this case.
@@ -1399,20 +2285,21 @@ class Function(Serializable):
             lib = SIM_LIBRARIES.get(binary_name, None)
             libraries = set()
             if lib is not None:
-                libraries.add(lib)
+                libraries.update(lib)
 
         else:
             # try all libraries or all libraries that match the given library name hint
             libraries = set()
-            for lib_name, lib in SIM_LIBRARIES.items():
+            for lib_name, libs in SIM_LIBRARIES.items():
                 # TODO: Add support for syscall libraries. Note that syscall libraries have different function
                 #  prototypes for .has_prototype() and .get_prototype()...
-                if not isinstance(lib, SimSyscallLibrary):
-                    if binary_name_hint:
-                        if binary_name_hint.lower() in lib_name.lower():
+                for lib in libs:
+                    if not isinstance(lib, SimSyscallLibrary):
+                        if binary_name_hint:
+                            if binary_name_hint.lower() in lib_name.lower():
+                                libraries.add(lib)
+                        else:
                             libraries.add(lib)
-                    else:
-                        libraries.add(lib)
 
         if not libraries:
             return False
@@ -1429,23 +2316,34 @@ class Function(Serializable):
 
         for library in libraries:
             for name in name_variants:
+                if isinstance(library, SimSyscallLibrary):
+                    # FIXME: we don't support getting declaration from a syscall library yet. we don't have the concept
+                    # of abi at this point.
+                    continue
                 if not library.has_prototype(name):
                     continue
 
                 proto = library.get_prototype(name)
                 if self.project is None:
                     # we need to get arch from self.project
-                    l.warning("Function %s does not have .project set. A possible prototype is found, but we cannot set it "
-                              "without .project.arch.")
+                    l.warning(
+                        "Function %s does not have .project set. A possible prototype is found, but we cannot set it "
+                        "without .project.arch.",
+                        self.name,
+                    )
                     return False
-                self.prototype = proto.with_arch(self.project.arch)
+                self.prototype = proto.with_arch(self.project.arch) if proto is not None else proto
+                self.prototype_libname = library.name
+                self.returning = library.is_returning(name)
 
                 # update self.calling_convention if necessary
                 if self.calling_convention is None:
-                    if self.project.arch.name in library.default_ccs:
+                    if self.project.arch.name in library.default_ccs and self.is_syscall is False:
                         self.calling_convention = library.default_ccs[self.project.arch.name](self.project.arch)
                     elif self.project.arch.name in DEFAULT_CC:
-                        self.calling_convention = DEFAULT_CC[self.project.arch.name](self.project.arch)
+                        cc_cls = default_cc_for_project(self.project, syscall=self.is_syscall is True)
+                        if cc_cls is not None:
+                            self.calling_convention = cc_cls(self.project.arch)
 
                 return True
 
@@ -1453,40 +2351,156 @@ class Function(Serializable):
 
     @staticmethod
     def _addr_to_funcloc(addr):
+        return addr
 
-        # FIXME
-        if isinstance(addr, tuple):
-            return addr[0]
-        else:  # int, long
-            return addr
+    def is_rust_function(self):
+        """
+        Determines if the function name follows Rust mangling conventions.
+        """
+        name = self.name
+
+        # 1. Check for Rust v0 mangling (Newer standard, e.g., _RNvCs...)
+        # Starts with _R followed by alphanumeric/underscores
+        if name.startswith("_R"):
+            return True
+
+        # 2. Check for Legacy/Itanium mangling (Standard, e.g., _ZN3std2io...)
+        # Rust legacy symbols almost always start with _ZN
+        if name.startswith("_ZN"):
+            # To distinguish from C++, look for the specific Rust hash pattern at the end.
+            # Rust legacy symbols typically end with 'h' followed by 16 hex characters.
+            # Example: _ZN3std2io5stdio6_print17h560ab85309735912E
+            rust_hash_pattern = re.compile(r"h[0-9a-fA-F]{16}E?$")
+            if rust_hash_pattern.search(name):
+                return True
+
+            # Fallback: If no hash is found, it *might* still be Rust (unhashed symbols),
+            # but _ZN is shared with C++.
+            # You might optionally check for common Rust crates in the name here.
+
+        return False
+
+    @staticmethod
+    def _rust_fmt_node(node):
+        result = []
+        rest = node
+        if rest.startswith("_$"):
+            rest = rest[1:]
+        while True:
+            if rest.startswith("."):
+                if len(rest) > 1 and rest[1] == ".":
+                    result.append("::")
+                    rest = rest[2:]
+                else:
+                    result.append(".")
+                    rest = rest[1:]
+            elif rest.startswith("$"):
+                if "$" in rest[1:]:
+                    escape, rest = rest[1:].split("$", 1)
+                else:
+                    break
+
+                unescaped = {"SP": "@", "BP": "*", "RF": "&", "LT": "<", "GT": ">", "LP": "(", "RP": ")", "C": ","}.get(
+                    escape
+                )
+
+                if unescaped is None and escape.startswith("u"):
+                    digits = escape[1:]
+                    if all(c in "0123456789abcdef" for c in digits):
+                        c = chr(int(digits, 16))
+                        if ord(c) >= 32 and ord(c) != 127:
+                            result.append(c)
+                            continue
+                if unescaped:
+                    result.append(unescaped)
+                else:
+                    break
+            else:
+                idx = min((rest.find(c) for c in "$." if c in rest), default=len(rest))
+                result.append(rest[:idx])
+                rest = rest[idx:]
+                if not rest:
+                    break
+        return "".join(result)
 
     @property
     def demangled_name(self):
-        if self.name[0:2] == "_Z":
-            try:
-                ast = parse(self.name)
-            except (NotImplementedError, KeyError):  # itanium demangler is not the most robust package in the world
-                return self.name
-            if ast:
-                return ast.__str__()
-        return self.name
+        if self.is_rust_function():
+            return demangle(self.name)
+        ast = pydemumble.demangle(self.name).strip()
+        return ast or self.name
 
-    def apply_definition(self, definition, calling_convention=None):
-        """
+    @property
+    def short_name(self):
+        if self.is_rust_function():
+            ast = pydemumble.demangle(self.name)
+            return Function._rust_fmt_node(ast.split("::")[-2])
+        func_name, meta = get_cpp_function_name_and_metadata(self.demangled_name)
+        if meta["ctor"]:
+            return "<ctor>"
+        if meta["dtor"]:
+            return "<dtor>"
+        if "<" in func_name and ">" in func_name:
+            # remove template arguments
+            depth = 0
+            new_name_chars = []
+            suffix = ""
+            if func_name.endswith(("<<", ">>")):
+                suffix = func_name[-2:]
+                func_name = func_name[:-2]
+            for c in func_name:
+                if c == "<":
+                    depth += 1
+                elif c == ">":
+                    depth -= 1
+                else:
+                    if depth == 0:
+                        new_name_chars.append(c)
+            func_name = "".join(new_name_chars) + suffix
+        return func_name.split("::")[-1] if "::" in func_name else func_name
 
-        :param str definition:
-        :param Optional[Union[SimCC, Type[SimCC]]] calling_convention:
-        :return None:
+    def get_unambiguous_name(self, display_name: str | None = None) -> str:
         """
+        Get a disambiguated function name.
+
+        :param display_name: Name to display, otherwise the function name.
+        :return: The function name in one of the following forms:
+
+            - ``::<name>`` when the function binary is the main object.
+            - ``::<obj>::<name>`` when the function binary is not the main object.
+            - ``::<addr>::<name>`` when the function binary is an unnamed non-main object, or when multiple functions
+              with the same name are defined in the function binary.
+        """
+        assert self.project is not None
+        must_disambiguate_by_addr = self.binary is not self.project.loader.main_object and self.binary_name is None
+
+        # If there are multiple functions with the same name in the same object, disambiguate by address
+        if not must_disambiguate_by_addr and self._function_manager is not None:
+            for func in self._function_manager.get_by_name(self.name):
+                if func is not self and func.binary is self.binary:
+                    must_disambiguate_by_addr = True
+                    break
+
+        separator = "::"
+        n = separator
+        if must_disambiguate_by_addr:
+            n += hex(self.addr) + separator
+        elif self.binary is not self.project.loader.main_object and self.binary_name is not None:
+            n += self.binary_name + separator
+        return n + (display_name or self.name)
+
+    def apply_definition(self, definition: str, calling_convention: SimCC | type[SimCC] | None = None) -> None:
+        assert self.project is not None
         if not definition.endswith(";"):
             definition += ";"
         func_def = parse_defns(definition, arch=self.project.arch)
         if len(func_def.keys()) > 1:
-            raise Exception("Too many definitions: %s " % list(func_def.keys()))
+            raise AngrValueError(f"Too many definitions: {list(func_def.keys())} ")
 
-        name, ty = func_def.popitem() # type: str, SimTypeFunction
+        name, ty = func_def.popitem()
+        assert isinstance(ty, SimTypeFunction)
         self.name = name
-        self.prototype = ty
+        self.prototype = ty.with_arch(self.project.arch)
         # setup the calling convention
         # If a SimCC object is passed assume that this is sane and just use it
         if isinstance(calling_convention, SimCC):
@@ -1503,47 +2517,71 @@ class Function(Serializable):
         else:
             raise TypeError("calling_convention has to be one of: [SimCC, type(SimCC), None]")
 
-    def functions_called(self) -> Set['Function']:
+    def functions_reachable(self) -> set[Function]:
         """
         :return: The set of all functions that can be reached from the function represented by self.
         """
-        called = set()
+        if self._function_manager is None:
+            return set()
+
+        seen: set[int] = set()
+        called: set[Function] = set()
+
         def _find_called(function_address):
-            successors = set(self._function_manager.callgraph.successors(function_address)) - called
-            for s in successors:
-                called.add(s)
+            assert self._function_manager is not None
+            for s in self._function_manager.callgraph.successors(function_address):
+                if s in seen:
+                    continue
+                seen.add(s)
+                func = self._function_manager.function(s)
+                assert func is not None
+                called.add(func)
                 _find_called(s)
+
         _find_called(self.addr)
-        return { self._function_manager.function(a) for a in called }
+        return called
+
+    def holes(self, min_size: int = 8) -> int:
+        """
+        Find the number of non-consecutive areas in the function that are at least `min_size` bytes large.
+        """
+
+        block_addrs = sorted(self._graph.local_addrs())
+        if not block_addrs:
+            return 0
+        holes = 0
+        for i, addr in enumerate(block_addrs):
+            if i == len(block_addrs) - 1:
+                break
+            next_addr = block_addrs[i + 1]
+            size = self._graph.block_size(addr)
+            assert size is not None
+            if next_addr > addr + size and next_addr - (addr + size) >= min_size:
+                holes += 1
+        return holes
 
     def copy(self):
         func = Function(self._function_manager, self.addr, name=self.name, syscall=self.is_syscall)
-        func.transition_graph = networkx.DiGraph(self.transition_graph)
+        func._graph = self._graph.copy()
         func.normalized = self.normalized
-        func._ret_sites = self._ret_sites.copy()
-        func._jumpout_sites = self._jumpout_sites.copy()
-        func._retout_sites = self._retout_sites.copy()
-        func._endpoints = self._endpoints.copy()
-        func._call_sites = self._call_sites.copy()
         func._project = self._project
-        func.is_plt = self.is_plt
-        func.is_simprocedure = self.is_simprocedure
+        func.previous_names = list(self.previous_names)
+        func._is_plt = self.is_plt
+        func._is_simprocedure = self.is_simprocedure
         func.binary_name = self.binary_name
         func.bp_on_stack = self.bp_on_stack
         func.retaddr_on_stack = self.retaddr_on_stack
         func.sp_delta = self.sp_delta
-        func.calling_convention = self.calling_convention
-        func.prototype = self.prototype
+        func._calling_convention = self.calling_convention
+        func._prototypes = {flavor: self._resolved_prototype(flavor) for flavor in self._prototypes}
+        func._prototype_sources = dict(self._prototype_sources)
+        func._prototypes_resolved = set(self._prototypes_resolved)
+        func._prototype_libname = self._prototype_libname
         func._returning = self._returning
-        func.alignment = self.alignment
-        func.startpoint = self.startpoint
-        func._addr_to_block_node = self._addr_to_block_node.copy()
-        func._block_sizes = self._block_sizes.copy()
-        func._block_cache = self._block_cache.copy()
-        func._local_blocks = self._local_blocks.copy()
-        func._local_block_addrs = self._local_block_addrs.copy()
-        func.info = self.info.copy()
+        func._is_alignment = self.is_alignment
+        func._info = self.info.copy(func)
         func.tags = self.tags
+        func._dirty = self._dirty
 
         return func
 
@@ -1551,4 +2589,5 @@ class Function(Serializable):
         """
         Pretty-print the function disassembly.
         """
+        assert self.project is not None
         print(self.project.analyses.Disassembly(self).render(**kwargs))

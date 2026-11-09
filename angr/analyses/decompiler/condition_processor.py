@@ -1,49 +1,373 @@
-from collections import defaultdict
-from typing import Generator, Dict, Any, Optional, Set
-import operator
+from __future__ import annotations
+
 import logging
+import operator
+import struct
+from collections import OrderedDict, defaultdict
+from collections.abc import Callable, Generator
+from typing import TYPE_CHECKING, Any
 
 import networkx
-import sympy
 
-import claripy
-import ailment
+from angr import ailment, claripy
+from angr.ailment.expression import StringLiteral
+from angr.block import Block, BlockNode
+from angr.errors import AngrRuntimeError
+from angr.utils.ail import is_head_controlled_loop_block
+from angr.utils.graph import GraphUtils, dfs_preorder_nodes, dominates, inverted_idoms
 
-from ...utils.graph import dominates, shallow_reverse
-from ...block import Block, BlockNode
-from ..cfg.cfg_utils import CFGUtils
-from .structurer_nodes import (EmptyBlockNotice, SequenceNode, CodeNode, SwitchCaseNode, BreakNode,
-                               ConditionalBreakNode, LoopNode, ConditionNode, ContinueNode, CascadingConditionNode)
+from .peephole_optimizations import InvertNegatedLogicalConjunctionsAndDisjunctions, RemoveRedundantNots, X87CmpF
+from .region_overlay import RegionOverlay
+from .structurer_nodes import (
+    BreakNode,
+    CascadingConditionNode,
+    CodeNode,
+    ConditionalBreakNode,
+    ConditionNode,
+    ContinueNode,
+    EmptyBlockNotice,
+    IncompleteSwitchCaseNode,
+    LoopNode,
+    MultiNode,
+    SequenceNode,
+    SwitchCaseNode,
+)
+from .utils import peephole_optimize_expr, peephole_optimize_expr_shallow
+from .variable_map import variable_map_of
+
+if TYPE_CHECKING:
+    from angr.ailment import Manager
 
 l = logging.getLogger(__name__)
 
 
-_UNIFIABLE_COMPARISONS = {
-    '__ne__', '__gt__', '__ge__', 'UGT', 'UGE', 'SGT', 'SGE',
+class AILExprIdAnnotation(claripy.Annotation):
+    """
+    An annotation that we use to annotate BVVs so that they are differentiable between other BVVs with the same value
+    and size.
+    """
+
+    eliminatable = True
+    relocatable = False
+
+    def __hash__(self):
+        return 1
+
+    def __eq__(self, other):
+        return isinstance(other, AILExprIdAnnotation)
+
+
+#
+# Util methods and mapping used during AIL AST to claripy AST conversion
+#
+
+
+def _op_with_unified_size(op, conv: Callable, operand0, operand1, ins_addr: int, ail_manager: Manager):
+    # ensure operand1 is of the same size as operand0
+    if isinstance(operand1, ailment.Expr.Const) and isinstance(operand1.value, int):
+        # amazing - we do the easy thing here
+        return op(conv(operand0, nobool=True, ins_addr=ins_addr), operand1.value)
+    if operand1.bits == operand0.bits:
+        return op(conv(operand0, nobool=True, ins_addr=ins_addr), conv(operand1, nobool=True, ins_addr=ins_addr))
+    # extension (or, for a shift amount wider than the value, truncation) is required
+    operand1 = ailment.Expr.Convert(ail_manager.next_atom(), operand1.bits, operand0.bits, False, operand1)
+    return op(conv(operand0, nobool=True, ins_addr=ins_addr), conv(operand1, nobool=True, ins_addr=ins_addr))
+
+
+def _dummy_bvs(condition, condition_mapping, name_suffix="", must_bool=False):
+    if must_bool:
+        var = claripy.BoolS(f"ailexpr_{condition!r}{name_suffix}", explicit_name=True)
+    else:
+        var = claripy.BVS(f"ailexpr_{condition!r}{name_suffix}", condition.bits, explicit_name=True)
+    condition_mapping[var.args[0]] = condition
+    return var
+
+
+def _dummy_bools(condition, condition_mapping, name_suffix=""):
+    var = claripy.BoolS(f"ailexpr_{condition!r}{name_suffix}", explicit_name=True)
+    condition_mapping[var.args[0]] = condition
+    return var
+
+
+_BITWISE_OPS = frozenset({"And", "Or", "Xor"})
+_FP_FLAGGED_OPS = frozenset({"CmpEQ", "CmpNE", "CmpLT", "CmpLE", "CmpGT", "CmpGE", "Add", "Sub", "Mul", "Div"})
+_CLARIPY_CMP_OPS = frozenset(
+    {"__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "SLT", "SLE", "SGT", "SGE", "ULT", "ULE", "UGT", "UGE"}
+)
+
+
+def _cmp_with_unified_size(op: Callable) -> Callable:
+    """
+    Build a comparison lambda whose operands are brought to the same width first. An AIL comparison can end up with
+    operands that convert to bit-vectors of different widths (an ill-formed expression from an earlier pass); claripy
+    refuses to compare those, and a decompilation should not die on a condition.
+    """
+
+    def _cmp(expr, conv: Callable, m, ins_addr: int, *args):  # pylint:disable=unused-argument
+        if expr.floating_point and expr.operands[0].likes(expr.operands[1]):
+            # x != x is the NaN test; claripy would fold it to a constant
+            return _dummy_bools(expr, m)
+        operands = []
+        for operand in expr.operands:
+            if expr.floating_point and isinstance(operand, ailment.Expr.BinaryOp) and operand.op in _BITWISE_OPS:
+                # bit operations on an FP compare operand (fabs as x & 0x7fff...) must stay opaque: claripy would
+                # simplify them into integer extracts and the compare would lose its FP meaning
+                operands.append(_dummy_bvs(operand, m))
+            else:
+                operands.append(conv(operand, nobool=True, ins_addr=ins_addr))
+        operand0, operand1 = operands
+        if isinstance(operand0, claripy.ast.BV) and isinstance(operand1, claripy.ast.BV):
+            size0, size1 = operand0.size(), operand1.size()
+            if size1 < size0:
+                operand1 = claripy.ZeroExt(size0 - size1, operand1)
+            elif size1 > size0:
+                operand1 = operand1[size0 - 1 : 0]
+        return op(operand0, operand1)
+
+    return _cmp
+
+
+_ail2claripy_op_mapping = {
+    "LogicalAnd": lambda expr, conv, _, ia, *args: claripy.And(
+        conv(expr.operands[0], ins_addr=ia), conv(expr.operands[1], ins_addr=ia)
+    ),
+    "LogicalOr": lambda expr, conv, _, ia, *args: claripy.Or(
+        conv(expr.operands[0], ins_addr=ia), conv(expr.operands[1], ins_addr=ia)
+    ),
+    "CmpEQ": _cmp_with_unified_size(operator.eq),
+    "CmpNE": _cmp_with_unified_size(operator.ne),
+    "CmpLE": _cmp_with_unified_size(operator.le),
+    "CmpLEs": _cmp_with_unified_size(claripy.SLE),
+    "CmpLT": _cmp_with_unified_size(operator.lt),
+    "CmpLTs": _cmp_with_unified_size(claripy.SLT),
+    "CmpGE": _cmp_with_unified_size(operator.ge),
+    "CmpGEs": _cmp_with_unified_size(claripy.SGE),
+    "CmpGT": _cmp_with_unified_size(operator.gt),
+    "CmpGTs": _cmp_with_unified_size(claripy.SGT),
+    "CasCmpEQ": _cmp_with_unified_size(operator.eq),
+    "CasCmpNE": _cmp_with_unified_size(operator.ne),
+    "CasCmpLE": _cmp_with_unified_size(operator.le),
+    "CasCmpLEs": _cmp_with_unified_size(claripy.SLE),
+    "CasCmpLT": _cmp_with_unified_size(operator.lt),
+    "CasCmpLTs": _cmp_with_unified_size(claripy.SLT),
+    "CasCmpGE": _cmp_with_unified_size(operator.ge),
+    "CasCmpGEs": _cmp_with_unified_size(claripy.SGE),
+    "CasCmpGT": _cmp_with_unified_size(operator.gt),
+    "CasCmpGTs": _cmp_with_unified_size(claripy.SGT),
+    "Add": lambda expr, conv, _, ia, am: _op_with_unified_size(
+        operator.add, conv, expr.operands[0], expr.operands[1], ia, am
+    ),
+    "Sub": lambda expr, conv, _, ia, am: _op_with_unified_size(
+        operator.sub, conv, expr.operands[0], expr.operands[1], ia, am
+    ),
+    "Mul": lambda expr, conv, _, ia, am: _op_with_unified_size(
+        operator.mul, conv, expr.operands[0], expr.operands[1], ia, am
+    ),
+    "Div": lambda expr, conv, _, ia, *args: (
+        conv(expr.operands[0], nobool=True, ins_addr=ia) / conv(expr.operands[1], nobool=True, ins_addr=ia)
+    ),
+    "Mod": lambda expr, conv, _, ia, *args: (
+        conv(expr.operands[0], nobool=True, ins_addr=ia) % conv(expr.operands[1], nobool=True, ins_addr=ia)
+    ),
+    "Not": lambda expr, conv, _, ia, *args: claripy.Not(conv(expr.operand, ins_addr=ia)),
+    "Neg": lambda expr, conv, _, ia, *args: -conv(expr.operand, ins_addr=ia),
+    "BitwiseNeg": lambda expr, conv, _, ia, *args: ~conv(expr.operand, ins_addr=ia),
+    "Xor": lambda expr, conv, _, ia, am: _op_with_unified_size(
+        operator.xor, conv, expr.operands[0], expr.operands[1], ia, am
+    ),
+    "And": lambda expr, conv, _, ia, am: _op_with_unified_size(
+        operator.and_, conv, expr.operands[0], expr.operands[1], ia, am
+    ),
+    "Or": lambda expr, conv, _, ia, am: _op_with_unified_size(
+        operator.or_, conv, expr.operands[0], expr.operands[1], ia, am
+    ),
+    "Shr": lambda expr, conv, _, ia, am: _op_with_unified_size(
+        claripy.LShR, conv, expr.operands[0], expr.operands[1], ia, am
+    ),
+    "Shl": lambda expr, conv, _, ia, am: _op_with_unified_size(
+        operator.lshift, conv, expr.operands[0], expr.operands[1], ia, am
+    ),
+    "Sar": lambda expr, conv, _, ia, am: _op_with_unified_size(
+        operator.rshift, conv, expr.operands[0], expr.operands[1], ia, am
+    ),
+    "Concat": lambda expr, conv, _, ia, *args: claripy.Concat(
+        *[conv(operand, ins_addr=ia) for operand in expr.operands]
+    ),
+    # There are no corresponding claripy operations for the following operations
+    "CmpF": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "Mull": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "Mulls": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "Reinterpret": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "Rol": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "Ror": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "LogicalXor": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "Carry": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "SCarry": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "SBorrow": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "ExpCmpNE": lambda expr, _, m, *args: _dummy_bools(expr, m),
+    "CmpUN": lambda expr, _, m, *args: _dummy_bools(expr, m),
+    "IsNaN": lambda expr, _, m, *args: _dummy_bools(expr, m),
+    "SignBit": lambda expr, _, m, *args: _dummy_bools(expr, m),
+    "MovMskPD": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "MovMskPS": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "IsInf": lambda expr, _, m, *args: _dummy_bools(expr, m),
+    "IsFinite": lambda expr, _, m, *args: _dummy_bools(expr, m),
+    "IsNormal": lambda expr, _, m, *args: _dummy_bools(expr, m),
+    "CmpORD": lambda expr, _, m, *args: _dummy_bvs(expr, m),  # in case CmpORDRewriter fails
+    "CmpEQV": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "GetMSBs": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "ShlNV": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "ShrNV": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "InterleaveLOV": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    "InterleaveHIV": lambda expr, _, m, *args: _dummy_bvs(expr, m),
+    # catch-all
+    "_DUMMY_": lambda expr, _, m, *args: _dummy_bvs(expr, m),
 }
+
+#
+# The ConditionProcessor class
+#
 
 
 class ConditionProcessor:
     """
     Convert between claripy AST and AIL expressions. Also calculates reaching conditions of all nodes on a graph.
     """
-    def __init__(self, arch, condition_mapping=None):
+
+    def __init__(self, arch, ail_manager: Manager, condition_mapping=None):
         self.arch = arch
-        self._condition_mapping: Dict[str,Any] = {} if condition_mapping is None else condition_mapping
-        self.jump_table_conds: Dict[int,Set] = defaultdict(set)
+        self.ail_manager = ail_manager
+        self._condition_mapping: dict[str, Any] = {} if condition_mapping is None else condition_mapping
+        self.jump_table_conds: dict[int, set] = defaultdict(set)
         self.reaching_conditions = {}
         self.guarding_conditions = {}
+        self.edge_conditions: dict[tuple[Any, Any], claripy.ast.Bool] = {}
         self._ast2annotations = {}
+        # claripy hash -> converted (and peephole-optimized) AIL expression; live only during one outermost
+        # conversion or one remove_claripy_bool_asts() traversal (leaf conversions depend on the current mapping)
+        self._conversion_memo: dict[int, Any] | None = None
+
+        self._peephole_expr_optimizations = [
+            cls(None, None, self.ail_manager)
+            for cls in [InvertNegatedLogicalConjunctionsAndDisjunctions, RemoveRedundantNots, X87CmpF]
+        ]
 
     def clear(self):
         self._condition_mapping = {}
         self.jump_table_conds = defaultdict(set)
         self.reaching_conditions = {}
         self.guarding_conditions = {}
+        self.edge_conditions = {}
         self._ast2annotations = {}
+        self._conversion_memo = None
 
-    def recover_reaching_conditions(self, region, with_successors=False,
-                                    case_entry_to_switch_head: Optional[Dict[int,int]]=None):
+    def have_opposite_edge_conditions(self, graph: networkx.DiGraph, src, dst0, dst1) -> bool:
+        """
+        Check if the edge conditions of two edges (src, dst0) and (src, dst1) are opposite to each other. Try to avoid
+        condition translation if possible.
+        """
+
+        if isinstance(src, SequenceNode) and src.nodes and isinstance(src.nodes[-1], ConditionNode):
+            cond_node = src.nodes[-1]
+            if (
+                isinstance(cond_node.true_node, ailment.Block)
+                and isinstance(cond_node.false_node, ailment.Block)
+                and cond_node.true_node.statements
+                and cond_node.false_node.statements
+            ):
+                last_stmt_true = self.get_last_statement(cond_node.true_node)
+                last_stmt_false = self.get_last_statement(cond_node.false_node)
+                if (
+                    isinstance(last_stmt_true, ailment.Stmt.Jump)
+                    and isinstance(last_stmt_false, ailment.Stmt.Jump)
+                    and isinstance(last_stmt_true.target, ailment.Expr.Const)
+                    and isinstance(last_stmt_false.target, ailment.Expr.Const)
+                ):
+                    return {last_stmt_true.target.value, last_stmt_false.target.value} == {dst0.addr, dst1.addr}
+
+        if src in graph and graph.out_degree[src] == 2 and graph.has_edge(src, dst0) and graph.has_edge(src, dst1):
+            # sometimes the last statement is the conditional jump. sometimes it's the first statement of the block
+            if isinstance(src, ailment.Block) and src.statements and is_head_controlled_loop_block(src):
+                last_stmt = next(
+                    iter(stmt for stmt in src.statements[:-1] if isinstance(stmt, ailment.Stmt.ConditionalJump)), None
+                )
+                assert last_stmt is not None
+            else:
+                try:
+                    last_stmt = self.get_last_statement(src)
+                except EmptyBlockNotice:
+                    last_stmt = None
+
+            if isinstance(last_stmt, ailment.Stmt.ConditionalJump):
+                return True
+
+        # fallback
+        edge_cond_left = self.recover_edge_condition(graph, src, dst0)
+        edge_cond_right = self.recover_edge_condition(graph, src, dst1)
+        cond = claripy.Not(edge_cond_left) == edge_cond_right
+        return claripy.is_true(claripy.simplify(cond))  # type: ignore
+
+    def recover_edge_condition(self, graph: networkx.DiGraph, src, dst):
+        def _check_condnode_and_get_condition(cond_node: ConditionNode) -> claripy.ast.Bool | None:
+            for cond_block, negate in [(cond_node.true_node, False), (cond_node.false_node, True)]:
+                if isinstance(cond_block, ailment.Block) and cond_block.statements:
+                    last_stmt = self.get_last_statement(cond_block)
+                    if (
+                        isinstance(last_stmt, ailment.Stmt.Jump)
+                        and isinstance(last_stmt.target, ailment.Expr.Const)
+                        and last_stmt.target.value == dst.addr
+                    ):
+                        return claripy.Not(cond_node.condition) if negate else cond_node.condition
+            return None
+
+        if isinstance(src, SequenceNode) and src.nodes and isinstance(src.nodes[-1], ConditionNode):
+            predicate = _check_condnode_and_get_condition(src.nodes[-1])
+            if predicate is not None:
+                return predicate
+        if isinstance(src, ConditionNode):
+            predicate = _check_condnode_and_get_condition(src)
+            if predicate is not None:
+                return predicate
+
+        edge = src, dst
+        edge_data = graph.get_edge_data(*edge)
+        edge_type = edge_data.get("type", "transition") if edge_data is not None else "transition"
+        try:
+            predicate = self._extract_predicate(src, dst, edge_type)
+        except EmptyBlockNotice:
+            # catch empty block notice - although this should not really happen
+            predicate = claripy.true()
+        return predicate
+
+    def recover_edge_conditions(self, region, graph=None) -> dict:
+        edge_conditions = {}
+        # traverse the graph to recover the condition for each edge
+        graph = graph or region.graph
+        for src in graph.nodes():
+            nodes = list(graph[src])
+            if len(nodes) >= 1:
+                for dst in nodes:
+                    predicate = self.recover_edge_condition(graph, src, dst)
+                    edge_conditions[(src, dst)] = predicate
+
+        return edge_conditions
+
+    def recover_reaching_conditions(
+        self,
+        region,
+        graph=None,
+        with_successors=False,
+        case_entry_to_switch_head: dict[int, int] | None = None,
+        simplify_conditions: bool = True,
+        with_guarding_conditions: bool = True,
+    ):
+        """
+        Recover the reaching conditions for each block in an acyclic graph. Note that we assume the graph that's passed
+        in is acyclic.
+
+        Edge conditions are stored in self.edge_conditions. Guarding conditions are only needed by structurers that
+        consume them (Dream, DuplicationReverter); pass with_guarding_conditions=False to skip computing them.
+        """
 
         def _strictly_postdominates(inv_idoms, node_a, node_b):
             """
@@ -51,62 +375,36 @@ class ConditionProcessor:
             """
             return dominates(inv_idoms, node_a, node_b)
 
-        edge_conditions = {}
-        predicate_mapping = {}
-        # traverse the graph to recover the condition for each edge
-        for src in region.graph.nodes():
-            nodes = list(region.graph[src])
-            if len(nodes) >= 1:
-                for dst in nodes:
-                    edge = src, dst
-                    edge_data = region.graph.get_edge_data(*edge)
-                    edge_type = edge_data.get('type', 'transition')
-                    try:
-                        predicate = self._extract_predicate(src, dst, edge_type)
-                    except EmptyBlockNotice:
-                        # catch empty block notice - although this should not really happen
-                        predicate = claripy.true
-                    edge_conditions[edge] = predicate
-                    predicate_mapping[predicate] = dst
+        edge_conditions = self.recover_edge_conditions(region, graph=graph)
 
-        if with_successors and region.graph_with_successors is not None:
-            _g = region.graph_with_successors
+        if graph:
+            _g = graph
+            head = next(node for node in graph.nodes if graph.in_degree(node) == 0)
         else:
-            _g = region.graph
+            if with_successors and region.graph_with_successors is not None:
+                _g = region.graph_with_successors
+            else:
+                _g = region.graph
+            head = region.head
 
         # special handling for jump table entries - do not allow crossing between cases
         if case_entry_to_switch_head:
             _g = self._remove_crossing_edges_between_cases(_g, case_entry_to_switch_head)
 
-        end_nodes = {n for n in _g.nodes() if _g.out_degree(n) == 0}
-        inverted_graph: networkx.DiGraph = shallow_reverse(_g)
-        if end_nodes:
-            if len(end_nodes) > 1:
-                # make sure there is only one end node
-                dummy_node = "DUMMY_NODE"
-                for end_node in end_nodes:
-                    inverted_graph.add_edge(dummy_node, end_node)
-                endnode = dummy_node
-            else:
-                endnode = next(iter(end_nodes))  # pick the end node
-
-            idoms = networkx.immediate_dominators(inverted_graph, endnode)
-        else:
-            idoms = None
+        inverted_graph, idoms = inverted_idoms(_g)
 
         reaching_conditions = {}
         # recover the reaching condition for each node
-        sorted_nodes = CFGUtils.quasi_topological_sort_nodes(_g)
-        terminating_nodes = [ ]
+        sorted_nodes = GraphUtils.quasi_topological_sort_nodes(_g)
+        terminating_nodes = []
         for node in sorted_nodes:
             # create special conditions for all nodes that are jump table entries
-            if case_entry_to_switch_head:
-                if node.addr in case_entry_to_switch_head:
-                    jump_target_var = self.create_jump_target_var(case_entry_to_switch_head[node.addr])
-                    cond = jump_target_var == claripy.BVV(node.addr, self.arch.bits)
-                    reaching_conditions[node] = cond
-                    self.jump_table_conds[case_entry_to_switch_head[node.addr]].add(cond)
-                    continue
+            if case_entry_to_switch_head and node.addr in case_entry_to_switch_head:
+                jump_target_var = self.create_jump_target_var(case_entry_to_switch_head[node.addr])
+                cond = jump_target_var == claripy.BVV(node.addr, self.arch.bits)
+                reaching_conditions[node] = cond
+                self.jump_table_conds[case_entry_to_switch_head[node.addr]].add(cond)
+                continue
 
             preds = _g.predecessors(node)
             reaching_condition = None
@@ -115,17 +413,17 @@ class ConditionProcessor:
             if out_degree == 0:
                 terminating_nodes.append(node)
 
-            if node is region.head:
+            if node is head:
                 # the head is always reachable
-                reaching_condition = claripy.true
-            elif idoms is not None and _strictly_postdominates(idoms, node, region.head):
+                reaching_condition = claripy.true()
+            elif idoms is not None and _strictly_postdominates(idoms, node, head):
                 # the node that post dominates the head is always reachable
-                reaching_conditions[node] = claripy.true
+                reaching_conditions[node] = claripy.true()
             else:
                 for pred in preds:
                     edge = (pred, node)
-                    pred_condition = reaching_conditions.get(pred, claripy.true)
-                    edge_condition = edge_conditions.get(edge, claripy.true)
+                    pred_condition = reaching_conditions.get(pred, claripy.true())
+                    edge_condition = edge_conditions.get(edge, claripy.true())
 
                     if reaching_condition is None:
                         reaching_condition = claripy.And(pred_condition, edge_condition)
@@ -133,7 +431,15 @@ class ConditionProcessor:
                         reaching_condition = claripy.Or(claripy.And(pred_condition, edge_condition), reaching_condition)
 
             if reaching_condition is not None:
-                reaching_conditions[node] = self.simplify_condition(reaching_condition)
+                reaching_conditions[node] = (
+                    self.simplify_condition(reaching_condition) if simplify_conditions else reaching_condition
+                )
+
+        self.reaching_conditions = reaching_conditions
+        self.edge_conditions = edge_conditions
+        if not with_guarding_conditions:
+            self.guarding_conditions = {}
+            return
 
         # My hypothesis: for nodes where two paths come together *and* those that cannot be further structured into
         # another if-else construct (we take the short-cut by testing if the operator is an "Or" after running our
@@ -141,23 +447,25 @@ class ConditionProcessor:
         # reaching conditions for if-else. see my super long chatlog with rhelmot on 5/14/2021.
         guarding_conditions = {}
         for the_node in sorted_nodes:
-
-            preds = list(_g.predecessors(the_node))
-            if len(preds) != 2:
+            if _g.in_degree(the_node) != 2:
                 continue
-            # generate a graph slice that goes from the region head to this node
-            slice_nodes = list(networkx.dfs_tree(inverted_graph, the_node))
-            subgraph = networkx.subgraph(_g, slice_nodes)
-            # figure out which paths cause the divergence from this node
+            # the graph slice from the region head to this node is the set of nodes that reach it; inverted_graph is
+            # _g reversed (plus a dummy sink without in-edges), so a DFS on it from the_node collects exactly that set
+            slice_nodes = dfs_preorder_nodes(inverted_graph, the_node)
+            slice_set = set(slice_nodes)
+            # successors of slice nodes outside the slice cannot reach the_node: these are the diverging paths. the
+            # slice is visited in the order of a networkx subgraph view so the set below (and the Or built from it)
+            # keeps its historical order
             nodes_do_not_reach_the_node = set()
-            for node_ in subgraph:
+            slice_iter = slice_set if 2 * len(slice_set) < len(_g) else (n for n in _g if n in slice_set)
+            for node_ in slice_iter:
                 if node_ is the_node:
                     continue
                 for succ in _g.successors(node_):
-                    if not networkx.has_path(_g, succ, the_node):
+                    if succ not in slice_set:
                         nodes_do_not_reach_the_node.add(succ)
 
-            diverging_conditions = [ ]
+            diverging_conditions = []
 
             for node_ in nodes_do_not_reach_the_node:
                 preds_ = list(_g.predecessors(node_))
@@ -172,89 +480,97 @@ class ConditionProcessor:
 
             if diverging_conditions:
                 # the negation of the union of diverging conditions is the guarding condition for this node
-                cond = claripy.Or(*map(claripy.Not, diverging_conditions))
+                cond = claripy.Or(*map(claripy.Not, diverging_conditions))  # pylint:disable=bad-builtin
                 guarding_conditions[the_node] = cond
 
-        self.reaching_conditions = reaching_conditions
         self.guarding_conditions = guarding_conditions
 
-    def remove_claripy_bool_asts(self, node, memo=None):
-
+    def remove_claripy_bool_asts(self, node):
         # Convert claripy Bool ASTs to AIL expressions
 
-        if memo is None:
-            memo = {}
+        if self._conversion_memo is not None:
+            return self._remove_claripy_bool_asts(node)
+        self._conversion_memo = {}
+        try:
+            return self._remove_claripy_bool_asts(node)
+        finally:
+            self._conversion_memo = None
 
+    def _remove_claripy_bool_asts(self, node):
         if isinstance(node, SequenceNode):
-            new_nodes = [ ]
+            new_nodes = []
             for n in node.nodes:
-                new_node = self.remove_claripy_bool_asts(n, memo=memo)
+                new_node = self._remove_claripy_bool_asts(n)
                 new_nodes.append(new_node)
-            new_seq_node = SequenceNode(node.addr, new_nodes)
-            return new_seq_node
+            return SequenceNode(node.addr, new_nodes)
 
-        elif isinstance(node, MultiNode):
-            new_nodes = [ ]
+        if isinstance(node, MultiNode):
+            new_nodes = []
             for n in node.nodes:
-                new_node = self.remove_claripy_bool_asts(n, memo=memo)
+                new_node = self._remove_claripy_bool_asts(n)
                 new_nodes.append(new_node)
-            new_multinode = MultiNode(nodes=new_nodes)
-            return new_multinode
+            return MultiNode(nodes=new_nodes)
 
-        elif isinstance(node, CodeNode):
-            node = CodeNode(self.remove_claripy_bool_asts(node.node, memo=memo),
-                            None if node.reaching_condition is None
-                            else self.convert_claripy_bool_ast(node.reaching_condition, memo=memo))
-            return node
+        if isinstance(node, CodeNode):
+            return CodeNode(
+                self._remove_claripy_bool_asts(node.node),
+                (None if node.reaching_condition is None else self.convert_claripy_bool_ast(node.reaching_condition)),
+            )
 
-        elif isinstance(node, ConditionalBreakNode):
+        if isinstance(node, ConditionalBreakNode):
+            return ConditionalBreakNode(
+                node.addr,
+                self.convert_claripy_bool_ast(node.condition),
+                node.target,
+            )
 
-            return ConditionalBreakNode(node.addr,
-                                        self.convert_claripy_bool_ast(node.condition, memo=memo),
-                                        node.target,
-                                        )
+        if isinstance(node, ConditionNode):
+            return ConditionNode(
+                node.addr,
+                (None if node.reaching_condition is None else self.convert_claripy_bool_ast(node.reaching_condition)),
+                self.convert_claripy_bool_ast(node.condition),
+                self._remove_claripy_bool_asts(node.true_node),
+                self._remove_claripy_bool_asts(node.false_node),
+            )
 
-        elif isinstance(node, ConditionNode):
-
-            return ConditionNode(node.addr,
-                                 None if node.reaching_condition is None else
-                                    self.convert_claripy_bool_ast(node.reaching_condition, memo=memo),
-                                 self.convert_claripy_bool_ast(node.condition, memo=memo),
-                                 self.remove_claripy_bool_asts(node.true_node, memo=memo),
-                                 self.remove_claripy_bool_asts(node.false_node, memo=memo),
-                                 )
-
-        elif isinstance(node, CascadingConditionNode):
-
-            cond_and_nodes = [ ]
+        if isinstance(node, CascadingConditionNode):
+            cond_and_nodes = []
             for cond, child_node in node.condition_and_nodes:
-                cond_and_nodes.append((
-                    self.convert_claripy_bool_ast(cond, memo=memo),
-                    self.remove_claripy_bool_asts(child_node, memo=memo))
+                cond_and_nodes.append(
+                    (
+                        self.convert_claripy_bool_ast(cond),
+                        self._remove_claripy_bool_asts(child_node),
+                    )
                 )
-            else_node = None if node.else_node is None else self.remove_claripy_bool_asts(node.else_node, memo=memo)
-            return CascadingConditionNode(node.addr,
-                                          cond_and_nodes,
-                                          else_node=else_node,
-                                          )
+            else_node = None if node.else_node is None else self._remove_claripy_bool_asts(node.else_node)
+            return CascadingConditionNode(
+                node.addr,
+                cond_and_nodes,
+                else_node=else_node,
+            )
 
-        elif isinstance(node, LoopNode):
-
+        if isinstance(node, LoopNode):
             result = node.copy()
-            result.condition = self.convert_claripy_bool_ast(node.condition, memo=memo) if node.condition is not None \
-                else None
-            result.sequence_node = self.remove_claripy_bool_asts(node.sequence_node, memo=memo)
+            result.condition = self.convert_claripy_bool_ast(node.condition) if node.condition is not None else None
+            result.sequence_node = self._remove_claripy_bool_asts(node.sequence_node)
             return result
 
-        elif isinstance(node, SwitchCaseNode):
-            return SwitchCaseNode(self.convert_claripy_bool_ast(node.switch_expr, memo=memo),
-                                  dict((idx, self.remove_claripy_bool_asts(case_node, memo=memo))
-                                       for idx, case_node in node.cases.items()),
-                                  self.remove_claripy_bool_asts(node.default_node, memo=memo),
-                                  addr=node.addr)
+        if isinstance(node, SwitchCaseNode):
+            return SwitchCaseNode(
+                self.convert_claripy_bool_ast(node.switch_expr),
+                OrderedDict((idx, self._remove_claripy_bool_asts(case_node)) for idx, case_node in node.cases.items()),
+                self._remove_claripy_bool_asts(node.default_node),
+                addr=node.addr,
+            )
 
-        else:
-            return node
+        if isinstance(node, IncompleteSwitchCaseNode):
+            return IncompleteSwitchCaseNode(
+                node.addr,
+                self._remove_claripy_bool_asts(node.head),
+                [self._remove_claripy_bool_asts(case) for case in node.cases],
+            )
+
+        return node
 
     @classmethod
     def get_last_statement(cls, block):
@@ -266,26 +582,25 @@ class ConditionProcessor:
         if type(block) is SequenceNode:
             if block.nodes:
                 return cls.get_last_statement(block.nodes[-1])
-            raise EmptyBlockNotice()
+            raise EmptyBlockNotice
         if type(block) is CodeNode:
             return cls.get_last_statement(block.node)
         if type(block) is ailment.Block:
             if not block.statements:
-                raise EmptyBlockNotice()
+                raise EmptyBlockNotice
             return block.statements[-1]
         if type(block) is Block:
-            raise NotImplementedError()
+            raise NotImplementedError
         if type(block) is BlockNode:
-            raise NotImplementedError()
+            raise NotImplementedError
         if type(block) is MultiNode:
             # get the last node
             for the_block in reversed(block.nodes):
                 try:
-                    last_stmt = cls.get_last_statement(the_block)
-                    return last_stmt
+                    return cls.get_last_statement(the_block)
                 except EmptyBlockNotice:
                     continue
-            raise EmptyBlockNotice()
+            raise EmptyBlockNotice
         if type(block) is LoopNode:
             return cls.get_last_statement(block.sequence_node)
         if type(block) is ConditionalBreakNode:
@@ -316,88 +631,105 @@ class ConditionProcessor:
             return None
         if type(block) is SwitchCaseNode:
             return None
-        if type(block) is GraphRegion:
+        if type(block) is IncompleteSwitchCaseNode:
+            return None
+        if isinstance(block, RegionOverlay):
             # normally this should not happen. however, we have test cases that trigger this case.
             return None
 
-        raise NotImplementedError()
+        raise NotImplementedError
 
     @classmethod
-    def get_last_statements(cls, block):
+    def get_last_statements(
+        cls, block
+    ) -> list[ailment.Stmt.Statement | ConditionalBreakNode | BreakNode | ContinueNode | None]:
         if type(block) is SequenceNode:
             for last_node in reversed(block.nodes):
                 try:
-                    last_stmts = cls.get_last_statements(last_node)
-                    return last_stmts
+                    return cls.get_last_statements(last_node)
                 except EmptyBlockNotice:
                     # the node is empty. try the next one
                     continue
 
-            raise EmptyBlockNotice()
+            raise EmptyBlockNotice
 
         if type(block) is CodeNode:
             return cls.get_last_statements(block.node)
         if type(block) is ailment.Block:
             if not block.statements:
-                raise EmptyBlockNotice()
-            return [ block.statements[-1] ]
+                raise EmptyBlockNotice
+            return [block.statements[-1]]
         if type(block) is Block:
-            raise NotImplementedError()
+            raise NotImplementedError
         if type(block) is BlockNode:
-            raise NotImplementedError()
+            raise NotImplementedError
         if type(block) is MultiNode:
             # get the last node
             for the_block in reversed(block.nodes):
                 try:
-                    last_stmts = cls.get_last_statements(the_block)
-                    return last_stmts
+                    return cls.get_last_statements(the_block)
                 except EmptyBlockNotice:
                     continue
-            raise EmptyBlockNotice()
+            raise EmptyBlockNotice
         if type(block) is LoopNode:
+            if block.sequence_node is None:
+                raise EmptyBlockNotice
             return cls.get_last_statements(block.sequence_node)
         if type(block) is ConditionalBreakNode:
-            return [ block ]
+            return [block]
         if type(block) is ConditionNode:
-            s = [ ]
+            s = []
             if block.true_node:
                 try:
                     last_stmts = cls.get_last_statements(block.true_node)
                     s.extend(last_stmts)
                 except EmptyBlockNotice:
                     pass
+            else:
+                s.append(None)
             if block.false_node:
                 last_stmts = cls.get_last_statements(block.false_node)
                 s.extend(last_stmts)
+            else:
+                s.append(None)
             return s
         if type(block) is CascadingConditionNode:
-            s = [ ]
+            s = []
             if block.else_node is not None:
                 try:
                     last_stmts = cls.get_last_statements(block.else_node)
                     s.extend(last_stmts)
                 except EmptyBlockNotice:
                     pass
+            else:
+                s.append(None)
             for _, node in block.condition_and_nodes:
                 last_stmts = cls.get_last_statements(node)
                 s.extend(last_stmts)
             return s
         if type(block) is BreakNode:
-            return [ block ]
+            return [block]
         if type(block) is ContinueNode:
-            return [ block ]
+            return [block]
         if type(block) is SwitchCaseNode:
-            s = [ ]
+            s = []
             for case in block.cases.values():
                 s.extend(cls.get_last_statements(case))
             if block.default_node is not None:
                 s.extend(cls.get_last_statements(block.default_node))
+            else:
+                s.append(None)
             return s
-        if type(block) is GraphRegion:
+        if type(block) is IncompleteSwitchCaseNode:
+            s = []
+            for case in block.cases:
+                s.extend(cls.get_last_statements(case))
+            return s
+        if isinstance(block, RegionOverlay):
             # normally this should not happen. however, we have test cases that trigger this case.
-            return [ ]
+            return []
 
-        raise NotImplementedError()
+        raise NotImplementedError
 
     #
     # Path predicate
@@ -405,18 +737,21 @@ class ConditionProcessor:
 
     EXC_COUNTER = 1000
 
-    def _extract_predicate(self, src_block, dst_block, edge_type):
-
-        if edge_type == 'exception':
+    def _extract_predicate(self, src_block, dst_block, edge_type) -> claripy.ast.Bool:
+        if edge_type == "exception":
             # TODO: THIS IS ABSOLUTELY A HACK. AT THIS MOMENT YOU SHOULD NOT ATTEMPT TO MAKE SENSE OF EXCEPTION EDGES.
             self.EXC_COUNTER += 1
             return self.claripy_ast_from_ail_condition(
                 ailment.Expr.BinaryOp(
-                    None,
-                    'CmpEQ',
-                    (ailment.Expr.Register(0x400000 + self.EXC_COUNTER, None, self.EXC_COUNTER, 64),
-                     ailment.Expr.Const(None, None, self.EXC_COUNTER, 64)),
-                    False)
+                    self.ail_manager.next_atom(),
+                    "CmpEQ",
+                    (
+                        ailment.Expr.Register(self.ail_manager.next_atom(), self.EXC_COUNTER, 64),
+                        ailment.Expr.Const(self.ail_manager.next_atom(), self.EXC_COUNTER, 64),
+                    ),
+                    False,
+                ),
+                ins_addr=dst_block.addr,
             )
 
         if type(src_block) is ConditionalBreakNode:
@@ -424,230 +759,416 @@ class ConditionProcessor:
             bool_var = src_block.condition
             if src_block.target == dst_block.addr:
                 return bool_var
-            else:
-                return claripy.Not(bool_var)
+            return claripy.Not(bool_var)
 
-        if type(src_block) is GraphRegion:
-            return claripy.true
+        if isinstance(src_block, RegionOverlay):
+            return claripy.true()
 
-        last_stmt = self.get_last_statement(src_block)
+        # sometimes the last statement is the conditional jump. sometimes it's the first statement of the block
+        if isinstance(src_block, ailment.Block) and src_block.statements and is_head_controlled_loop_block(src_block):
+            last_stmt = next(
+                iter(stmt for stmt in src_block.statements[:-1] if isinstance(stmt, ailment.Stmt.ConditionalJump)), None
+            )
+            assert last_stmt is not None
+        else:
+            last_stmt = self.get_last_statement(src_block)
 
         if last_stmt is None:
-            return claripy.true
-        if type(last_stmt) is ailment.Stmt.Jump:
+            return claripy.true()
+        if isinstance(last_stmt, ailment.Stmt.Jump):
             if isinstance(last_stmt.target, ailment.Expr.Const):
-                return claripy.true
+                return claripy.true()
             # indirect jump
-            target_ast = self.claripy_ast_from_ail_condition(last_stmt.target)
+            target_ast = self.claripy_ast_from_ail_condition(last_stmt.target, ins_addr=last_stmt.tags["ins_addr"])
             return target_ast == dst_block.addr
-        if type(last_stmt) is ailment.Stmt.ConditionalJump:
-            bool_var = self.claripy_ast_from_ail_condition(last_stmt.condition)
+        if isinstance(last_stmt, ailment.Stmt.ConditionalJump):
+            bool_var = self.claripy_ast_from_ail_condition(
+                last_stmt.condition, must_bool=True, ins_addr=last_stmt.tags["ins_addr"]
+            )
+            assert isinstance(bool_var, claripy.ast.Bool)
             if isinstance(last_stmt.true_target, ailment.Expr.Const) and last_stmt.true_target.value == dst_block.addr:
                 return bool_var
-            else:
-                return claripy.Not(bool_var)
+            return claripy.Not(bool_var)
 
-        return claripy.true
+        return claripy.true()
 
     #
     # Expression conversion
     #
 
-    def _convert_extract(self, hi, lo, expr, memo=None):
-        # ailment does not support Extract. We translate Extract to Convert and shift.
-        if lo == 0:
-            # TODO: Keep track of tags
-            return ailment.Expr.Convert(None, expr.size(), hi + 1, False,
-                                        self.convert_claripy_bool_ast(expr, memo=memo),
-                                        )
+    def _convert_extract(self, hi, lo, expr, tags):
+        # ailment does not support Extract. We translate Extract(hi, lo, expr) to a
+        # logical right shift by `lo` (dropping the low bits) followed by a Convert
+        # that truncates to the extracted width.
+        converted = self.convert_claripy_bool_ast(expr)
+        if lo != 0:
+            converted = ailment.Expr.BinaryOp(
+                self.ail_manager.next_atom(),
+                "Shr",
+                (
+                    converted,
+                    ailment.Expr.Const(self.ail_manager.next_atom(), lo, expr.size(), **tags),
+                ),
+                False,
+                **tags,
+            )
+        return ailment.Expr.Convert(
+            self.ail_manager.next_atom(),
+            expr.size(),
+            hi - lo + 1,
+            False,
+            converted,
+            **tags,
+        )
 
-        raise NotImplementedError("This case will be implemented once encountered.")
-
-    def convert_claripy_bool_ast(self, cond, memo=None):
+    def convert_claripy_bool_ast(self, cond):
         """
-        Convert recovered reaching conditions from claripy ASTs to ailment Expressions
+        Convert recovered reaching conditions from claripy ASTs to ailment Expressions.
 
-        :return: None
+        Within one outermost conversion (or one remove_claripy_bool_asts() traversal) subtrees are memoized by claripy
+        hash, so a shared subtree is converted once. The memo does not outlive the call: a leaf converts to whatever
+        AIL expression _condition_mapping currently holds, and later translations may replace that entry with an
+        equivalent expression of a different idx, which codegen types differently.
+
+        Peephole rules are applied bottom-up as nodes are built: children are already optimized when their parent is
+        converted, so only the new node needs checking, and the subtree is re-walked only when a rule rewrites it.
         """
 
-        if memo is None:
-            memo = {}
-        if cond._hash in memo:
-            return memo[cond._hash]
-        r = self.convert_claripy_bool_ast_core(cond, memo)
-        memo[cond._hash] = r
+        if not isinstance(cond, claripy.ast.Base):
+            return cond
+        if self._conversion_memo is not None:
+            return self._convert_claripy_bool_ast(cond)
+        self._conversion_memo = {}
+        try:
+            return self._convert_claripy_bool_ast(cond)
+        finally:
+            self._conversion_memo = None
+
+    def _convert_claripy_bool_ast(self, cond):
+        assert self._conversion_memo is not None
+        key = cond.hash()
+        r = self._conversion_memo.get(key)
+        if r is None:
+            r = self.convert_claripy_bool_ast_core(cond)
+            optimized = peephole_optimize_expr_shallow(r, self._peephole_expr_optimizations)
+            if optimized is not r:
+                r = peephole_optimize_expr(optimized, self._peephole_expr_optimizations)
+            self._conversion_memo[key] = r
         return r
 
-    def convert_claripy_bool_ast_core(self, cond, memo):
+    def convert_claripy_bool_ast_core(self, cond):
         if isinstance(cond, ailment.Expr.Expression):
             return cond
 
-        if cond.op in {"BoolS", "BoolV"} and claripy.is_true(cond):
-            return ailment.Expr.Const(None, None, True, 1)
+        if cond.op in {"BoolS", "BoolV"} and claripy.is_true(claripy.simplify(cond)):
+            return ailment.Expr.Const(self.ail_manager.next_atom(), True, 1)
         if cond in self._condition_mapping:
             return self._condition_mapping[cond]
         if cond.op in {"BVS", "BoolS"} and cond.args[0] in self._condition_mapping:
             return self._condition_mapping[cond.args[0]]
 
-        def _binary_op_reduce(op, args, signed=False):
+        def _binary_op_reduce(op, args, tags, signed=False):
             r = None
             for arg in args:
                 if r is None:
-                    r = self.convert_claripy_bool_ast(arg, memo=memo)
+                    r = self.convert_claripy_bool_ast(arg)
                 else:
-                    # TODO: Keep track of tags
-                    r = ailment.Expr.BinaryOp(None, op, (r, self.convert_claripy_bool_ast(arg, memo=memo)), signed)
+                    r = ailment.Expr.BinaryOp(
+                        self.ail_manager.next_atom(),
+                        op,
+                        (r, self.convert_claripy_bool_ast(arg)),
+                        signed,
+                        **tags,
+                    )
             return r
 
-        def _unary_op_reduce(op, arg):
-            r = self.convert_claripy_bool_ast(arg, memo=memo)
+        def _unary_op_reduce(op, arg, tags):
+            r = self.convert_claripy_bool_ast(arg)
             # TODO: Keep track of tags
-            return ailment.Expr.UnaryOp(None, op, r)
+            return ailment.Expr.UnaryOp(self.ail_manager.next_atom(), op, r, **tags)
+
+        def _cmp_reduce(op, cond_, tags):
+            # A bit test like `(base & 0b100) != 0` is canonicalized by clarirs into
+            # `Extract(hi, lo, base) != 0`. Lowering that extract literally yields `(base >> lo) & mask`;
+            # re-express the comparison against zero as the in-place mask `base & (mask << lo)` instead so
+            # it reads like the original `base & C`. This is only valid because comparing to zero makes it
+            # a boolean test (the shifted-down and in-place forms differ in value but not in truthiness).
+            # `lo == 0` extracts already lower to a clean `base & mask` and are left alone.
+            for ext, other in (cond_.args, cond_.args[::-1]):
+                if (
+                    ext.op == "Extract" and other.op == "BVV" and other.args[0] == 0 and ext.args[1] != 0  # lo
+                ):
+                    hi, lo, base = ext.args
+                    mask = ((1 << (hi - lo + 1)) - 1) << lo
+                    base_ail = self.convert_claripy_bool_ast(base)
+                    masked = ailment.Expr.BinaryOp(
+                        self.ail_manager.next_atom(),
+                        "And",
+                        (base_ail, ailment.Expr.Const(self.ail_manager.next_atom(), mask, base.size(), **tags)),
+                        False,
+                        **tags,
+                    )
+                    return ailment.Expr.BinaryOp(
+                        self.ail_manager.next_atom(),
+                        op,
+                        (masked, ailment.Expr.Const(self.ail_manager.next_atom(), 0, base.size(), **tags)),
+                        False,
+                        **tags,
+                    )
+            return _binary_op_reduce(op, cond_.args, tags)
 
         _mapping = {
-            'Not': lambda cond_: _unary_op_reduce('Not', cond_.args[0]),
-            'And': lambda cond_: _binary_op_reduce('LogicalAnd', cond_.args),
-            'Or': lambda cond_: _binary_op_reduce('LogicalOr', cond_.args),
-            '__le__': lambda cond_: _binary_op_reduce('CmpLE', cond_.args, signed=True),
-            'SLE': lambda cond_: _binary_op_reduce('CmpLE', cond_.args, signed=True),
-            '__lt__': lambda cond_: _binary_op_reduce('CmpLT', cond_.args, signed=True),
-            'SLT': lambda cond_: _binary_op_reduce('CmpLT', cond_.args, signed=True),
-            'UGT': lambda cond_: _binary_op_reduce('CmpGT', cond_.args),
-            'UGE': lambda cond_: _binary_op_reduce('CmpGE', cond_.args),
-            '__gt__': lambda cond_: _binary_op_reduce('CmpGT', cond_.args, signed=True),
-            '__ge__': lambda cond_: _binary_op_reduce('CmpGE', cond_.args, signed=True),
-            'SGT': lambda cond_: _binary_op_reduce('CmpGT', cond_.args, signed=True),
-            'SGE': lambda cond_: _binary_op_reduce('CmpGE', cond_.args, signed=True),
-            'ULT': lambda cond_: _binary_op_reduce('CmpLT', cond_.args),
-            'ULE': lambda cond_: _binary_op_reduce('CmpLE', cond_.args),
-            '__eq__': lambda cond_: _binary_op_reduce('CmpEQ', cond_.args),
-            '__ne__': lambda cond_: _binary_op_reduce('CmpNE', cond_.args),
-            '__add__': lambda cond_: _binary_op_reduce('Add', cond_.args, signed=False),
-            '__sub__': lambda cond_: _binary_op_reduce('Sub', cond_.args),
-            '__mul__': lambda cond_: _binary_op_reduce('Mul', cond_.args),
-            '__xor__': lambda cond_: _binary_op_reduce('Xor', cond_.args),
-            '__or__': lambda cond_: _binary_op_reduce('Or', cond_.args, signed=False),
-            '__and__': lambda cond_: _binary_op_reduce('And', cond_.args),
-            '__lshift__': lambda cond_: _binary_op_reduce('Shl', cond_.args),
-            '__rshift__': lambda cond_: _binary_op_reduce('Sar', cond_.args),
-            '__floordiv__': lambda cond_: _binary_op_reduce('Div', cond_.args),
-            'LShR': lambda cond_: _binary_op_reduce('Shr', cond_.args),
-            'BVV': lambda cond_: ailment.Expr.Const(None, None, cond_.args[0], cond_.size()),
-            'BoolV': lambda cond_: ailment.Expr.Const(None, None, True, 1) if cond_.args[0] is True
-                                                                        else ailment.Expr.Const(None, None, False, 1),
-            'Extract': lambda cond_: self._convert_extract(*cond_.args, memo=memo),
+            "Not": lambda cond_, tags: _unary_op_reduce("Not", cond_.args[0], tags),
+            "__neg__": lambda cond_, tags: _unary_op_reduce("Neg", cond_.args[0], tags),
+            "__invert__": lambda cond_, tags: _unary_op_reduce("BitwiseNeg", cond_.args[0], tags),
+            "And": lambda cond_, tags: _binary_op_reduce("LogicalAnd", cond_.args, tags),
+            "Or": lambda cond_, tags: _binary_op_reduce("LogicalOr", cond_.args, tags),
+            "__le__": lambda cond_, tags: _binary_op_reduce("CmpLE", cond_.args, tags, signed=True),
+            "SLE": lambda cond_, tags: _binary_op_reduce("CmpLE", cond_.args, tags, signed=True),
+            "__lt__": lambda cond_, tags: _binary_op_reduce("CmpLT", cond_.args, tags, signed=True),
+            "SLT": lambda cond_, tags: _binary_op_reduce("CmpLT", cond_.args, tags, signed=True),
+            "UGT": lambda cond_, tags: _binary_op_reduce("CmpGT", cond_.args, tags),
+            "UGE": lambda cond_, tags: _binary_op_reduce("CmpGE", cond_.args, tags),
+            "__gt__": lambda cond_, tags: _binary_op_reduce("CmpGT", cond_.args, tags, signed=True),
+            "__ge__": lambda cond_, tags: _binary_op_reduce("CmpGE", cond_.args, tags, signed=True),
+            "SGT": lambda cond_, tags: _binary_op_reduce("CmpGT", cond_.args, tags, signed=True),
+            "SGE": lambda cond_, tags: _binary_op_reduce("CmpGE", cond_.args, tags, signed=True),
+            "ULT": lambda cond_, tags: _binary_op_reduce("CmpLT", cond_.args, tags),
+            "ULE": lambda cond_, tags: _binary_op_reduce("CmpLE", cond_.args, tags),
+            "__eq__": lambda cond_, tags: _cmp_reduce("CmpEQ", cond_, tags),
+            "__ne__": lambda cond_, tags: _cmp_reduce("CmpNE", cond_, tags),
+            "__add__": lambda cond_, tags: _binary_op_reduce("Add", cond_.args, tags, signed=False),
+            "__sub__": lambda cond_, tags: _binary_op_reduce("Sub", cond_.args, tags),
+            "__mul__": lambda cond_, tags: _binary_op_reduce("Mul", cond_.args, tags),
+            "__xor__": lambda cond_, tags: _binary_op_reduce("Xor", cond_.args, tags),
+            "__or__": lambda cond_, tags: _binary_op_reduce("Or", cond_.args, tags, signed=False),
+            "__and__": lambda cond_, tags: _binary_op_reduce("And", cond_.args, tags),
+            "__lshift__": lambda cond_, tags: _binary_op_reduce("Shl", cond_.args, tags),
+            "__rshift__": lambda cond_, tags: _binary_op_reduce("Sar", cond_.args, tags),
+            "__floordiv__": lambda cond_, tags: _binary_op_reduce("Div", cond_.args, tags),
+            "__mod__": lambda cond_, tags: _binary_op_reduce("Mod", cond_.args, tags),
+            "LShR": lambda cond_, tags: _binary_op_reduce("Shr", cond_.args, tags),
+            "BVV": lambda cond_, tags: ailment.Expr.Const(
+                self.ail_manager.next_atom(), cond_.args[0], cond_.size(), **tags
+            ),
+            "BoolV": lambda cond_, tags: (
+                ailment.Expr.Const(self.ail_manager.next_atom(), True, 1, **tags)
+                if cond_.args[0] is True
+                else ailment.Expr.Const(self.ail_manager.next_atom(), False, 1, **tags)
+            ),
+            "Extract": lambda cond_, tags: self._convert_extract(*cond_.args, tags),
+            "ZeroExt": lambda cond_, tags: _binary_op_reduce(
+                "Concat", [claripy.BVV(0, cond_.args[0]), cond_.args[1]], tags
+            ),
+            "Concat": lambda cond_, tags: _binary_op_reduce("Concat", cond_.args, tags),
         }
 
         if cond.op in _mapping:
-            return _mapping[cond.op](cond)
-        raise NotImplementedError(("Condition variable %s has an unsupported operator %s. "
-                                   "Consider implementing.") % (cond, cond.op))
+            if cond in self._ast2annotations:
+                cond_tags = self._ast2annotations[cond]
+            elif claripy.Not(cond) in self._ast2annotations:
+                cond_tags = self._ast2annotations[claripy.Not(cond)]
+            else:
+                cond_tags = {}
+            if cond_tags.get("floating_point") is not True and cond.op in _CLARIPY_CMP_OPS:
+                # a comparison claripy derived by negating an FP comparison is an FP comparison too
+                negated_tags = self._ast2annotations.get(claripy.Not(cond))
+                if negated_tags is not None and negated_tags.get("floating_point") is True:
+                    cond_tags = {**cond_tags, "floating_point": True}
+            if cond_tags.get("floating_point") is True:
+                # claripy has no FP flavor of these operators; restore the flag on the rebuilt expression
+                cond_tags = {k: v for k, v in cond_tags.items() if k != "floating_point"}
+                r = _mapping[cond.op](cond, cond_tags)
+                if isinstance(r, ailment.Expr.BinaryOp) and r.op in _FP_FLAGGED_OPS and not r.floating_point:
+                    r = ailment.Expr.BinaryOp(
+                        r.idx, r.op, r.operands, r.signed, bits=r.bits, floating_point=True, **r.tags
+                    )
+                return r
+            return _mapping[cond.op](cond, cond_tags)
+        raise NotImplementedError(
+            f"Condition variable {cond} has an unsupported operator {cond.op}. Consider implementing."
+        )
 
-    def claripy_ast_from_ail_condition(self, condition) -> claripy.ast.Base:
-
+    def claripy_ast_from_ail_condition(
+        self, condition, *, nobool: bool = False, must_bool: bool = False, ins_addr: int = 0
+    ) -> claripy.ast.Bool | claripy.ast.Bits:
         # Unpack a condition all the way to the leaves
-        if isinstance(condition, claripy.ast.Base):  # pylint:disable=isinstance-second-argument-not-valid-type
+        if isinstance(condition, (claripy.ast.Bits, claripy.ast.Bool)):  # pylint:disable=isinstance-second-argument-not-valid-type
             return condition
 
-        def _op_with_unified_size(op, conv, operand0, operand1):
-            # ensure operand1 is of the same size as operand0
-            if isinstance(operand1, ailment.Expr.Const):
-                # amazing - we do the eazy thing here
-                return op(conv(operand0), operand1.value)
-            if operand1.bits == operand0.bits:
-                return op(conv(operand0), conv(operand1))
-            # extension is required
-            assert operand1.bits < operand0.bits
-            operand1 = ailment.Expr.Convert(None, operand1.bits, operand0.bits, False, operand1)
-            return op(conv(operand0), conv(operand1))
-
-        def _dummy_bvs(condition):
-            var = claripy.BVS('ailexpr_%s' % repr(condition), condition.bits, explicit_name=True)
-            self._condition_mapping[var.args[0]] = condition
-            return var
-
-        _mapping = {
-            'LogicalAnd': lambda expr, conv: claripy.And(conv(expr.operands[0]), conv(expr.operands[1])),
-            'LogicalOr': lambda expr, conv: claripy.Or(conv(expr.operands[0]), conv(expr.operands[1])),
-            'CmpEQ': lambda expr, conv: conv(expr.operands[0]) == conv(expr.operands[1]),
-            'CmpNE': lambda expr, conv: conv(expr.operands[0]) != conv(expr.operands[1]),
-            'CmpLE': lambda expr, conv: conv(expr.operands[0]) <= conv(expr.operands[1]),
-            'CmpLEs': lambda expr, conv: claripy.SLE(conv(expr.operands[0]), conv(expr.operands[1])),
-            'CmpLT': lambda expr, conv: conv(expr.operands[0]) < conv(expr.operands[1]),
-            'CmpLTs': lambda expr, conv: claripy.SLT(conv(expr.operands[0]), conv(expr.operands[1])),
-            'CmpGE': lambda expr, conv: conv(expr.operands[0]) >= conv(expr.operands[1]),
-            'CmpGEs': lambda expr, conv: claripy.SGE(conv(expr.operands[0]), conv(expr.operands[1])),
-            'CmpGT': lambda expr, conv: conv(expr.operands[0]) > conv(expr.operands[1]),
-            'CmpGTs': lambda expr, conv: claripy.SGT(conv(expr.operands[0]), conv(expr.operands[1])),
-            'Add': lambda expr, conv: conv(expr.operands[0]) + conv(expr.operands[1]),
-            'Sub': lambda expr, conv: conv(expr.operands[0]) - conv(expr.operands[1]),
-            'Mul': lambda expr, conv: conv(expr.operands[0]) * conv(expr.operands[1]),
-            'Div': lambda expr, conv: conv(expr.operands[0]) / conv(expr.operands[1]),
-            'Not': lambda expr, conv: claripy.Not(conv(expr.operand)),
-            'Xor': lambda expr, conv: conv(expr.operands[0]) ^ conv(expr.operands[1]),
-            'And': lambda expr, conv: conv(expr.operands[0]) & conv(expr.operands[1]),
-            'Or': lambda expr, conv: conv(expr.operands[0]) | conv(expr.operands[1]),
-            'Shr': lambda expr, conv: _op_with_unified_size(claripy.LShR, conv, expr.operands[0], expr.operands[1]),
-            'Shl': lambda expr, conv: _op_with_unified_size(operator.lshift, conv, expr.operands[0], expr.operands[1]),
-            'Sar': lambda expr, conv: _op_with_unified_size(operator.rshift, conv, expr.operands[0], expr.operands[1]),
-
-            # There are no corresponding claripy operations for the following operations
-            'DivMod': lambda expr, _: _dummy_bvs(expr),
-            'CmpF': lambda expr, _: _dummy_bvs(expr),
-            'Mull': lambda expr, _: _dummy_bvs(expr),
-            'Mulls': lambda expr, _: _dummy_bvs(expr),
-        }
-
-        if isinstance(condition, (ailment.Expr.DirtyExpression, ailment.Expr.BasePointerOffset,
-                                  ailment.Expr.ITE, ailment.Stmt.Call)):
-            return _dummy_bvs(condition)
-        elif isinstance(condition, (ailment.Expr.Load, ailment.Expr.Register)):
+        if isinstance(
+            condition,
+            (ailment.Expr.VEXCCallExpression, ailment.Expr.BasePointerOffset, ailment.Expr.ITE, StringLiteral),
+        ):
+            return _dummy_bvs(condition, self._condition_mapping, must_bool=must_bool)
+        if isinstance(condition, (ailment.Expr.Call, ailment.Expr.FunctionLikeMacro)):
+            return _dummy_bvs(
+                condition,
+                self._condition_mapping,
+                name_suffix=hex(condition.tags.get("ins_addr", 0)),
+                must_bool=must_bool,
+            )
+        if isinstance(condition, (ailment.Expr.Load, ailment.Expr.Register, ailment.Expr.VirtualVariable)):
+            if isinstance(condition, ailment.Expr.VirtualVariable):
+                # SSA: the same vvar holds the same value at every instruction
+                ins_addr = 0
             # does it have a variable associated?
-            if condition.variable is not None:
-                var = claripy.BVS('ailexpr_%s-%s' % (repr(condition), condition.variable.name), condition.bits,
-                                  explicit_name=True)
+            condition_var = variable_map_of(self.ail_manager).variable(condition)
+            if condition_var is not None:
+                if condition.bits == 1:
+                    var = claripy.BoolS(
+                        f"ailexpr_{condition!r}-{condition_var.ident}-{ins_addr:x}",
+                        explicit_name=True,
+                    )
+                else:
+                    var = claripy.BVS(
+                        f"ailexpr_{condition!r}-{condition_var.ident}-{ins_addr:x}",
+                        condition.bits,
+                        explicit_name=True,
+                    )
             else:
-                var = claripy.BVS('ailexpr_%s-%d' % (repr(condition), condition.idx), condition.bits,
-                                  explicit_name=True)
+                if condition.bits == 1:
+                    var = claripy.BoolS(f"ailexpr_{condition!r}-{condition.idx}-{ins_addr:x}", explicit_name=True)
+                else:
+                    var = claripy.BVS(
+                        f"ailexpr_{condition!r}-{condition.idx}-{ins_addr:x}", condition.bits, explicit_name=True
+                    )
             self._condition_mapping[var.args[0]] = condition
             return var
-        elif isinstance(condition, ailment.Expr.Convert):
-            # convert is special. if it generates a 1-bit variable, it should be treated as a BVS
-            if condition.to_bits == 1:
-                var_ = self.claripy_ast_from_ail_condition(condition.operands[0])
-                name = 'ailcond_Conv(%d->%d, %d)' % (condition.from_bits, condition.to_bits, hash(var_))
+        if isinstance(condition, ailment.expression.Extract):
+            var_ = self.claripy_ast_from_ail_condition(condition.base, ins_addr=ins_addr)
+            offset_expr = (
+                self.claripy_ast_from_ail_condition(condition.offset, ins_addr=ins_addr).args[0]
+                if not isinstance(condition.offset, ailment.expression.Const)
+                else condition.offset.value
+            )
+            var = claripy.BVS(
+                f"ailexpr_Extract({condition.bits}, {condition.endness}, {offset_expr}, {var_.hash()})",
+                condition.bits,
+                explicit_name=True,
+            )
+            self._condition_mapping[var.args[0]] = condition
+            return var
+        if isinstance(condition, ailment.expression.Insert):
+            var_ = self.claripy_ast_from_ail_condition(condition.base, ins_addr=ins_addr)
+            value = self.claripy_ast_from_ail_condition(condition.value, ins_addr=ins_addr)
+            offset_expr = (
+                self.claripy_ast_from_ail_condition(condition.offset, ins_addr=ins_addr).args[0]
+                if not isinstance(condition.offset, ailment.expression.Const)
+                else condition.offset.value
+            )
+            var = claripy.BVS(
+                f"ailexpr_Insert({offset_expr}, {value.hash()}, {var_.hash()})", condition.bits, explicit_name=True
+            )
+            self._condition_mapping[var.args[0]] = condition
+            return var
+        if isinstance(condition, ailment.Expr.Convert):
+            # convert is special. if it generates a 1-bit variable, it should be treated as a BoolS
+            if condition.to_bits == 1 and not nobool:
+                var_ = self.claripy_ast_from_ail_condition(condition.operands[0], ins_addr=ins_addr)
+                name = f"ailcond_Conv({condition.from_bits}->{condition.to_bits}, {var_.hash()})"
                 var = claripy.BoolS(name, explicit_name=True)
             else:
-                var_ = self.claripy_ast_from_ail_condition(condition.operands[0])
-                name = 'ailexpr_Conv(%d->%d, %d)' % (condition.from_bits, condition.to_bits, hash(var_))
+                var_ = self.claripy_ast_from_ail_condition(condition.operands[0], ins_addr=ins_addr)
+                name = f"ailexpr_Conv({condition.from_bits}->{condition.to_bits}, {var_.hash()})"
                 var = claripy.BVS(name, condition.to_bits, explicit_name=True)
             self._condition_mapping[var.args[0]] = condition
             return var
-        elif isinstance(condition, ailment.Expr.Const):
-            var = claripy.BVV(condition.value, condition.bits)
+        if isinstance(condition, ailment.Expr.Const):
+            val = condition.value
+            if isinstance(val, float):
+                # represent FP constants by their bit pattern
+                if condition.bits == 64:
+                    val = struct.unpack("<Q", struct.pack("<d", val))[0]
+                elif condition.bits == 32:
+                    val = struct.unpack("<I", struct.pack("<f", val))[0]
+                else:
+                    raise TypeError("BVV value must be a int, bytes, or str")
+            var = claripy.BVV(val, condition.bits)
+            if condition.idx is not None:
+                # we do not want to lose track of this constant when it has idx
+                var = var.annotate(AILExprIdAnnotation())
+                self._condition_mapping[var] = condition
+            if isinstance(var, claripy.ast.Bits) and var.size() == 1:
+                var = claripy.true() if var.concrete_value == 1 else claripy.false()
             return var
-        elif isinstance(condition, ailment.Expr.Tmp):
+        if isinstance(condition, ailment.Expr.Tmp):
             l.warning("Left-over ailment.Tmp variable %s.", condition)
             if condition.bits == 1:
-                var = claripy.BoolV('ailtmp_%d' % condition.tmp_idx)
+                var = claripy.BoolS(f"ailtmp_{condition.tmp_idx}", explicit_name=True)
             else:
-                var = claripy.BVS('ailtmp_%d' % condition.tmp_idx, condition.bits, explicit_name=True)
+                var = claripy.BVS(f"ailtmp_{condition.tmp_idx}", condition.bits, explicit_name=True)
+            self._condition_mapping[var.args[0]] = condition
+            return var
+        if isinstance(condition, ailment.Expr.MultiStatementExpression):
+            # just cache it
+            if condition.bits == 1:
+                var = claripy.BoolS(f"mstmtexpr_{hash(condition)}", explicit_name=True)
+            else:
+                var = claripy.BVS(f"mstmtexpr_{hash(condition)}", condition.bits, explicit_name=True)
             self._condition_mapping[var.args[0]] = condition
             return var
 
-        lambda_expr = _mapping.get(condition.verbose_op, None)
+        if not isinstance(
+            condition,
+            (ailment.Expr.Op, ailment.Expr.Call, ailment.Expr.DirtyExpression, ailment.Expr.VEXCCallExpression),
+        ):
+            # an atom without an operator (a struct or string literal, a call): keep it opaque
+            if condition.bits == 1:
+                var = claripy.BoolS(f"ailexpr_opaque_{hash(condition)}", explicit_name=True)
+            else:
+                var = claripy.BVS(f"ailexpr_opaque_{hash(condition)}", condition.bits, explicit_name=True)
+            self._condition_mapping[var.args[0]] = condition
+            return var
+        lambda_expr = _ail2claripy_op_mapping.get(condition.verbose_op)
         if lambda_expr is None:
             # fall back to op
-            lambda_expr = _mapping.get(condition.op, None)
+            lambda_expr = _ail2claripy_op_mapping.get(condition.op)
         if lambda_expr is None:
-            raise NotImplementedError("Unsupported AIL expression operation %s or %s. Consider implementing."
-                                      % (condition.op, condition.verbose_op))
-        r = lambda_expr(condition, self.claripy_ast_from_ail_condition)
-        if r is NotImplemented:
-            r = claripy.BVS("ailexpr_%r" % condition, condition.bits, explicit_name=True)
+            # fall back to the catch-all option
+            l.debug(
+                "Unsupported AIL expression operation %s (or verbose: %s). Fall back to the default catch-all dummy "
+                "option. Consider implementing.",
+                condition.op,
+                condition.verbose_op,
+            )
+            lambda_expr = _ail2claripy_op_mapping["_DUMMY_"]
+        try:
+            r = lambda_expr(
+                condition, self.claripy_ast_from_ail_condition, self._condition_mapping, ins_addr, self.ail_manager
+            )
+        except ZeroDivisionError:
+            # a constant division by zero: keep the expression opaque
+            r = NotImplemented
+
+        if isinstance(r, claripy.ast.Bool) and nobool:
+            r = claripy.BVS(f"ailexpr_from_bool_{r!r}", 1, explicit_name=True)
             self._condition_mapping[r.args[0]] = condition
-        # don't lose tags
-        self._ast2annotations[r] = condition.tags
+
+        if r is NotImplemented:
+            if condition.bits == 1 and not nobool:
+                r = claripy.BoolS(f"ailexpr_{condition!r}", explicit_name=True)
+            else:
+                r = claripy.BVS(f"ailexpr_{condition!r}", condition.bits, explicit_name=True)
+            self._condition_mapping[r.args[0]] = condition
+        # don't lose tags, nor the floating-point flag of an FP comparison (claripy folds !(a == b) into a != b,
+        # so the negation of an FP comparison annotates that comparison)
+        tags = condition.tags
+        fp_source = condition
+        if isinstance(condition, ailment.Expr.UnaryOp) and condition.op == "Not":
+            fp_source = condition.operand
+        if isinstance(fp_source, (ailment.Expr.BinaryOp, ailment.Expr.UnaryOp)) and fp_source.floating_point:
+            tags = {**tags, "floating_point": True}
+        self._ast2annotations[r] = tags
+
+        if isinstance(r, claripy.ast.BV) and r.size() == 1 and must_bool:
+            # convert to a BoolS
+            if r.op == "BVV":
+                r = claripy.false() if r.args[0] == 0 else claripy.true()
+            else:
+                # r.op == "BVS"
+                r = claripy.BoolS(f"bool_from_bv1_{r.args[0]}", explicit_name=True)
+                self._condition_mapping[r.args[0]] = condition
         return r
 
     #
@@ -655,135 +1176,13 @@ class ConditionProcessor:
     #
 
     @staticmethod
-    def claripy_ast_to_sympy_expr(ast, memo=None):
-        if ast.op == "And":
-            return sympy.And(*(ConditionProcessor.claripy_ast_to_sympy_expr(arg, memo=memo) for arg in ast.args))
-        if ast.op == "Or":
-            return sympy.Or(*(ConditionProcessor.claripy_ast_to_sympy_expr(arg, memo=memo) for arg in ast.args))
-        if ast.op == "Not":
-            return sympy.Not(ConditionProcessor.claripy_ast_to_sympy_expr(ast.args[0], memo=memo))
-
-        if ast.op in _UNIFIABLE_COMPARISONS:
-            # unify comparisons to enable more simplification opportunities without going "deep" in sympy
-            inverse_op = getattr(ast.args[0], claripy.operations.inverse_operations[ast.op])
-            return sympy.Not(ConditionProcessor.claripy_ast_to_sympy_expr(inverse_op(ast.args[1]), memo=memo))
-
-        if memo is not None and ast in memo:
-            return memo[ast]
-        symbol = sympy.Symbol(str(hash(ast)))
-        if memo is not None:
-            memo[symbol] = ast
-        return symbol
-
-    @staticmethod
-    def sympy_expr_to_claripy_ast(expr, memo: Dict):
-        if expr.is_Symbol:
-            return memo[expr]
-        if isinstance(expr, sympy.Or):
-            return claripy.Or(*(ConditionProcessor.sympy_expr_to_claripy_ast(arg, memo) for arg in expr.args))
-        if isinstance(expr, sympy.And):
-            return claripy.And(*(ConditionProcessor.sympy_expr_to_claripy_ast(arg, memo) for arg in expr.args))
-        if isinstance(expr, sympy.Not):
-            return claripy.Not(ConditionProcessor.sympy_expr_to_claripy_ast(expr.args[0], memo))
-        if isinstance(expr, sympy.logic.boolalg.BooleanTrue):
-            return claripy.true
-        if isinstance(expr, sympy.logic.boolalg.BooleanFalse):
-            return claripy.false
-        raise RuntimeError("Unreachable reached")
-
-    @staticmethod
     def simplify_condition(cond, depth_limit=8, variables_limit=8):
-        memo = { }
         if cond.depth > depth_limit or len(cond.variables) > variables_limit:
             return cond
-        sympy_expr = ConditionProcessor.claripy_ast_to_sympy_expr(cond, memo=memo)
-        r = ConditionProcessor.sympy_expr_to_claripy_ast(sympy.simplify_logic(sympy_expr, deep=False), memo)
-        return r
-
-    @staticmethod
-    def simplify_condition_deprecated(cond):
-
-        # Z3's simplification may yield weird and unreadable results
-        # hence we mostly rely on our own simplification. we only use Z3's simplification results when it returns a
-        # concrete value.
-        claripy_simplified = claripy.simplify(cond)
-        if not claripy_simplified.symbolic:
-            return claripy_simplified
-
-        simplified = ConditionProcessor._fold_double_negations(cond)
-        cond = simplified if simplified is not None else cond
-        simplified = ConditionProcessor._revert_short_circuit_conditions(cond)
-        cond = simplified if simplified is not None else cond
-        simplified = ConditionProcessor._extract_common_subexpressions(cond)
-        cond = simplified if simplified is not None else cond
-        # simplified = ConditionProcessor._remove_redundant_terms(cond)
-        # cond = simplified if simplified is not None else cond
-        # in the end, use claripy's simplification to handle really easy cases again
-        simplified = ConditionProcessor._simplify_trivial_cases(cond)
-        cond = simplified if simplified is not None else cond
-        return cond
-
-    @staticmethod
-    def _simplify_trivial_cases(cond):
-
-        if cond.op == "And":
-            new_args = [ ]
-            for arg in cond.args:
-                claripy_simplified = claripy.simplify(arg)
-                if claripy.is_true(claripy_simplified):
-                    continue
-                new_args.append(arg)
-            return claripy.And(*new_args)
-
-        return None
-
-    @staticmethod
-    def _revert_short_circuit_conditions(cond):
-
-        # revert short-circuit conditions
-        # !A||(A&&!B) ==> !(A&&B)
-
-        if cond.op != "Or":
-            return cond
-
-        if len(cond.args) == 1:
-            # redundant operator. get rid of it
-            return cond.args[0]
-
-        or_arg0, or_arg1 = cond.args[:2]
-        if or_arg1.op == 'And':
-            pass
-        elif or_arg0.op == 'And':
-            or_arg0, or_arg1 = or_arg1, or_arg0
-        else:
-            return cond
-
-        not_a = or_arg0
-        solver = claripy.SolverCacheless()
-
-        if not_a.variables == or_arg1.args[0].variables:
-            solver.add(not_a == or_arg1.args[0])
-            not_b = or_arg1.args[1]
-        elif not_a.variables == or_arg1.args[1].variables:
-            solver.add(not_a == or_arg1.args[1])
-            not_b = or_arg1.args[0]
-        else:
-            return cond
-
-        if not solver.satisfiable():
-            # found it!
-            b = claripy.Not(not_b)
-            a = claripy.Not(not_a)
-            if len(cond.args) <= 2:
-                return claripy.Not(claripy.And(a, b))
-            else:
-                return claripy.Or(claripy.Not(claripy.And(a, b)), *cond.args[2:])
-        else:
-            return cond
+        return claripy.minimize_boolean(cond)
 
     @staticmethod
     def _fold_double_negations(cond):
-
         # !(!A) ==> A
         # !((!A) && (!B)) ==> A || B
         # !((!A) && B) ==> A || !B
@@ -797,46 +1196,34 @@ class ConditionProcessor:
         if cond.args[0].op == "And" and len(cond.args[0].args) == 2:
             and_0, and_1 = cond.args[0].args
             if and_0.op == "Not" and and_1.op == "Not":
-                expr = claripy.Or(and_0.args[0], and_1.args[0])
-                return expr
+                return claripy.Or(and_0.args[0], and_1.args[0])
 
             if and_0.op == "Not":  # and_1.op != "Not"
-                expr = claripy.Or(
-                    and_0.args[0],
-                    ConditionProcessor.simplify_condition(
-                        claripy.Not(and_1)
-                    )
-                )
-                return expr
+                return claripy.Or(and_0.args[0], ConditionProcessor.simplify_condition(claripy.Not(and_1)))
 
         if cond.args[0].op == "Or" and len(cond.args[0].args) == 2:
             or_0, or_1 = cond.args[0].args
-            expr = claripy.And(
+            return claripy.And(
                 ConditionProcessor.simplify_condition(claripy.Not(or_0)),
                 ConditionProcessor.simplify_condition(claripy.Not(or_1)),
             )
-            return expr
 
         return None
 
     @staticmethod
     def _extract_common_subexpressions(cond):
-
         def _expr_inside_collection(expr_, coll_) -> bool:
-            for ex_ in coll_:
-                if expr_ is ex_:
-                    return True
-            return False
+            return any(expr_ is ex_ for ex_ in coll_)
 
         # (A && B) || (A && C) => A && (B || C)
         if cond.op == "And":
-            args = [ ConditionProcessor._extract_common_subexpressions(arg) for arg in cond.args ]
+            args = [ConditionProcessor._extract_common_subexpressions(arg) for arg in cond.args]
             if all(arg is None for arg in args):
                 return None
             return claripy.And(*((arg if arg is not None else ori_arg) for arg, ori_arg in zip(args, cond.args)))
 
         if cond.op == "Or":
-            args = [ ConditionProcessor._extract_common_subexpressions(arg) for arg in cond.args ]
+            args = [ConditionProcessor._extract_common_subexpressions(arg) for arg in cond.args]
             args = [(arg if arg is not None else ori_arg) for arg, ori_arg in zip(args, cond.args)]
 
             expr_ctrs = defaultdict(int)
@@ -847,7 +1234,7 @@ class ConditionProcessor:
                 else:
                     expr_ctrs[arg] += 1
 
-            common_exprs = [ ]
+            common_exprs = []
             for expr, ctr in expr_ctrs.items():
                 if ctr == len(args):
                     # found a common one
@@ -856,28 +1243,25 @@ class ConditionProcessor:
             if not common_exprs:
                 return claripy.Or(*args)
 
-            new_args = [ ]
+            new_args = []
             for arg in args:
                 if arg.op == "And":
-                    new_subexprs = [ subexpr for subexpr in arg.args
-                                     if not _expr_inside_collection(subexpr, common_exprs) ]
+                    new_subexprs = [
+                        subexpr for subexpr in arg.args if not _expr_inside_collection(subexpr, common_exprs)
+                    ]
                     new_args.append(claripy.And(*new_subexprs))
                 elif arg in common_exprs:
                     continue
                 else:
-                    raise RuntimeError("Unexpected behavior - you should never reach here")
+                    raise AngrRuntimeError("Unexpected behavior - you should never reach here")
 
             return claripy.And(*common_exprs, claripy.Or(*new_args))
 
         return None
 
-
     @staticmethod
-    def _extract_terms(ast: claripy.ast.Bool) -> Generator[claripy.ast.Bool,None,None]:
-        if ast.op == "And":
-            for arg in ast.args:
-                yield from ConditionProcessor._extract_terms(arg)
-        elif ast.op == "Or":
+    def _extract_terms(ast: claripy.ast.Bool) -> Generator[claripy.ast.Bool]:
+        if ast.op in ("And", "Or"):
             for arg in ast.args:
                 yield from ConditionProcessor._extract_terms(arg)
         elif ast.op == "Not":
@@ -886,102 +1270,44 @@ class ConditionProcessor:
             yield ast
 
     @staticmethod
-    def _replace_term_in_ast(ast: claripy.ast.Bool,
-                             r0: claripy.ast.Bool,
-                             r0_with: claripy.ast.Bool,
-                             r1: claripy.ast.Bool,
-                             r1_with: claripy.ast.Bool) -> claripy.ast.Bool:
+    def _replace_term_in_ast(
+        ast: claripy.ast.Bool,
+        r0: claripy.ast.Bool,
+        r0_with: claripy.ast.Bool,
+        r1: claripy.ast.Bool,
+        r1_with: claripy.ast.Bool,
+    ) -> claripy.ast.Bool:
         if ast.op == "And":
-            return ast.make_like("And", (
-                (ConditionProcessor._replace_term_in_ast(
-                    arg,
-                    r0,
-                    r0_with,
-                    r1,
-                    r1_with) for arg in ast.args)))
-        elif ast.op == "Or":
-            return ast.make_like("Or", (
-                 (ConditionProcessor._replace_term_in_ast(
-                    arg,
-                    r0,
-                    r0_with,
-                    r1,
-                    r1_with) for arg in ast.args)))
-        elif ast.op == "Not":
-            return ast.make_like("Not", (
-                ConditionProcessor._replace_term_in_ast(
-                    ast.args[0],
-                    r0,
-                    r0_with,
-                    r1,
-                    r1_with),))
-        else:
-            if ast is r0:
-                return r0_with
-            if ast is r1:
-                return r1_with
-            return ast
-
-    @staticmethod
-    def _remove_redundant_terms(cond):
-        """
-        Extract all terms and test for each term if its truism impacts the truism of the entire condition. If not, the
-        term is redundant and can be replaced with a True.
-        """
-
-        all_terms = set()
-        for term in ConditionProcessor._extract_terms(cond):
-            if term not in all_terms:
-                all_terms.add(term)
-
-        negations = {}
-        to_skip = set()
-        all_terms_without_negs = set()
-        for term in all_terms:
-            if term in to_skip:
-                continue
-            neg = claripy.Not(term)
-            if neg in all_terms:
-                negations[term] = neg
-                to_skip.add(neg)
-                all_terms_without_negs.add(term)
-            else:
-                all_terms_without_negs.add(term)
-
-        solver = claripy.SolverCacheless()
-        for term in all_terms_without_negs:
-            neg = negations.get(term, None)
-
-            replaced_with_true = ConditionProcessor._replace_term_in_ast(cond, term, claripy.true, neg, claripy.false)
-            sat0 = solver.satisfiable(extra_constraints=(cond, claripy.Not(replaced_with_true),))
-            sat1 = solver.satisfiable(extra_constraints=(claripy.Not(cond), replaced_with_true,))
-            if sat0 or sat1:
-                continue
-
-            replaced_with_false = ConditionProcessor._replace_term_in_ast(cond, term, claripy.false, neg, claripy.true)
-            sat0 = solver.satisfiable(extra_constraints=(cond, claripy.Not(replaced_with_false),))
-            sat1 = solver.satisfiable(extra_constraints=(claripy.Not(cond), replaced_with_false,))
-            if sat0 or sat1:
-                continue
-
-            # TODO: Finish the implementation
-            print(term, "is redundant")
+            return claripy.And(
+                *(ConditionProcessor._replace_term_in_ast(arg, r0, r0_with, r1, r1_with) for arg in ast.args)
+            )
+        if ast.op == "Or":
+            return claripy.Or(
+                *(ConditionProcessor._replace_term_in_ast(arg, r0, r0_with, r1, r1_with) for arg in ast.args)
+            )
+        if ast.op == "Not":
+            return claripy.Not(ConditionProcessor._replace_term_in_ast(ast.args[0], r0, r0_with, r1, r1_with))
+        if ast is r0:
+            return r0_with
+        if ast is r1:
+            return r1_with
+        return ast
 
     #
     # Graph processing
     #
 
     @staticmethod
-    def _remove_crossing_edges_between_cases(graph: networkx.DiGraph,
-                                             case_entry_to_switch_head: Dict[int,int]) -> networkx.DiGraph:
-        starting_nodes = { node for node in graph if node.addr in case_entry_to_switch_head }
+    def _remove_crossing_edges_between_cases(
+        graph: networkx.DiGraph, case_entry_to_switch_head: dict[int, int]
+    ) -> networkx.DiGraph:
+        starting_nodes = {node for node in graph if node.addr in case_entry_to_switch_head}
         if not starting_nodes:
             return graph
 
         traversed_nodes = set()
         edges_to_remove = set()
         for starting_node in starting_nodes:
-
             queue = [starting_node]
             while queue:
                 src = queue.pop(0)
@@ -1013,10 +1339,4 @@ class ConditionProcessor:
     #
 
     def create_jump_target_var(self, jumptable_head_addr: int):
-        return claripy.BVS("jump_table_%x" % jumptable_head_addr,
-                           self.arch.bits,
-                           explicit_name=True)
-
-
-# delayed import
-from .region_identifier import GraphRegion, MultiNode  # pylint:disable=wrong-import-position
+        return claripy.BVS(f"jump_table_{jumptable_head_addr:x}", self.arch.bits, explicit_name=True)

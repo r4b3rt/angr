@@ -1,13 +1,14 @@
-from archinfo.arch_arm import is_arm_arch
+from __future__ import annotations
+
 import cle
+from archinfo.arch_arm import is_arm_arch
 
 from .plugin import KnowledgeBasePlugin
 
 
 class Labels(KnowledgeBasePlugin):
-
     def __init__(self, kb):
-        self._kb = kb
+        super().__init__(kb=kb)
         self._labels = {}
         self._reverse_labels = {}
 
@@ -16,7 +17,7 @@ class Labels(KnowledgeBasePlugin):
             for v in obj.symbols:
                 if is_arm and v.name in {"$d", "$t", "$a"}:
                     continue
-                if v.name and not v.is_import and v.type not in {cle.SymbolType.TYPE_OTHER, }:
+                if v.name and not v.is_import and v.type != cle.SymbolType.TYPE_OTHER:
                     self._labels[v.rebased_addr] = v.name
                     self._reverse_labels[v.name] = v.rebased_addr
             try:
@@ -61,24 +62,24 @@ class Labels(KnowledgeBasePlugin):
     def items(self):
         return self._labels.items()
 
-    def get(self, addr):
+    def get(self, addr, default=None):
         """
         Get a label as string for a given address
         Same as .labels[x]
         """
-        return self[addr]
+        return self._labels.get(addr, default)
 
-    def lookup(self, name):
+    def lookup(self, name, default=None):
         """
         Returns an address to a given label
         To show all available labels, iterate over .labels or list(b.kb.labels)
         """
-        return self._reverse_labels[name]
+        return self._reverse_labels.get(name, default)
 
     def copy(self):
         o = Labels(self._kb)
-        o._labels = {k: v for k, v in self._labels.items()}
-        o._reverse_labels = {k: v for k, v in self._reverse_labels.items()}
+        o._labels = dict(self._labels.items())
+        o._reverse_labels = dict(self._reverse_labels.items())
 
     def get_unique_label(self, label):
         """
@@ -88,16 +89,16 @@ class Labels(KnowledgeBasePlugin):
         :return:            A unique label name.
         """
 
-        if label not in self._labels:
+        if label not in self._reverse_labels:
             return label
 
         # use it as the prefix
         i = 1
         while True:
-            new_label = "%s_%d" % (label, i)
-            if new_label not in self._labels:
+            new_label = f"{label}_{i}"
+            if new_label not in self._reverse_labels:
                 return new_label
             i += 1
 
 
-KnowledgeBasePlugin.register_default('labels', Labels)
+KnowledgeBasePlugin.register_default("labels", Labels)

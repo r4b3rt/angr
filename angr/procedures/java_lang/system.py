@@ -1,20 +1,18 @@
-import logging
-import claripy
+from __future__ import annotations
 
-from ..java import JavaSimProcedure
+import logging
+from time import time
+
+from angr import claripy
+from angr.procedures.java import JavaSimProcedure
 
 log = logging.getLogger(name=__name__)
 
 
 class SystemCurrentTimeMillis(JavaSimProcedure):
-
-    __provides__ = (
-        ('java.lang.System', 'currentTimeMillis()'),
-    )
+    __provides__ = (("java.lang.System", "currentTimeMillis()"),)
 
     def run(self):
-        log.debug('Called SimProcedure java.lang.System.currentTimeMillis with args')
+        log.debug("Called SimProcedure java.lang.System.currentTimeMillis with args")
 
-        from time import time
         return claripy.BVV(int(time() * 1000), 64)
-

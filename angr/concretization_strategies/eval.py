@@ -1,4 +1,7 @@
-from . import SimConcretizationStrategy
+from __future__ import annotations
+
+from .base import SimConcretizationStrategy
+
 
 class SimConcretizationStrategyEval(SimConcretizationStrategy):
     """
@@ -9,9 +12,8 @@ class SimConcretizationStrategyEval(SimConcretizationStrategy):
     """
 
     def __init__(self, limit, **kwargs):
-        super(SimConcretizationStrategyEval, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         self._limit = limit
 
     def _concretize(self, memory, addr, **kwargs):
-        addrs = self._eval(memory, addr, self._limit, **kwargs)
-        return addrs
+        return self._eval(memory, addr, self._limit, **kwargs)

@@ -1,9 +1,7 @@
+from __future__ import annotations
+
 import angr
 from angr.sim_type import SimTypeInt
-
-######################################
-# getgid
-######################################
 
 
 class getgid(angr.SimProcedure):

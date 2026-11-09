@@ -1,15 +1,24 @@
-import logging
-l = logging.getLogger(name=__name__)
+from __future__ import annotations
 
 import itertools
+import logging
 
-from .plugin import SimStatePlugin
-class SimStateLog(SimStatePlugin):
+from angr.errors import SimEventError
+from angr.sim_state import SimState
+
+from .plugin import SimStatePlugin, SupportsMerge
+from .sim_action import SimAction, SimActionConstraint
+from .sim_event import SimEvent
+
+l = logging.getLogger(name=__name__)
+
+
+class SimStateLog(SimStatePlugin, SupportsMerge):
     def __init__(self, log=None):
         SimStatePlugin.__init__(self)
 
         # general events
-        self.events = [ ]
+        self.events = []
 
         if log is not None:
             self.events.extend(log.events)
@@ -37,10 +46,10 @@ class SimStateLog(SimStatePlugin):
         self.events.extend(new_actions)
 
     def events_of_type(self, event_type):
-        return [ e for e in self.events if e.type == event_type ]
+        return [e for e in self.events if e.type == event_type]
 
     def actions_of_type(self, action_type):
-        return [ action for action in self.actions if action.type == action_type ]
+        return [action for action in self.actions if action.type == action_type]
 
     @property
     def fresh_constraints(self):
@@ -48,33 +57,25 @@ class SimStateLog(SimStatePlugin):
         return [ev.constraint.ast for ev in self.events if isinstance(ev, SimActionConstraint)]
 
     @SimStatePlugin.memo
-    def copy(self, memo): # pylint: disable=unused-argument
+    def copy(self, memo):  # pylint: disable=unused-argument
         return SimStateLog(log=self)
 
     def _combine(self, others):
-        all_events = [ e.events for e in itertools.chain([self], others) ]
-        self.events = [ SimEvent(self.state, 'merge', event_lists=all_events) ]
+        all_events = [e.events for e in itertools.chain([self], others)]
+        self.events = [SimEvent(self.state, "merge", event_lists=all_events)]
         return False
 
-    def merge(self, others, merge_conditions, common_ancestor=None): # pylint: disable=unused-argument
-        return self._combine(others)
-
-    def widen(self, others):
+    def merge(self, others, merge_conditions, common_ancestor=None):  # pylint: disable=unused-argument
         return self._combine(others)
 
     def clear(self):
         s = self.state
         self.__init__()
         self.state = s
-        #self.events = [ ]
-        #self.temps.clear()
-        #self.used_variables.clear()
-        #self.input_variables.clear()
-
-from ..errors import SimEventError
-from .sim_event import SimEvent
-from .sim_action import SimAction, SimActionConstraint
+        # self.events = [ ]
+        # self.temps.clear()
+        # self.used_variables.clear()
+        # self.input_variables.clear()
 
 
-from angr.sim_state import SimState
-SimState.register_default('log', SimStateLog)
+SimState.register_default("log", SimStateLog)

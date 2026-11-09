@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+
 class SimActLocation:
     """
     Structure-like class used to bundle the instruction address and statement index of a given SimAction in order to
@@ -35,9 +38,12 @@ class ParsedInstruction:
     Used by parser to facilitate linking with recent ancestors in an efficient manner
     """
 
-    def __init__(self, ins_addr: int,  # Instruction that was parsed
-                 min_stmt_idx: int,  # Index of first statement in instruction
-                 max_stmt_idx: int):  # Index of last statement in instruction
+    def __init__(
+        self,
+        ins_addr: int,  # Instruction that was parsed
+        min_stmt_idx: int,  # Index of first statement in instruction
+        max_stmt_idx: int,
+    ):  # Index of last statement in instruction
         self.ins_addr = ins_addr
         self.min_stmt_idx = min_stmt_idx
         self.max_stmt_idx = max_stmt_idx

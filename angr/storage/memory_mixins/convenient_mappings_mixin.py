@@ -1,13 +1,13 @@
 # pylint:disable=arguments-differ,assignment-from-no-return,isinstance-second-argument-not-valid-type
-from typing import Optional, Set
+from __future__ import annotations
+
 import logging
 
-import claripy
-
+from angr import claripy
 from angr import sim_options as options
-from ...utils.cowdict import ChainMapCOW
-from ...errors import SimMemoryError, SimMemoryMissingError
-from . import MemoryMixin
+from angr.errors import SimMemoryError, SimMemoryMissingError
+from angr.storage.memory_mixins.memory_mixin import MemoryMixin
+from angr.utils.cowdict import ChainMapCOW
 
 l = logging.getLogger(name=__name__)
 
@@ -16,10 +16,11 @@ class ConvenientMappingsMixin(MemoryMixin):
     """
     Implements mappings between names and hashes of symbolic variables and these variables themselves.
     """
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        self._symbolic_addrs: Set = set()
+        self._symbolic_addrs: set = set()
         self._name_mapping = ChainMapCOW()
         self._hash_mapping = ChainMapCOW()
         self._updated_mappings = set()
@@ -35,12 +36,14 @@ class ConvenientMappingsMixin(MemoryMixin):
     def store(self, addr, data, size=None, **kwargs):
         if options.MEMORY_SYMBOLIC_BYTES_MAP in self.state.options:
             if data.symbolic:
-                self._symbolic_addrs.update(range(addr, addr+size))
+                self._symbolic_addrs.update(range(addr, addr + size))
             else:
-                self._symbolic_addrs.difference_update(range(addr, addr+size))
+                self._symbolic_addrs.difference_update(range(addr, addr + size))
 
-        if not (options.REVERSE_MEMORY_NAME_MAP in self.state.options or
-                options.REVERSE_MEMORY_HASH_MAP in self.state.options):
+        if not (
+            options.REVERSE_MEMORY_NAME_MAP in self.state.options
+            or options.REVERSE_MEMORY_HASH_MAP in self.state.options
+        ):
             return super().store(addr, data, size=size, **kwargs)
 
         if options.REVERSE_MEMORY_HASH_MAP not in self.state.options and not data.variables:
@@ -54,15 +57,15 @@ class ConvenientMappingsMixin(MemoryMixin):
                 obj_vars = old_obj.variables
                 for v in obj_vars:
                     self._mark_updated_mapping(self._name_mapping, v)
-                    self._name_mapping[v].difference_update(range(addr, addr+size))
+                    self._name_mapping[v].difference_update(range(addr, addr + size))
                     if len(self._name_mapping[v]) == 0:
                         self._name_mapping.pop(v, None)
                         self._updated_mappings.remove((v, id(self._name_mapping)))
 
                 if options.REVERSE_MEMORY_HASH_MAP in self.state.options:
-                    h = old_obj.cache_key
+                    h = old_obj.hash()
                     self._mark_updated_mapping(self._hash_mapping, h)
-                    self._hash_mapping[h].difference_update(range(addr, addr+size))
+                    self._hash_mapping[h].difference_update(range(addr, addr + size))
                     if len(self._hash_mapping[h]) == 0:
                         self._hash_mapping.pop(h, None)
                         self._updated_mappings.remove((h, id(self._hash_mapping)))
@@ -75,21 +78,21 @@ class ConvenientMappingsMixin(MemoryMixin):
                 self._mark_updated_mapping(self._name_mapping, v)
                 if v not in self._name_mapping:
                     self._name_mapping[v] = set()
-                self._name_mapping[v].update(range(addr, addr+size))
+                self._name_mapping[v].update(range(addr, addr + size))
 
         if options.REVERSE_MEMORY_HASH_MAP in self.state.options:
             # add the new variables to the hash->addrs mapping
-            h = data.cache_key
+            h = data.hash()
             self._mark_updated_mapping(self._hash_mapping, h)
             if h not in self._hash_mapping:
                 self._hash_mapping[h] = set()
-            self._hash_mapping[h].update(range(addr, addr+size))
+            self._hash_mapping[h].update(range(addr, addr + size))
 
         return super().store(addr, data, size=size, **kwargs)
 
     def _default_value(self, addr, size, **kwargs):
         d = super()._default_value(addr, size, **kwargs)
-        if addr is not None:
+        if type(addr) is int:
             self._update_mappings(addr, None, d)
         return d
 
@@ -113,19 +116,22 @@ class ConvenientMappingsMixin(MemoryMixin):
             d[m] = set()
         self._updated_mappings.add((m, id(d)))
 
-    def _update_mappings(self, actual_addr: int, old_obj: Optional[claripy.ast.BV], new_obj: claripy.ast.BV):
+    def _update_mappings(self, actual_addr: int, old_obj: claripy.ast.BV | None, new_obj: claripy.ast.BV):
         if options.MEMORY_SYMBOLIC_BYTES_MAP in self.state.options:
             if self.state.solver.symbolic(new_obj):
                 self._symbolic_addrs.add(actual_addr)
             else:
                 self._symbolic_addrs.discard(actual_addr)
 
-        if not (options.REVERSE_MEMORY_NAME_MAP in self.state.options or
-                options.REVERSE_MEMORY_HASH_MAP in self.state.options):
+        if not (
+            options.REVERSE_MEMORY_NAME_MAP in self.state.options
+            or options.REVERSE_MEMORY_HASH_MAP in self.state.options
+        ):
             return
 
-        if (options.REVERSE_MEMORY_HASH_MAP not in self.state.options) and \
-                len(self.state.solver.variables(new_obj)) == 0:
+        if (options.REVERSE_MEMORY_HASH_MAP not in self.state.options) and len(
+            self.state.solver.variables(new_obj)
+        ) == 0:
             return
 
         l.debug("Updating mappings at address %#x", actual_addr)
@@ -142,7 +148,7 @@ class ConvenientMappingsMixin(MemoryMixin):
                         self._name_mapping.pop(v, None)
 
             if options.REVERSE_MEMORY_HASH_MAP in self.state.options:
-                h = hash(old_obj)
+                h = old_obj.hash()
                 self._mark_updated_mapping(self._hash_mapping, h)
                 self._hash_mapping[h].discard(actual_addr)
                 if len(self._hash_mapping[h]) == 0:
@@ -160,7 +166,7 @@ class ConvenientMappingsMixin(MemoryMixin):
 
         if options.REVERSE_MEMORY_HASH_MAP in self.state.options:
             # add the new variables to the hash->addrs mapping
-            h = hash(new_obj)
+            h = new_obj.hash()
             self._mark_updated_mapping(self._hash_mapping, h)
             if h not in self._hash_mapping:
                 self._hash_mapping[h] = set()
@@ -181,8 +187,10 @@ class ConvenientMappingsMixin(MemoryMixin):
         to_discard = set()
         for e in self._name_mapping[n]:
             try:
-                if n in self.load(e, size=1).variables: yield e
-                else: to_discard.add(e)
+                if n in self.load(e, size=1).variables:
+                    yield e
+                else:
+                    to_discard.add(e)
             except KeyError:
                 to_discard.add(e)
         self._name_mapping[n] -= to_discard
@@ -200,10 +208,8 @@ class ConvenientMappingsMixin(MemoryMixin):
         for e in self._hash_mapping[h]:
             try:
                 present = self.load(e, size=1)
-                if h == present.cache_key or (
-                        present.op == 'Extract'
-                        and present.args[0] - present.args[1] == 7
-                        and h == present.args[2].cache_key
+                if h == present.hash() or (
+                    present.op == "Extract" and present.args[0] - present.args[1] == 7 and h == present.args[2].hash()
                 ):
                     yield e
                 else:
@@ -222,8 +228,10 @@ class ConvenientMappingsMixin(MemoryMixin):
         """
 
         if options.REVERSE_MEMORY_NAME_MAP not in self.state.options:
-            raise SimMemoryError("replace_all is not doable without a reverse name mapping. Please add "
-                                 "sim_options.REVERSE_MEMORY_NAME_MAP to the state options")
+            raise SimMemoryError(
+                "replace_all is not doable without a reverse name mapping. Please add "
+                "sim_options.REVERSE_MEMORY_NAME_MAP to the state options"
+            )
 
         if not isinstance(old, claripy.ast.BV) or not isinstance(new, claripy.ast.BV):
             raise SimMemoryError("old and new arguments to replace_all() must be claripy.BV objects")
@@ -233,7 +241,7 @@ class ConvenientMappingsMixin(MemoryMixin):
 
         # Computer an intersection between sets of memory addresses for each unique variable name. The eventual address
         # set contains all addresses whose memory objects we should update.
-        addrs: Optional[Set] = None
+        addrs: set | None = None
         for v in old.variables:
             v: str
             if addrs is None:

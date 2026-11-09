@@ -1,11 +1,16 @@
+from __future__ import annotations
+
+import contextlib
 import logging
 
 import networkx
-from . import Analysis
+
+from angr.analyses.analysis import AnalysesHub, Analysis
 
 l = logging.getLogger(name=__name__)
 
-class Loop(object):
+
+class Loop:
     def __init__(self, entry, entry_edges, break_edges, continue_edges, body_nodes, graph, subloops):
         self.entry = entry
         self.entry_edges = entry_edges
@@ -15,18 +20,18 @@ class Loop(object):
         self.graph = graph
         self.subloops = subloops
 
-        self.has_calls = any(map(lambda loop: loop.has_calls, subloops))
+        self.has_calls = any(loop.has_calls for loop in subloops)
 
         if not self.has_calls:
             for _, _, data in self.graph.edges(data=True):
-                if 'type' in data and data['type'] == 'fake_return':
+                if "type" in data and data["type"] == "fake_return":
                     # this is a function call.
                     self.has_calls = True
                     break
 
     def __repr__(self):
-        s = "<Loop @ %s, %d blocks>" % (self.entry.addr, len(self.body_nodes))
-        return s
+        return f"<Loop @ {self.entry.addr}, {len(self.body_nodes)} blocks>"
+
 
 class LoopFinder(Analysis):
     """
@@ -41,9 +46,7 @@ class LoopFinder(Analysis):
         self.loops = []
         self.loops_hierarchy = {}
         for function in functions:
-
-            if self.project.is_hooked(function.addr) or \
-                    self.project.simos.is_syscall_addr(function.addr):
+            if self.project.is_hooked(function.addr) or self.project.simos.is_syscall_addr(function.addr):
                 # skip SimProcedures and syscalls
                 continue
 
@@ -113,10 +116,8 @@ class LoopFinder(Analysis):
                     except networkx.NetworkXError:
                         if entry_edge in removed_entries:
                             subg.add_edge(removed_entries[entry_edge], subloop)
-                            try:
+                            with contextlib.suppress(networkx.NetworkXError):
                                 subg.remove_edge(removed_entries[entry_edge], entry_edge[1])
-                            except networkx.NetworkXError:
-                                pass
                         else:
                             raise
                     else:
@@ -128,27 +129,20 @@ class LoopFinder(Analysis):
                     except networkx.NetworkXError:
                         if exit_edge in removed_entries:
                             subg.add_edge(subloop, removed_entries[exit_edge])
-                            try:
+                            with contextlib.suppress(networkx.NetworkXError):
                                 subg.remove_edge(exit_edge[0], removed_entries[exit_edge])
-                            except networkx.NetworkXError:
-                                pass
                         else:
                             raise
                     else:
                         subg.add_edge(subloop, exit_edge[1])
                         removed_exits[exit_edge] = subloop
-                _subgraphs = (networkx.induced_subgraph(subg, nodes).copy() for nodes in
-                             networkx.weakly_connected_components(subg))
-                subg = next(filter( lambda g: entry_node in g.nodes(),
-                                    _subgraphs))
-        me = Loop(entry_node,
-             entry_edges,
-             break_edges,
-             continue_edges,
-             loop_body_nodes,
-             subg,
-             tops[:])
-        return me, [me] + alls
+                _subgraphs = (
+                    networkx.induced_subgraph(subg, nodes).copy()
+                    for nodes in networkx.weakly_connected_components(subg)
+                )
+                subg = next(filter(lambda g: entry_node in g.nodes(), _subgraphs))
+        me = Loop(entry_node, entry_edges, break_edges, continue_edges, loop_body_nodes, subg, tops[:])
+        return me, [me, *alls]
 
     def _parse_loops_from_graph(self, graph: networkx.DiGraph):
         """
@@ -161,15 +155,16 @@ class LoopFinder(Analysis):
         outtop = []
         outall = []
         subg: networkx.DiGraph
-        for subg in ( networkx.induced_subgraph(graph, nodes).copy() for nodes in networkx.strongly_connected_components(graph)):
-            if len(subg.nodes()) == 1:
-                if len(list(subg.successors(list(subg.nodes())[0]))) == 0:
-                    continue
+        for subg in (
+            networkx.induced_subgraph(graph, nodes).copy() for nodes in networkx.strongly_connected_components(graph)
+        ):
+            if len(subg.nodes()) == 1 and len(list(subg.successors(next(iter(subg.nodes()))))) == 0:
+                continue
             thisloop, allloops = self._parse_loop_graph(subg, graph)
             if thisloop is not None:
                 outall += allloops
                 outtop.append(thisloop)
         return outtop, outall
 
-from angr.analyses import AnalysesHub
-AnalysesHub.register_default('LoopFinder', LoopFinder)
+
+AnalysesHub.register_default("LoopFinder", LoopFinder)

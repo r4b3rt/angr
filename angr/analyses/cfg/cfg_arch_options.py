@@ -1,5 +1,7 @@
+from __future__ import annotations
 
-class CFGArchOptions(object):
+
+class CFGArchOptions:
     """
     Stores architecture-specific options and settings, as well as the detailed explanation of those options and
     settings.
@@ -15,24 +17,28 @@ class CFGArchOptions(object):
     # option name: (option value type, default option value)
 
     OPTIONS = {
-        'ARMEL': {
+        "ARMEL": {
             # Whether to perform some simple heuristics to detect returns that are incorrectly labeled as boring
             # branches by VEX
-            'ret_jumpkind_heuristics': (bool, True),
+            "ret_jumpkind_heuristics": (bool, True),
             # Whether to switch between ARM mode and THUMB mode when VEX fails to decode a block
-            'switch_mode_on_nodecode': (bool, True),
+            "switch_mode_on_nodecode": (bool, True),
             # Whether we should use byte-based pattern-matching to identify ifuncs
-            'pattern_match_ifuncs': (bool, True),
+            "pattern_match_ifuncs": (bool, True),
+            # Do we consider ARM-mode code at all
+            "has_arm_code": (bool, True),
         },
-        'ARMHF': {
-            'ret_jumpkind_heuristics': (bool, True),
-            'switch_mode_on_nodecode': (bool, True),
-            'pattern_match_ifuncs': (bool, True),
+        "ARMHF": {
+            "ret_jumpkind_heuristics": (bool, True),
+            "switch_mode_on_nodecode": (bool, True),
+            "pattern_match_ifuncs": (bool, True),
+            "has_arm_code": (bool, True),
         },
-        'ARMCortexM': {
-            'ret_jumpkind_heuristics': (bool, True),
-            'switch_mode_on_nodecode': (bool, False),
-            'pattern_match_ifuncs': (bool, True),
+        "ARMCortexM": {
+            "ret_jumpkind_heuristics": (bool, True),
+            "switch_mode_on_nodecode": (bool, False),
+            "pattern_match_ifuncs": (bool, True),
+            "has_arm_code": (bool, False),
         },
     }
 
@@ -56,9 +62,9 @@ class CFGArchOptions(object):
                 self._options[k] = value
 
         # make sure options are valid
-        for k in options.keys():
+        for k in options:
             if self.arch.name not in self.OPTIONS or k not in self.OPTIONS[self.arch.name]:
-                raise KeyError('Architecture %s does not support arch-specific option "%s".' % (self.arch.name, k))
+                raise KeyError(f'Architecture {self.arch.name} does not support arch-specific option "{k}".')
 
         for k, v in options.items():
             self.__setattr__(k, v)
@@ -71,14 +77,19 @@ class CFGArchOptions(object):
 
     def __setattr__(self, option_name, option_value):
         if option_name in self._options:
-
-            # type checking
+            # Type checking
             sort = self.OPTIONS[self.arch.name][option_name][0]
 
             if sort is None or isinstance(option_value, sort):
                 self._options[option_name] = option_value
             else:
-                raise ValueError('Value for option "%s" must be of type %s' % (option_name, sort))
+                raise ValueError(f'Value for option "{option_name}" must be of type {sort}')
 
         else:
-            super(CFGArchOptions, self).__setattr__(option_name, option_value )
+            super().__setattr__(option_name, option_value)
+
+    def __getitem__(self, option_name: str):
+        return self._options[option_name]
+
+    def __contains__(self, option_name: str) -> bool:
+        return option_name in self._options

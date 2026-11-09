@@ -1,20 +1,18 @@
-import logging
+from __future__ import annotations
 
-from angr.procedures.stubs.format_parser import FormatParser
+import logging
 
 from cle.backends.externs.simdata.io_file import io_file_data_for_arch
 
+from angr.procedures.stubs.format_parser import FormatParser
+
 l = logging.getLogger(name=__name__)
 
-######################################
-# fprintf
-######################################
 
 class fprintf(FormatParser):
-
     def run(self, file_ptr, fmt):  # pylint:disable=unused-argument
-        fd_offset = io_file_data_for_arch(self.state.arch)['fd']
-        fileno = self.state.mem[file_ptr + fd_offset:].int.resolved
+        fd_offset = io_file_data_for_arch(self.state.arch)["fd"]
+        fileno = self.state.mem[file_ptr + fd_offset :].int.resolved
         simfd = self.state.posix.get_fd(fileno)
         if simfd is None:
             return -1
@@ -26,3 +24,10 @@ class fprintf(FormatParser):
         simfd.write_data(out_str, out_str.size() // 8)
 
         return out_str.size() // 8
+
+
+class __fprintf_chk(fprintf):
+    # _FORTIFY_SOURCE redirect: __fprintf_chk(fp, flag, fmt, ...). The flag is
+    # ignored, as in __printf_chk.
+    def run(self, file_ptr, flag, fmt):  # type:ignore[reportIncompatibleMethodOverride] # pylint:disable=unused-argument
+        return super().run(file_ptr, fmt)

@@ -1,22 +1,24 @@
-
 # VEX Variables
+from __future__ import annotations
+
 
 class VEXVariable:
-
-    __slots__ = tuple()
+    __slots__ = ()
 
     def __hash__(self):
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def __eq__(self, other):
-        raise NotImplementedError()
+        raise NotImplementedError
 
 
 class VEXMemVar:
+    __slots__ = (
+        "addr",
+        "size",
+    )
 
-    __slots__ = ('addr', 'size', )
-
-    def __init__(self, addr, size):
+    def __init__(self, addr: int, size: int):
         self.addr = addr
         self.size = size
 
@@ -27,12 +29,14 @@ class VEXMemVar:
         return type(other) is VEXMemVar and other.addr == self.addr and other.size == self.size
 
     def __repr__(self):
-        return "<mem %#x[%d bytes]>" % (self.addr, self.size)
+        return f"<mem {self.addr:#x}[{self.size} bytes]>"
 
 
 class VEXReg(VEXVariable):
-
-    __slots__ = ('offset', 'size', )
+    __slots__ = (
+        "offset",
+        "size",
+    )
 
     def __init__(self, offset, size):
         self.offset = offset
@@ -45,12 +49,11 @@ class VEXReg(VEXVariable):
         return type(other) is VEXReg and other.offset == self.offset and other.size == self.size
 
     def __repr__(self):
-        return "<reg %d[%d]>" % (self.offset, self.size)
+        return f"<reg {self.offset}[{self.size}]>"
 
 
 class VEXTmp(VEXVariable):
-
-    __slots__ = ('tmp', )
+    __slots__ = ("tmp",)
 
     def __init__(self, tmp):
         self.tmp = tmp
@@ -62,4 +65,4 @@ class VEXTmp(VEXVariable):
         return type(other) is VEXTmp and other.tmp == self.tmp
 
     def __repr__(self):
-        return "<tmp %d>" % self.tmp
+        return f"<tmp {self.tmp}>"

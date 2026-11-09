@@ -1,14 +1,15 @@
+from __future__ import annotations
+
+from angr.engines.soot.field_dispatcher import resolve_field
 
 from .base import SimSootValue
-from ..field_dispatcher import resolve_field
 
 
 class SimSootValue_StaticFieldRef(SimSootValue):
-
-    __slots__ = [ 'id', 'class_name', 'field_name', 'type' ]
+    __slots__ = ["class_name", "field_name", "id", "type"]
 
     def __init__(self, class_name, field_name, type_):
-        self.id = "%s.%s" % (class_name, field_name)
+        self.id = f"{class_name}.{field_name}"
         self.class_name = class_name
         self.field_name = field_name
         self.type = type_

@@ -1,9 +1,10 @@
+from __future__ import annotations
 
 import logging
 
 from .base import SimSootStmt
 
-l = logging.getLogger('angr.engines.soot.statements.invoke')
+l = logging.getLogger("angr.engines.soot.statements.invoke")
 
 
 class SimSootStmt_Invoke(SimSootStmt):

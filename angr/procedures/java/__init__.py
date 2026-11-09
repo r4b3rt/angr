@@ -1,13 +1,12 @@
+from __future__ import annotations
 
 import itertools
 
-from ...sim_procedure import SimProcedure
-from ...engines.soot.values import SimSootValue_Local, SimSootValue_ParamRef, translate_value
-from ...engines.soot.expressions import translate_expr
+from angr.engines.soot.values import SimSootValue_Local, SimSootValue_ParamRef
+from angr.sim_procedure import SimProcedure
 
 
 class JavaSimProcedure(SimProcedure):
-
     @property
     def is_java(self):
         return True
@@ -20,7 +19,7 @@ class JavaSimProcedure(SimProcedure):
         sim_args = []
         # try to get 'this' reference
         try:
-            this_ref = state.javavm_memory.load(addr=SimSootValue_Local('this', None))
+            this_ref = state.javavm_memory.load(addr=SimSootValue_Local("this", None))
             sim_args += [this_ref]
         except KeyError:
             pass
@@ -38,3 +37,6 @@ class JavaSimProcedure(SimProcedure):
 
     def _prepare_ret_state(self):
         self._engine.prepare_return_state(self.state, self.ret_expr)
+
+
+__all__ = ("JavaSimProcedure",)

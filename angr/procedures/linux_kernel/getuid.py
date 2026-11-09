@@ -1,9 +1,7 @@
+from __future__ import annotations
+
 import angr
 from angr.sim_type import SimTypeInt
-
-######################################
-# getuid
-######################################
 
 
 class getuid(angr.SimProcedure):
@@ -11,6 +9,7 @@ class getuid(angr.SimProcedure):
     def run(self):
         self.return_type = SimTypeInt(16, True)
         return 1000
+
 
 class getuid32(angr.SimProcedure):
     # pylint: disable=arguments-differ

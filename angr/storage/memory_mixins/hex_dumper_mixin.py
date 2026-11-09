@@ -1,14 +1,27 @@
+from __future__ import annotations
+
+import contextlib
 import string
 
-from ...errors import SimValueError
-from . import MemoryMixin
+from angr.errors import SimValueError
+from angr.storage.memory_mixins.memory_mixin import MemoryMixin
 
 
 class HexDumperMixin(MemoryMixin):
-
-    def hex_dump(self, start, size, word_size=4, words_per_row=4, endianness="Iend_BE",
-                 symbolic_char='?', unprintable_char='.', solve=False, extra_constraints=None,
-                 inspect=False, disable_actions=True):
+    def hex_dump(
+        self,
+        start,
+        size,
+        word_size=4,
+        words_per_row=4,
+        endianness="Iend_BE",
+        symbolic_char="?",
+        unprintable_char=".",
+        solve=False,
+        extra_constraints=None,
+        inspect=False,
+        disable_actions=True,
+    ):
         """
         Returns a hex dump as a string. The solver, if enabled, is called once for every byte
         potentially making this function very slow. It is meant to be used mainly as a
@@ -30,10 +43,7 @@ class HexDumperMixin(MemoryMixin):
         :param disable_actions: whether or not to disable SimActions for the memory load
         :return: hex dump as a string
         """
-        if endianness == "Iend_BE":
-            end = 1
-        else:
-            end = -1
+        end = 1 if endianness == "Iend_BE" else -1
         if extra_constraints is None:
             extra_constraints = []
 
@@ -45,7 +55,7 @@ class HexDumperMixin(MemoryMixin):
         i = start
         dump_str = ""
         for line in raw_mem.chop(line_size * self.state.arch.byte_width):
-            dump = "%x:" % i
+            dump = f"{i:x}:"
             group_str = ""
             for word in line.chop(word_size * self.state.arch.byte_width):
                 word_bytes = ""
@@ -53,26 +63,21 @@ class HexDumperMixin(MemoryMixin):
                 for byte_ in word.chop(self.state.arch.byte_width)[::end]:
                     byte_value = None
                     if not self.state.solver.symbolic(byte_) or solve:
-                        try:
-                            byte_value = self.state.solver.eval_one(
-                                byte_,
-                                extra_constraints=extra_constraints
-                            )
-                        except SimValueError:
-                            pass
+                        with contextlib.suppress(SimValueError):
+                            byte_value = self.state.solver.eval_one(byte_, extra_constraints=extra_constraints)
 
                     if byte_value is not None:
-                        word_bytes += "%02x" % byte_value
+                        word_bytes += f"{byte_value:02x}"
                         if chr(byte_value) in string.printable[:-5]:
                             word_str += chr(byte_value)
                         else:
                             word_str += unprintable_char
                     else:
-                        word_bytes += symbolic_char*2
+                        word_bytes += symbolic_char * 2
                         word_str += symbolic_char
-                dump += ' ' + word_bytes
+                dump += " " + word_bytes
                 group_str += word_str[::end]  # always print ASCII representation in little-endian
-            dump += ' ' + group_str
+            dump += " " + group_str
             i += line_size
-            dump_str += dump + '\n'
+            dump_str += dump + "\n"
         return dump_str

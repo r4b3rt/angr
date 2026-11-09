@@ -1,31 +1,76 @@
-import functools
-import sys
+# pylint:disable=missing-class-docstring
+from __future__ import annotations
+
 import contextlib
-from collections import defaultdict
-from inspect import Signature
-from typing import TYPE_CHECKING, TypeVar, Type, Generic, Callable, Optional
-
-import progressbar
+import functools
 import logging
+import os
+import sys
 import time
+import typing
+from collections import defaultdict
+from collections.abc import Callable
+from inspect import Signature
+from itertools import chain
+from traceback import format_exception
+from types import NoneType
+from typing import TYPE_CHECKING, Any
 
-from ..misc.plugins import PluginVendor, VendorPreset
-from ..misc.ux import deprecated
+import psutil
+from rich import progress
+
+from angr.misc import telemetry
+from angr.misc.plugins import PluginVendor, VendorPreset
+from angr.misc.testing import is_testing
 
 if TYPE_CHECKING:
-    from ..knowledge_base import KnowledgeBase
-    import angr
-    from ..project import Project
     from typing_extensions import ParamSpec
+
+    from angr.knowledge_base import KnowledgeBase
+    from angr.project import Project
+
+    from .backward_slice import BackwardSlice
+    from .binary_optimizer import BinaryOptimizer
+    from .bindiff import BinDiff
+    from .boyscout import BoyScout
+    from .callee_cleanup_finder import CalleeCleanupFinder
+    from .calling_convention import CallingConventionAnalysis
+    from .cdg import CDG
+    from .cfg import CFG, CFBlanket, CFGEmulated, CFGFast
+    from .code_tagging import CodeTagging
+    from .complete_calling_conventions import CompleteCallingConventionsAnalysis
+    from .congruency_check import CongruencyCheck
+    from .ddg import DDG
+    from .decompiler.clinic import Clinic
+    from .decompiler.decompiler import Decompiler
+    from .disassembly import Disassembly
+    from .identifier import Identifier
+    from .loopfinder import LoopFinder
+    from .propagator import PropagatorAnalysis
+    from .reaching_definitions import ReachingDefinitionsAnalysis
+    from .reassembler import Reassembler
+    from .s_liveness import SLivenessAnalysis
+    from .s_reaching_definitions import SReachingDefinitionsAnalysis
+    from .static_hooker import StaticHooker
+    from .variable_recovery import VariableRecovery, VariableRecoveryFast
+    from .veritesting import Veritesting
+    from .vfg import VFG
+    from .vsa_ddg import VSA_DDG
+    from .xrefs import XRefsAnalysis
+
     AnalysisParams = ParamSpec("AnalysisParams")
 
 l = logging.getLogger(name=__name__)
+t = telemetry.get_tracer(name=__name__)
+
+# the minimum interval (in seconds) between two consecutive sleeps in _release_gil()
+GIL_RELEASE_INTERVAL = 0.05
 
 
 class AnalysisLogEntry:
     def __init__(self, message, exc_info=False):
         if exc_info:
-            (e_type, value, traceback) = sys.exc_info()
+            e_type, value, traceback = sys.exc_info()
             self.exc_type = e_type
             self.exc_value = value
             self.exc_traceback = traceback
@@ -36,11 +81,18 @@ class AnalysisLogEntry:
 
         self.message = message
 
+    def format(self) -> str:
+        if self.exc_traceback is None:
+            return self.message
+        return "\n".join((*format_exception(self.exc_type, self.exc_value, self.exc_traceback), "", self.message))
+
     def __getstate__(self):
-        return str(self.__dict__.get("exc_type")), \
-               str(self.__dict__.get("exc_value")), \
-               str(self.__dict__.get("exc_traceback")), \
-               self.message
+        return (
+            str(self.__dict__.get("exc_type")),
+            str(self.__dict__.get("exc_value")),
+            str(self.__dict__.get("exc_traceback")),
+            self.message,
+        )
 
     def __setstate__(self, s):
         self.exc_type, self.exc_value, self.exc_traceback, self.message = s
@@ -49,66 +101,145 @@ class AnalysisLogEntry:
         if self.exc_type is None:
             msg_str = repr(self.message)
             if len(msg_str) > 70:
-                msg_str = msg_str[:66] + '...'
+                msg_str = msg_str[:66] + "..."
                 if msg_str[0] in ('"', "'"):
                     msg_str += msg_str[0]
-            return '<AnalysisLogEntry %s>' % msg_str
-        else:
-            msg_str = repr(self.message)
-            if len(msg_str) > 40:
-                msg_str = msg_str[:36] + '...'
-                if msg_str[0] in ('"', "'"):
-                    msg_str += msg_str[0]
-            return '<AnalysisLogEntry %s with %s: %s>' % (msg_str, self.exc_type.__name__, self.exc_value)
+            return f"<AnalysisLogEntry {msg_str}>"
+        msg_str = repr(self.message)
+        if len(msg_str) > 40:
+            msg_str = msg_str[:36] + "..."
+            if msg_str[0] in ('"', "'"):
+                msg_str += msg_str[0]
+        return f"<AnalysisLogEntry {msg_str} with {self.exc_type.__name__}: {self.exc_value}>"
 
 
-A = TypeVar("A", bound="Analysis")
-class AnalysesHub(PluginVendor):
+class AnalysesHub(PluginVendor[Any]):
     """
     This class contains functions for all the registered and runnable analyses,
     """
+
     def __init__(self, project):
-        super(AnalysesHub, self).__init__()
+        super().__init__()
         self.project = project
 
-    @deprecated()
-    def reload_analyses(self): # pylint: disable=no-self-use
-        return
+    def _init_plugin[A: Analysis](self, plugin_cls: type[A]) -> AnalysisFactory[A]:
+        return functools.wraps(plugin_cls)(AnalysisFactory(self.project, plugin_cls))  # type: ignore
 
-    def _init_plugin(self, plugin_cls: Type[A]) -> "AnalysisFactory[A]":
-        return AnalysisFactory(self.project, plugin_cls)
-
-    def __getstate__(self):
-        s = super(AnalysesHub, self).__getstate__()
+    def __getstate__(self):  # type: ignore[reportIncompatibleMethodOverride]
+        s = super().__getstate__()
         return (s, self.project)
 
     def __setstate__(self, sd):
         s, self.project = sd
-        super(AnalysesHub, self).__setstate__(s)
+        super().__setstate__(s)
 
-    def __getitem__(self, plugin_cls: "Type[A]") -> "AnalysisFactory[A]":
-        return AnalysisFactory(self.project, plugin_cls)
+    def __getitem__[A: Analysis](self, plugin_cls: type[A]) -> AnalysisFactory[A]:
+        return functools.wraps(plugin_cls)(AnalysisFactory(self.project, plugin_cls))  # type: ignore
 
 
-class AnalysisFactory(Generic[A]):
-    def __init__(self, project: "Project", analysis_cls: Type[A]):
+class KnownAnalysesPlugin(typing.Protocol):
+    Identifier: type[Identifier]
+    CalleeCleanupFinder: type[CalleeCleanupFinder]
+    VSA_DDG: type[VSA_DDG]
+    CDG: type[CDG]
+    BinDiff: type[BinDiff]
+    CFGEmulated: type[CFGEmulated]
+    CFB: type[CFBlanket]
+    CFBlanket: type[CFBlanket]
+    CFG: type[CFG]
+    CFGFast: type[CFGFast]
+    StaticHooker: type[StaticHooker]
+    DDG: type[DDG]
+    CongruencyCheck: type[CongruencyCheck]
+    Reassembler: type[Reassembler]
+    BackwardSlice: type[BackwardSlice]
+    BinaryOptimizer: type[BinaryOptimizer]
+    VFG: type[VFG]
+    LoopFinder: type[LoopFinder]
+    Disassembly: type[Disassembly]
+    Veritesting: type[Veritesting]
+    CodeTagging: type[CodeTagging]
+    BoyScout: type[BoyScout]
+    VariableRecoveryFast: type[VariableRecoveryFast]
+    VariableRecovery: type[VariableRecovery]
+    ReachingDefinitions: type[ReachingDefinitionsAnalysis]
+    CompleteCallingConventions: type[CompleteCallingConventionsAnalysis]
+    Clinic: type[Clinic]
+    Propagator: type[PropagatorAnalysis]
+    CallingConvention: type[CallingConventionAnalysis]
+    Decompiler: type[Decompiler]
+    XRefs: type[XRefsAnalysis]
+    SLiveness: type[SLivenessAnalysis]
+    SReachingDefinitions: type[SReachingDefinitionsAnalysis]
+
+
+class AnalysesHubWithDefault(AnalysesHub, KnownAnalysesPlugin):
+    """
+    This class has type-hinting for all built-in analyses plugin
+    """
+
+
+class AnalysisFactory[A: Analysis]:
+    def __init__(self, project: Project, analysis_cls: type[A]):
         self._project = project
         self._analysis_cls = analysis_cls
-        self.__doc__ = ''
-        self.__doc__ += analysis_cls.__doc__ or ''
-        self.__doc__ += analysis_cls.__init__.__doc__ or ''
-        self.__call__.__func__.__signature__ = Signature.from_callable(analysis_cls.__init__)
+        self.__sig: Signature | None = None  # will be computed upon first access
 
-    def prep(self,
-              fail_fast=False,
-              kb: Optional["KnowledgeBase"] = None,
-              progress_callback: Optional[Callable] = None,
-              show_progressbar: bool = False) -> Type[A]:
+    def prep(
+        self,
+        fail_fast: bool | None = None,
+        kb: KnowledgeBase | None = None,
+        progress_callback: Callable | None = None,
+        show_progressbar: bool = False,
+    ) -> type[A]:
+        if fail_fast is None:
+            fail_fast = is_testing
 
         @functools.wraps(self._analysis_cls.__init__)
+        @t.start_as_current_span(self._analysis_cls.__name__)
         def wrapper(*args, **kwargs):
+            span = telemetry.get_current_span()
+            if span.is_recording():
+                if self.__sig is None:
+                    self.__sig = Signature.from_callable(self._analysis_cls.__init__)
+                sig = self.__sig
+                bound = sig.bind(None, *args, **kwargs)
+                for name, val in chain(bound.arguments.items(), bound.arguments.get("kwargs", {}).items()):
+                    if name in ("kwargs", "self"):
+                        continue
+                    if isinstance(val, (str, bytes, bool, int, float, NoneType)):
+                        if val is None:
+                            span.set_attribute(f"arg.{name}.is_none", True)
+                        else:
+                            span.set_attribute(f"arg.{name}", val)
+                    elif isinstance(val, (list, tuple, set, frozenset)):
+                        listval = list(val)
+                        if not listval or (
+                            isinstance(listval[0], (str, bytes, bool, int, float))
+                            and all(type(sval) is type(listval[0]) for sval in listval)
+                        ):
+                            span.set_attribute(f"arg.{name}", listval)
+                    elif isinstance(val, dict):
+                        listval_keys = list(val)
+                        listval_values = list(val.values())
+                        if not listval_keys or (
+                            isinstance(listval_keys[0], (str, bytes, bool, int, float))
+                            and all(type(sval) is type(listval_keys[0]) for sval in listval_keys)
+                        ):
+                            span.set_attribute(f"arg.{name}.keys", listval_keys)
+                        if not listval_values or (
+                            isinstance(listval_values[0], (str, bytes, bool, int, float))
+                            and all(type(sval) is type(listval_values[0]) for sval in listval_values)
+                        ):
+                            span.set_attribute(f"arg.{name}.values", listval_values)
+                    else:
+                        span.set_attribute(f"arg.{name}.unrepresentable", True)
+                if self._project.filename is not None:
+                    span.set_attribute("project.binary_name", self._project.filename)
+                span.set_attribute("project.arch_name", self._project.arch.name)
+
             oself = object.__new__(self._analysis_cls)
-            oself.named_errors = {}
+            oself.named_errors = defaultdict(list)
             oself.errors = []
             oself.log = []
 
@@ -122,41 +253,22 @@ class AnalysisFactory(Generic[A]):
             oself.__init__(*args, **kwargs)
             return oself
 
-        return wrapper # type: ignore
+        return wrapper  # type: ignore
 
-    def __call__(self, *args, **kwargs):
-        fail_fast = kwargs.pop('fail_fast', False)
-        kb = kwargs.pop('kb', self._project.kb)
-        progress_callback = kwargs.pop('progress_callback', None)
-        show_progressbar = kwargs.pop('show_progressbar', False)
+    def __call__(self, *args, **kwargs) -> A:
+        fail_fast = kwargs.pop("fail_fast", is_testing)
+        kb = kwargs.pop("kb", self._project.kb)
+        progress_callback = kwargs.pop("progress_callback", None)
+        show_progressbar = kwargs.pop("show_progressbar", False)
 
-        w = self.prep(fail_fast=fail_fast,
-                  kb=kb,
-                  progress_callback=progress_callback,
-                  show_progressbar=show_progressbar)
+        w = self.prep(
+            fail_fast=fail_fast, kb=kb, progress_callback=progress_callback, show_progressbar=show_progressbar
+        )
 
         r = w(*args, **kwargs)
         # clean up so that it's always pickleable
         r._progressbar = None
         return r
-
-
-class StatusBar(progressbar.widgets.WidgetBase):
-    """
-    Implements a progressbar component for displaying raw text.
-    """
-    def __init__(self, width: Optional[int]=40):
-        super().__init__()
-        self.status: str = ""
-        self.width = width
-
-    def __call__(self, progress, data, **kwargs):  # pylint:disable=unused-argument
-        if self.width is None:
-            return self.status
-        if len(self.status) < self.width:
-            return self.status.ljust(self.width, " ")
-        else:
-            return self.status[:self.width]
 
 
 class Analysis:
@@ -171,30 +283,32 @@ class Analysis:
                                         progress.
     :ivar bool _show_progressbar: If a progressbar should be shown during the analysis. It's independent from
                                     _progress_callback.
-    :ivar progressbar.ProgressBar _progressbar: The progress bar object.
+    :ivar progress.Progress _progressbar: The progress bar object.
     """
 
-    project: "Project" = None
-    kb: 'KnowledgeBase' = None
-    _fail_fast = None
-    _name = None
-    errors = []
-    named_errors = defaultdict(list)
-    _progress_callback = None
+    project: Project
+    kb: KnowledgeBase
+    _fail_fast: bool
+    _name: str
+    errors: list[AnalysisLogEntry] = []
+    named_errors: defaultdict[str, list[AnalysisLogEntry]] = defaultdict(list)
+    _ram_usage: float | None = None
+    _last_ramusage_update: float = 0.0
+    _last_gil_release: float = 0.0
+    _progress_callback: Callable | None = None
     _show_progressbar = False
     _progressbar = None
-    _statusbar: Optional[StatusBar] = None
+    _task = None
+    log: list
 
     _PROGRESS_WIDGETS = [
-        progressbar.Percentage(),
-        ' ',
-        progressbar.Bar(),
-        ' ',
-        progressbar.Timer(),
-        ' ',
-        progressbar.ETA(),
-        ' ',
-        StatusBar(),
+        progress.TaskProgressColumn(),
+        progress.BarColumn(),
+        progress.TextColumn("Elapsed:"),
+        progress.TimeElapsedColumn(),
+        progress.TextColumn("Time:"),
+        progress.TimeRemainingColumn(),
+        progress.TextColumn("{task.description}"),
     ]
 
     @contextlib.contextmanager
@@ -204,13 +318,17 @@ class Analysis:
         except exception:  # pylint:disable=broad-except
             if self._fail_fast:
                 raise
+            error = AnalysisLogEntry("exception occurred", exc_info=True)
+            l.error(
+                "Caught and logged %s with resilience: %s",
+                error.exc_type.__name__ if error.exc_type is not None else "UnknownException",
+                error.exc_value,  # type: ignore
+                exc_info=True,
+            )
+            if name is None:
+                self.errors.append(error)
             else:
-                error = AnalysisLogEntry("exception occurred", exc_info=True)
-                l.error("Caught and logged %s with resilience: %s", error.exc_type.__name__, error.exc_value)
-                if name is None:
-                    self.errors.append(error)
-                else:
-                    self.named_errors[name].append(error)
+                self.named_errors[name].append(error)
 
     def _initialize_progressbar(self):
         """
@@ -218,8 +336,10 @@ class Analysis:
         :return: None
         """
 
-        self._progressbar = progressbar.ProgressBar(widgets=Analysis._PROGRESS_WIDGETS, max_value=10000 * 100).start()
-        self._statusbar = self._progressbar.widgets[-1]
+        self._progressbar = progress.Progress(*self._PROGRESS_WIDGETS)
+        self._task = self._progressbar.add_task(total=100, description="")
+
+        self._progressbar.start()
 
     def _update_progress(self, percentage, text=None, **kwargs):
         """
@@ -235,10 +355,12 @@ class Analysis:
             if self._progressbar is None:
                 self._initialize_progressbar()
 
-            self._progressbar.update(percentage * 10000)
+            assert self._task is not None
+            assert self._progressbar is not None
+            self._progressbar.update(self._task, completed=percentage)
 
-        if text is not None and self._statusbar is not None:
-            self._statusbar.status = text
+            if text is not None and self._progressbar:
+                self._progressbar.update(self._task, description=text)
 
         if self._progress_callback is not None:
             self._progress_callback(percentage, text=text, **kwargs)  # pylint:disable=not-callable
@@ -253,46 +375,67 @@ class Analysis:
             if self._progressbar is None:
                 self._initialize_progressbar()
             if self._progressbar is not None:
-                self._progressbar.finish()
-                # Remove the progressbar object so it will not be pickled
+                assert self._task is not None
+                self._progressbar.update(self._task, completed=100)
+                self._progressbar.stop()
                 self._progressbar = None
 
         if self._progress_callback is not None:
             self._progress_callback(100.0)  # pylint:disable=not-callable
 
-    @staticmethod
-    def _release_gil(ctr, freq, sleep_time=0.001):
+    def _release_gil(self, ctr, freq, sleep_time=0.001):
         """
         Periodically calls time.sleep() and releases the GIL so other threads (like, GUI threads) have a much better
         chance to be scheduled, and other critical components (like the GUI) can be kept responsiveness.
 
         This is, of course, a hack before we move all computational intensive tasks to pure C++ implementations.
 
+        Sleeping is throttled: regardless of how often this method is called, it sleeps at most once every
+        GIL_RELEASE_INTERVAL seconds. This keeps the GUI responsive while bounding the overhead on tight
+        analysis loops.
+
         :param int ctr:     A number provided by the caller.
-        :param int freq:    How frequently time.sleep() should be called. time.sleep() is called when ctr % freq == 0.
+        :param int freq:    How frequently the wall clock should be checked. The check happens when ctr % freq == 0.
         :param sleep_time:  Number (or fraction) of seconds to sleep.
         :return:            None
         """
 
         if ctr != 0 and ctr % freq == 0:
-            time.sleep(sleep_time)
+            now = time.perf_counter()
+            if now - self._last_gil_release >= GIL_RELEASE_INTERVAL:
+                time.sleep(sleep_time)
+                self._last_gil_release = time.perf_counter()
+
+    @property
+    def ram_usage(self) -> float:
+        """
+        Return the current RAM usage of the Python process, in bytes. The value is updated at most once per second.
+        """
+
+        if time.time() - self._last_ramusage_update > 1:
+            self._last_ramusage_update = time.time()
+            proc = psutil.Process(os.getpid())
+            meminfo = proc.memory_info()
+            self._ram_usage = meminfo.rss
+        return self._ram_usage if self._ram_usage is not None else -0.1
 
     def __getstate__(self):
         d = dict(self.__dict__)
-        if "_progressbar" in d:
-            del d['_progressbar']
-        if '_progress_callback' in d:
-            del d['_progress_callback']
-        if '_statusbar' in d:
-            del d['_statusbar']
+        d.pop("_progressbar", None)
+        d.pop("_progress_callback", None)
+        d.pop("_statusbar", None)
         return d
 
     def __setstate__(self, state):
         self.__dict__.update(state)
 
     def __repr__(self):
-        return '<%s Analysis Result at %#x>' % (self._name, id(self))
+        return f"<{self._name} Analysis Result at {id(self):#x}>"
 
 
 default_analyses = VendorPreset()
-AnalysesHub.register_preset('default', default_analyses)
+AnalysesHub.register_preset("default", default_analyses)
+
+
+def register_analysis(cls, name):
+    AnalysesHub.register_default(name, cls)

@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 import logging
 
 from angr.procedures.stubs.format_parser import ScanfFormatParser
 
 l = logging.getLogger(name=__name__)
 
+
 class scanf(ScanfFormatParser):
-    #pylint:disable=arguments-differ,unused-argument
+    # pylint:disable=arguments-differ,unused-argument
 
     def run(self, fmt):
         fmt_str = self._parse(fmt)
@@ -15,5 +18,4 @@ class scanf(ScanfFormatParser):
         if simfd is None:
             return -1
 
-        items = fmt_str.interpret(self.va_arg, simfd=simfd)
-        return items
+        return fmt_str.interpret(self.va_arg, simfd=simfd)

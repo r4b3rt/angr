@@ -1,8 +1,11 @@
-from typing import Optional
+from __future__ import annotations
+
 from sortedcontainers import SortedDict
 
-from ....errors import SimRegionMapError
-from ....state_plugins import SimStatePlugin
+from angr import claripy
+from angr.errors import SimRegionMapError
+from angr.state_plugins.plugin import SimStatePlugin
+
 
 class AddressWrapper:
     """
@@ -10,9 +13,15 @@ class AddressWrapper:
     object) that is normalized from an integer/BVV/StridedInterval.
     """
 
-    __slots__ = ('region', 'region_base_addr', 'address', 'is_on_stack', 'function_address', )
+    __slots__ = (
+        "address",
+        "function_address",
+        "is_on_stack",
+        "region",
+        "region_base_addr",
+    )
 
-    def __init__(self, region: str, region_base_addr: int, address, is_on_stack: bool, function_address: Optional[int]):
+    def __init__(self, region: str, region_base_addr: int, address, is_on_stack: bool, function_address: int | None):
         """
         Constructor for the class AddressWrapper.
 
@@ -35,7 +44,7 @@ class AddressWrapper:
         return self.region == other.region and self.address == other.address
 
     def __repr__(self):
-        return "<%s> %s" % (self.region, hex(self.address))
+        return f"<{self.region}> {hex(self.address)}"
 
     def to_valueset(self, state):
         """
@@ -44,7 +53,7 @@ class AddressWrapper:
         :param state: A state
         :return: The converted ValueSet instance
         """
-        return state.solver.VS(state.arch.bits, self.region, self.region_base_addr, self.address)
+        return claripy.VS(state.arch.bits, self.region, self.region_base_addr, self.address)
 
 
 class RegionDescriptor:
@@ -52,7 +61,11 @@ class RegionDescriptor:
     Descriptor for a memory region ID.
     """
 
-    __slots__ = ('region_id', 'base_address', 'related_function_address', )
+    __slots__ = (
+        "base_address",
+        "region_id",
+        "related_function_address",
+    )
 
     def __init__(self, region_id, base_address, related_function_address=None):
         self.region_id = region_id
@@ -60,10 +73,7 @@ class RegionDescriptor:
         self.related_function_address = related_function_address
 
     def __repr__(self):
-        return "<%s - %#x>" % (
-            self.region_id,
-            self.related_function_address if self.related_function_address is not None else 0
-        )
+        return f"<{self.region_id} - {self.related_function_address if self.related_function_address is not None else 0:#x}>"
 
 
 class RegionMap:
@@ -84,16 +94,14 @@ class RegionMap:
         # A sorted list, which maps stack addresses to region IDs
         self._address_to_region_id = SortedDict()
         # A dict, which maps region IDs to memory address ranges
-        self._region_id_to_address = { }
+        self._region_id_to_address = {}
 
     #
     # Properties
     #
 
     def __repr__(self):
-        return "RegionMap<%s>" % (
-            "S" if self.is_stack else "H"
-        )
+        return "RegionMap<%s>" % ("S" if self.is_stack else "H")
 
     @property
     def is_empty(self):
@@ -115,7 +123,7 @@ class RegionMap:
     #
 
     @SimStatePlugin.memo
-    def copy(self, memo): # pylint: disable=unused-argument
+    def copy(self, memo):  # pylint: disable=unused-argument
         r = RegionMap(is_stack=self.is_stack)
 
         # A shallow copy should be enough, since we never modify any RegionDescriptor object in-place
@@ -136,8 +144,8 @@ class RegionMap:
 
         if self.is_stack:
             # Sanity check
-            if not region_id.startswith('stack_'):
-                raise SimRegionMapError('Received a non-stack memory ID "%d" in a stack region map' % region_id)
+            if not region_id.startswith("stack_"):
+                raise SimRegionMapError(f'Received a non-stack memory ID "{region_id}" in a stack region map')
 
             # Remove all stack regions that are lower than the one to add
             while True:
@@ -159,11 +167,7 @@ class RegionMap:
                 del self._region_id_to_address[descriptor.region_id]
 
         # Add this new region mapping
-        desc = RegionDescriptor(
-            region_id,
-            absolute_address,
-            related_function_address=related_function_address
-        )
+        desc = RegionDescriptor(region_id, absolute_address, related_function_address=related_function_address)
 
         self._address_to_region_id[absolute_address] = desc
         self._region_id_to_address[region_id] = desc
@@ -189,12 +193,12 @@ class RegionMap:
                                     exist.
         """
 
-        if region_id == 'global':
+        if region_id == "global":
             # The global region always bases 0
             return relative_address
 
         if region_id not in self._region_id_to_address:
-            raise SimRegionMapError('Non-existent region ID "%s"' % region_id)
+            raise SimRegionMapError(f'Non-existent region ID "{region_id}"')
 
         base_address = self._region_id_to_address[region_id].base_address
         return base_address + relative_address
@@ -224,17 +228,17 @@ class RegionMap:
 
                 except StopIteration:
                     # Not found. It belongs to the global region then.
-                    return 'global', absolute_address, None
+                    return "global", absolute_address, None
 
             descriptor = self._address_to_region_id[base_address]
 
         else:
-            if target_region_id == 'global':
+            if target_region_id == "global":
                 # Just return the absolute address
-                return 'global', absolute_address, None
+                return "global", absolute_address, None
 
             if target_region_id not in self._region_id_to_address:
-                raise SimRegionMapError('Trying to relativize to a non-existent region "%s"' % target_region_id)
+                raise SimRegionMapError(f'Trying to relativize to a non-existent region "{target_region_id}"')
 
             descriptor = self._region_id_to_address[target_region_id]
             base_address = descriptor.base_address

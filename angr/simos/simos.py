@@ -1,23 +1,23 @@
+from __future__ import annotations
+
 import logging
 import struct
-from typing import Optional
+from typing import TYPE_CHECKING
 
-import angr # for types
-
-import claripy
 from archinfo import ArchMIPS32, ArchS390X
 
-from ..errors import (
-    AngrCallableError,
-    AngrCallableMultistateError,
-    AngrSimOSError,
-)
-from ..sim_state import SimState
-from ..state_plugins import SimSystemPosix
-from ..calling_conventions import DEFAULT_CC
-from ..procedures import SIM_PROCEDURES as P
-from .. import sim_options as o
-from ..storage.file import SimFileStream, SimFileBase
+import angr
+from angr import claripy
+from angr import sim_options as o
+from angr.calling_conventions import default_cc
+from angr.errors import AngrCallableError, AngrCallableMultistateError, AngrSimOSError
+from angr.procedures import SIM_PROCEDURES as P
+from angr.sim_state import SimState
+from angr.state_plugins.posix import SimSystemPosix
+from angr.storage.file import SimFileBase, SimFileStream
+
+if TYPE_CHECKING:
+    from angr.sim_procedure import SimProcedure
 
 
 _l = logging.getLogger(name=__name__)
@@ -28,48 +28,46 @@ class SimOS:
     A class describing OS/arch-level configuration.
     """
 
-    def __init__(self, project: 'angr.Project', name=None):
+    name: str | None
+
+    def __init__(self, project: angr.Project, name: str | None = None):
         self.arch = project.arch
         self.project = project
         self.name = name
         self.return_deadend = None
         self.unresolvable_jump_target = None
         self.unresolvable_call_target = None
+        self.function_initial_registers = None
 
     def configure_project(self):
         """
         Configure the project to set up global settings (like SimProcedures).
         """
         self.return_deadend = self.project.loader.extern_object.allocate()
-        self.project.hook(self.return_deadend, P['stubs']['CallReturn']())
+        self.project.hook(self.return_deadend, P["stubs"]["CallReturn"]())
 
         self.unresolvable_jump_target = self.project.loader.extern_object.allocate()
-        self.project.hook(self.unresolvable_jump_target, P['stubs']['UnresolvableJumpTarget']())
+        self.project.hook(self.unresolvable_jump_target, P["stubs"]["UnresolvableJumpTarget"]())
         self.unresolvable_call_target = self.project.loader.extern_object.allocate()
-        self.project.hook(self.unresolvable_call_target, P['stubs']['UnresolvableCallTarget']())
+        self.project.hook(self.unresolvable_call_target, P["stubs"]["UnresolvableCallTarget"]())
 
-        def irelative_resolver(resolver_addr):
+        def irelative_resolver(resolver_addr: int) -> int | None:
             # autohooking runs before this does, might have provided this already
             # in that case, we want to advertise the _resolver_ address, since it is now
             # providing the behavior of the actual function
             if self.project.is_hooked(resolver_addr):
                 return resolver_addr
 
-
-            base_state = self.state_blank(addr=0,
-                add_options={o.SYMBOL_FILL_UNCONSTRAINED_MEMORY, o.SYMBOL_FILL_UNCONSTRAINED_REGISTERS})
-            prototype = 'void *x(long)' if isinstance(self.arch, ArchS390X) else 'void *x(void)'
+            base_state = self.state_blank(
+                addr=0, add_options={o.SYMBOL_FILL_UNCONSTRAINED_MEMORY, o.SYMBOL_FILL_UNCONSTRAINED_REGISTERS}
+            )
+            prototype = "void *x(long)" if isinstance(self.arch, ArchS390X) else "void *x(void)"
             resolver = self.project.factory.callable(
-                resolver_addr,
-                concrete_only=True,
-                base_state=base_state,
-                prototype=prototype)
+                resolver_addr, concrete_only=True, base_state=base_state, prototype=prototype
+            )
             try:
-                if isinstance(self.arch, ArchS390X):
-                    # On s390x ifunc resolvers expect hwcaps.
-                    val = resolver(0)
-                else:
-                    val = resolver()
+                # On s390x ifunc resolvers expect hwcaps.
+                val = resolver(0) if isinstance(self.arch, ArchS390X) else resolver()
             except AngrCallableMultistateError:
                 _l.error("Resolver at %#x failed to resolve! (multivalued)", resolver_addr)
                 return None
@@ -77,25 +75,31 @@ class SimOS:
                 _l.error("Resolver at %#x failed to resolve!", resolver_addr)
                 return None
 
-            return val._model_concrete.value
+            return val.concrete_value if val is not None and val.concrete else None
 
         self.project.loader.perform_irelative_relocs(irelative_resolver)
 
     def _weak_hook_symbol(self, name, hook, scope=None):
-        if scope is None:
-            sym = self.project.loader.find_symbol(name)
-        else:
-            sym = scope.get_symbol(name)
+        sym = self.project.loader.find_symbol(name) if scope is None else scope.get_symbol(name)
 
         if sym is not None:
             addr, _ = self.prepare_function_symbol(name, basic_addr=sym.rebased_addr)
-            if self.project.is_hooked(addr):
-                if not self.project.hooked_by(addr).is_stub:
-                    return
+            if self.project.is_hooked(addr) and not self.project.hooked_by(addr).is_stub:  # type: ignore
+                return
             self.project.hook(addr, hook)
 
-    def state_blank(self, addr=None, initial_prefix=None, brk=None, stack_end=None, stack_size=1024*1024*8, stdin=None,
-                    thread_idx=None, permissions_backer=None, **kwargs):
+    def state_blank(
+        self,
+        addr=None,
+        initial_prefix=None,
+        brk=None,
+        stack_end=None,
+        stack_size=1024 * 1024 * 8,
+        stdin=None,
+        thread_idx=None,
+        permissions_backer=None,
+        **kwargs,
+    ):
         """
         Initialize a blank state.
 
@@ -111,22 +115,22 @@ class SimOS:
         Any additional arguments will be passed to the SimState constructor
         """
         # TODO: move ALL of this into the SimState constructor
-        if kwargs.get('mode', None) is None:
-            kwargs['mode'] = self.project._default_analysis_mode
+        if kwargs.get("mode") is None:
+            kwargs["mode"] = self.project._default_analysis_mode
         if permissions_backer is not None:
-            kwargs['permissions_map'] = permissions_backer[1]
-            kwargs['default_permissions'] = 7 if permissions_backer[0] else 3
-        if kwargs.get('cle_memory_backer', None) is None:
-            kwargs['cle_memory_backer'] = self.project.loader
-        if kwargs.get('os_name', None) is None:
-            kwargs['os_name'] = self.name
+            kwargs["permissions_map"] = permissions_backer[1]
+            kwargs["default_permissions"] = 7 if permissions_backer[0] else 3
+        if kwargs.get("cle_memory_backer") is None:
+            kwargs["cle_memory_backer"] = self.project.loader
+        if kwargs.get("os_name") is None:
+            kwargs["os_name"] = self.name
         actual_stack_end = stack_end
         if stack_end is None:
             stack_end = self.arch.initial_sp
 
-        if kwargs.get('permissions_map', None) is None:
+        if kwargs.get("permissions_map") is None:
             # just a dict of address ranges to permission bits
-            permission_map = { }
+            permission_map = {}
             for obj in self.project.loader.all_objects:
                 for seg in obj.segments:
                     perms = 0
@@ -138,40 +142,41 @@ class SimOS:
                     if seg.is_executable:
                         perms |= 4  # PROT_EXEC
                     permission_map[(seg.min_addr, seg.max_addr)] = perms
-            kwargs['permissions_map'] = permission_map
-        if self.project.loader.main_object.execstack:
-            stack_perms = 1 | 2 | 4  # RWX
-        else:
-            stack_perms = 1 | 2  # RW
+            kwargs["permissions_map"] = permission_map
+        # RWX or RW
+        stack_perms = 1 | 2 | 4 if self.project.loader.main_object.execstack else 1 | 2
 
         state = SimState(self.project, stack_end=stack_end, stack_size=stack_size, stack_perms=stack_perms, **kwargs)
 
         if stdin is not None and not isinstance(stdin, SimFileBase):
-            if type(stdin) is type:
-                stdin = stdin(name='stdin', has_end=False)
+            if isinstance(stdin, type):
+                stdin = stdin(name="stdin", has_end=False)
             else:
-                if isinstance(stdin, claripy.Bits):
+                if isinstance(stdin, claripy.ast.Bits):
                     num_bytes = len(stdin) // self.project.arch.byte_width
                 else:
                     num_bytes = len(stdin)
-                _l.warning("stdin is constrained to %d bytes (has_end=True). If you are only providing the first "
-                           "%d bytes instead of the entire stdin, please use "
-                           "stdin=SimFileStream(name='stdin', content=your_first_n_bytes, has_end=False).",
-                           num_bytes, num_bytes)
-                stdin = SimFileStream(name='stdin', content=stdin, has_end=True)
+                _l.warning(
+                    "stdin is constrained to %d bytes (has_end=True). If you are only providing the first "
+                    "%d bytes instead of the entire stdin, please use "
+                    "stdin=SimFileStream(name='stdin', content=your_first_n_bytes, has_end=False).",
+                    num_bytes,
+                    num_bytes,
+                )
+                stdin = SimFileStream(name="stdin", content=stdin, has_end=True)
 
         last_addr = self.project.loader.main_object.max_addr
         actual_brk = (last_addr - last_addr % 0x1000 + 0x1000) if brk is None else brk
-        state.register_plugin('posix', SimSystemPosix(stdin=stdin, brk=actual_brk))
+        state.register_plugin("posix", SimSystemPosix(stdin=stdin, brk=actual_brk))
 
         if initial_prefix is not None:
             for reg in state.arch.default_symbolic_registers:
-                state.registers.store(reg, state.solver.BVS(
-                    initial_prefix + "_" + reg,
-                    state.arch.bits,
-                    explicit_name=True,
-                    key=('reg', reg),
-                    eternal=True))
+                state.registers.store(
+                    reg,
+                    state.solver.BVS(
+                        initial_prefix + "_" + reg, state.arch.bits, explicit_name=True, key=("reg", reg), eternal=True
+                    ),
+                )
 
         if state.arch.sp_offset is not None:
             state.regs.sp = stack_end
@@ -183,18 +188,18 @@ class SimOS:
                 if isinstance(mem_region, tuple):
                     # unpack it
                     mem_region, region_base = mem_region
-                elif mem_region == 'global':
+                elif mem_region == "global":
                     # Backward compatibility
                     region_base = 0
                 else:
-                    raise AngrSimOSError('You must specify the base address for memory region "%s". ' % mem_region)
+                    raise AngrSimOSError(f'You must specify the base address for memory region "{mem_region}". ')
 
             # special case for stack_end overriding sp default
             if actual_stack_end is not None and state.arch.registers[reg][0] == state.arch.sp_offset:
                 continue
 
             if o.ABSTRACT_MEMORY in state.options and is_addr:
-                address = claripy.ValueSet(state.arch.bits, mem_region, region_base, val)
+                address = claripy.VS(state.arch.bits, mem_region, region_base, val)
                 state.registers.store(reg, address)
             else:
                 state.registers.store(reg, val)
@@ -204,26 +209,25 @@ class SimOS:
 
         thread_name = self.project.loader.main_object.threads[thread_idx] if thread_idx is not None else None
         for reg, val in self.project.loader.main_object.thread_registers(thread_name).items():
-            if reg in ('fs', 'gs', 'cs', 'ds', 'es', 'ss') and state.arch.name == 'X86':
+            if reg in ("fs", "gs", "cs", "ds", "es", "ss") and state.arch.name == "X86":
                 state.registers.store(reg, val >> 16)  # oh boy big hack
-            elif reg in state.arch.registers or reg in ('flags', 'eflags', 'rflags'):
+            elif reg in state.arch.registers or reg in ("flags", "eflags", "rflags"):
                 state.registers.store(reg, val)
-            elif reg == 'fctrl':
+            elif reg == "fctrl":
                 state.regs.fpround = (val & 0xC00) >> 10
-            elif reg == 'fstat':
-                state.regs.fc3210 = (val & 0x4700)
-            elif reg == 'ftag':
+            elif reg == "fstat":
+                state.regs.fc3210 = val & 0x4700
+            elif reg == "ftag":
                 empty_bools = [((val >> (x * 2)) & 3) == 3 for x in range(8)]
                 tag_chars = [claripy.BVV(0 if x else 1, 8) for x in empty_bools]
                 for i, tag in enumerate(tag_chars):
-                    setattr(state.regs, 'fpu_t%d' % i, tag)
-            elif reg in ('fiseg', 'fioff', 'foseg', 'fooff', 'fop'):
+                    setattr(state.regs, f"fpu_t{i}", tag)
+            elif reg in ("fiseg", "fioff", "foseg", "fooff", "fop"):
                 pass
-            elif reg == 'mxcsr':
+            elif reg == "mxcsr":
                 state.regs.sseround = (val & 0x600) >> 9
             else:
                 _l.error("What is this register %s I have to translate?", reg)
-
 
         if addr is not None:
             state.regs.ip = addr
@@ -232,7 +236,7 @@ class SimOS:
         state.scratch.ins_addr = addr
         state.scratch.bbl_addr = addr
         state.scratch.stmt_idx = 0
-        state.history.jumpkind = 'Ijk_Boring'
+        state.history.jumpkind = "Ijk_Boring"
 
         return state
 
@@ -243,32 +247,35 @@ class SimOS:
         return self.state_entry(**kwargs)
 
     def state_call(self, addr, *args, **kwargs):
-        cc = kwargs.pop('cc', DEFAULT_CC[self.arch.name](self.project.arch))
-        state = kwargs.pop('base_state', None)
-        toc = kwargs.pop('toc', None)
+        cc = kwargs.pop("cc", default_cc(self.arch.name, platform=self.name)(self.project.arch))  # type: ignore
+        state = kwargs.pop("base_state", None)
+        toc = kwargs.pop("toc", None)
 
-        ret_addr = kwargs.pop('ret_addr', self.return_deadend)
-        stack_base = kwargs.pop('stack_base', None)
-        alloc_base = kwargs.pop('alloc_base', None)
-        grow_like_stack = kwargs.pop('grow_like_stack', True)
-        prototype = angr.calling_conventions.SimCC.guess_prototype(args, kwargs.pop('prototype', None)).with_arch(self.arch)
+        ret_addr = kwargs.pop("ret_addr", self.return_deadend)
+        stack_base = kwargs.pop("stack_base", None)
+        alloc_base = kwargs.pop("alloc_base", None)
+        grow_like_stack = kwargs.pop("grow_like_stack", True)
+        prototype = angr.calling_conventions.SimCC.guess_prototype(args, kwargs.pop("prototype", None)).with_arch(
+            self.arch
+        )
 
         if state is None:
             if stack_base is not None:
-                kwargs['stack_end'] = (stack_base + 0x1000) & ~0xfff
+                kwargs["stack_end"] = (stack_base + 0x1000) & ~0xFFF
             state = self.state_blank(addr=addr, **kwargs)
         else:
             state = state.copy()
             state.regs.ip = addr
         cc.setup_callsite(state, ret_addr, args, prototype, stack_base, alloc_base, grow_like_stack)
 
-        if state.arch.name == 'PPC64' and toc is not None:
+        if state.arch.name == "PPC64" and toc is not None:
             state.regs.r2 = toc
+        elif state.arch.name in ("MIPS32", "MIPS64", "MIPSN32"):
+            state.regs.t9 = addr
 
         return state
 
-    def prepare_call_state(self, calling_state, initial_state=None,
-                           preserve_registers=(), preserve_memory=()):
+    def prepare_call_state(self, calling_state, initial_state=None, preserve_registers=(), preserve_memory=()):
         """
         This function prepares a state that is executing a call instruction.
         If given an initial_state, it copies over all of the critical registers to it from the
@@ -282,8 +289,8 @@ class SimOS:
         if isinstance(self.arch, ArchMIPS32):
             if initial_state is not None:
                 initial_state = self.state_blank()
-            mips_caller_saves = ('s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 'gp', 'sp', 'bp', 'ra')
-            preserve_registers = preserve_registers + mips_caller_saves + ('t9',)
+            mips_caller_saves = ("s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "gp", "sp", "bp", "ra")
+            preserve_registers = preserve_registers + mips_caller_saves + ("t9",)
 
         if initial_state is None:
             new_state = calling_state.copy()
@@ -307,7 +314,7 @@ class SimOS:
             basic_addr = self.project.loader.extern_object.get_pseudo_addr(symbol_name)
         return basic_addr, basic_addr
 
-    def handle_exception(self, successors, engine, exception): # pylint: disable=no-self-use,unused-argument
+    def handle_exception(self, successors, engine, exception):  # pylint: disable=no-self-use,unused-argument
         """
         Perform exception handling. This method will be called when, during execution, a SimException is thrown.
         Currently, this can only indicate a segfault, but in the future it could indicate any unexpected exceptional
@@ -317,30 +324,29 @@ class SimOS:
 
         :param successors:      The SimSuccessors object currently being executed on
         :param engine:          The engine that was processing this step
-        :param exc_type:        The value of sys.exc_info()[0] from the error, the type of the exception that was raised
-        :param exc_value:       The value of sys.exc_info()[1] from the error, the actual exception object
-        :param exc_traceback:   The value of sys.exc_info()[2] from the error, the traceback from the exception
+        :param exception:       The actual exception object
         """
         raise exception
+
     # Dummy stuff to allow this API to be used freely
 
     # pylint: disable=unused-argument, no-self-use
-    def syscall(self, state, allow_unsupported=True):
+    def syscall(self, state: SimState, allow_unsupported: bool = True) -> SimProcedure | None:
         return None
 
-    def syscall_abi(self, state) -> str:
+    def syscall_abi(self, state: SimState) -> str | None:
         return None
 
-    def syscall_cc(self, state) -> Optional[angr.calling_conventions.SimCCSyscall]:
-        raise NotImplementedError()
+    def syscall_cc(self, state: SimState) -> angr.calling_conventions.SimCCSyscall | None:
+        raise NotImplementedError
 
-    def is_syscall_addr(self, addr):
+    def is_syscall_addr(self, addr) -> bool:
         return False
 
-    def syscall_from_addr(self, addr, allow_unsupported=True):
+    def syscall_from_addr(self, addr, allow_unsupported=True) -> SimProcedure | None:
         return None
 
-    def syscall_from_number(self, number, allow_unsupported=True, abi=None):
+    def syscall_from_number(self, number, allow_unsupported=True, abi=None) -> SimProcedure | None:
         return None
 
     def setup_gdt(self, state, gdt):
@@ -351,7 +357,7 @@ class SimOS:
         :param gdt: GlobalDescriptorTable object
         :return:
         """
-        state.memory.store(gdt.addr+8, gdt.table)
+        state.memory.store(gdt.addr + 8, gdt.table)
         state.regs.gdt = gdt.gdt
         state.regs.cs = gdt.cs
         state.regs.ds = gdt.ds
@@ -381,18 +387,19 @@ class SimOS:
         GDT_ADDR = 0x4000
         GDT_LIMIT = 0x1000
 
-        normal_entry = self._create_gdt_entry(0, 0xFFFFFFFF,
-                                             A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0 | A_DIR_CON_BIT,
-                                             F_PROT_32)
-        stack_entry = self._create_gdt_entry(0, 0xFFFFFFFF, A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0,
-                                            F_PROT_32)
-        fs_entry = self._create_gdt_entry(fs, fs_size,
-                                         A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0 | A_DIR_CON_BIT, F_PROT_32)
-        gs_entry = self._create_gdt_entry(gs, gs_size,
-                                         A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0 | A_DIR_CON_BIT, F_PROT_32)
+        normal_entry = self._create_gdt_entry(
+            0, 0xFFFFFFFF, A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0 | A_DIR_CON_BIT, F_PROT_32
+        )
+        stack_entry = self._create_gdt_entry(0, 0xFFFFFFFF, A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0, F_PROT_32)
+        fs_entry = self._create_gdt_entry(
+            fs, fs_size, A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0 | A_DIR_CON_BIT, F_PROT_32
+        )
+        gs_entry = self._create_gdt_entry(
+            gs, gs_size, A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0 | A_DIR_CON_BIT, F_PROT_32
+        )
 
         table = normal_entry + stack_entry + fs_entry + gs_entry
-        gdt =  (GDT_ADDR << 16 | GDT_LIMIT)
+        gdt = GDT_ADDR << 16 | GDT_LIMIT
         selector = self._create_selector(1, S_GDT | S_PRIV_0)
         cs = selector
         ds = selector
@@ -403,8 +410,7 @@ class SimOS:
         fs = selector
         selector = self._create_selector(4, S_GDT | S_PRIV_0)
         gs = selector
-        global_descriptor_table = GlobalDescriptorTable(GDT_ADDR, GDT_LIMIT, table, gdt, cs, ds, es, ss, fs, gs)
-        return global_descriptor_table
+        return GlobalDescriptorTable(GDT_ADDR, GDT_LIMIT, table, gdt, cs, ds, es, ss, fs, gs)
 
     @staticmethod
     def _create_selector(idx, flags):
@@ -414,16 +420,18 @@ class SimOS:
 
     @staticmethod
     def _create_gdt_entry(base, limit, access, flags):
-        to_ret = limit & 0xffff
-        to_ret |= (base & 0xffffff) << 16
-        to_ret |= (access & 0xff) << 40
-        to_ret |= ((limit >> 16) & 0xf) << 48
-        to_ret |= (flags & 0xff) << 52
-        to_ret |= ((base >> 24) & 0xff) << 56
-        return struct.pack('<Q', to_ret)
+        to_ret = limit & 0xFFFF
+        to_ret |= (base & 0xFFFFFF) << 16
+        to_ret |= (access & 0xFF) << 40
+        to_ret |= ((limit >> 16) & 0xF) << 48
+        to_ret |= (flags & 0xFF) << 52
+        to_ret |= ((base >> 24) & 0xFF) << 56
+        return struct.pack("<Q", to_ret)
 
 
 class GlobalDescriptorTable:
+    """GlobalDescriptorTable object to store the GDT table and the segment registers values"""
+
     def __init__(self, addr, limit, table, gdt_sel, cs_sel, ds_sel, es_sel, ss_sel, fs_sel, gs_sel):
         self.addr = addr
         self.limit = limit

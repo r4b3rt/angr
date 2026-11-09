@@ -1,29 +1,25 @@
+from __future__ import annotations
+
 import angr
 
-######################################
-# stub, for unsupported syscalls
-######################################
 
-#pylint:disable=redefined-builtin,arguments-differ
+# pylint:disable=redefined-builtin,arguments-differ
 class syscall(angr.SimProcedure):
-
     def run(self, *args, resolves=None):
-
         self.resolves = resolves  # pylint:disable=attribute-defined-outside-init
 
         if self.successors is not None:
-            self.successors.artifacts['resolves'] = resolves
+            self.successors.artifacts["resolves"] = resolves
 
         # code duplicated from ReturnUnconstrained
         size = self.prototype.returnty.size
-        # ummmmm do we really want to rely on this behavior?
-        if size is NotImplemented:
+        if size is None:
             return None
-        else:
-            return self.state.solver.Unconstrained("syscall_stub_%s" % self.display_name, size, key=('syscall', '?', self.display_name))
+        return self.state.solver.Unconstrained(
+            f"syscall_stub_{self.display_name}", size, key=("syscall", "?", self.display_name)
+        )
 
     def __repr__(self):
-        if 'resolves' in self.kwargs:
-            return '<Syscall stub (%s)>' % self.kwargs['resolves']
-        else:
-            return '<Syscall stub>'
+        if "resolves" in self.kwargs:
+            return "<Syscall stub ({})>".format(self.kwargs["resolves"])
+        return "<Syscall stub>"

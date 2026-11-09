@@ -1,9 +1,10 @@
+from __future__ import annotations
 
 import logging
 
 from .base import SimSootStmt
 
-l = logging.getLogger('angr.engines.soot.statements.identity')
+l = logging.getLogger("angr.engines.soot.statements.identity")
 
 
 class SimSootStmt_Identity(SimSootStmt):

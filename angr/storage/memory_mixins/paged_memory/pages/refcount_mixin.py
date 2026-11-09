@@ -1,11 +1,14 @@
-from angr.storage.memory_mixins import MemoryMixin
+from __future__ import annotations
+
 from angr.misc import PicklableLock
+from angr.storage.memory_mixins.memory_mixin import MemoryMixin
 
 
 class RefcountMixin(MemoryMixin):
     """
     This mixin adds a locked reference counter and methods to manipulate it, to facilitate copy-on-write optimizations.
     """
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._init()
@@ -28,9 +31,10 @@ class RefcountMixin(MemoryMixin):
         with self.lock:
             if self.refcount == 1:
                 return self
-            else:
-                self.refcount -= 1
-        return self.copy({})  # TODO: evaluate if it's worth making the lock a reentrant lock (RLock) so this can go in the else arm
+            self.refcount -= 1
+        return self.copy(
+            {}
+        )  # TODO: evaluate if it's worth making the lock a reentrant lock (RLock) so this can go in the else arm
 
     def acquire_shared(self) -> None:
         """
@@ -46,4 +50,3 @@ class RefcountMixin(MemoryMixin):
         """
         with self.lock:
             self.refcount -= 1
-

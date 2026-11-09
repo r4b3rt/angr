@@ -1,10 +1,17 @@
+from __future__ import annotations
+
 import logging
 
-from ..sim_procedure import SimProcedure
+from angr.sim_procedure import SimProcedure
 
 l = logging.getLogger(name=__name__)
 
-class DataGraphMeta(object):
+
+class DataGraphError(Exception):
+    pass
+
+
+class DataGraphMeta:
     def __init__(self):
         self._p = None
 
@@ -22,7 +29,7 @@ class DataGraphMeta(object):
         for n in self._vfg._nodes.values():
             if n.addr == addr:
                 return n
-        raise DataGraphError("No VFG node at 0x%x" % addr)
+        raise DataGraphError(f"No VFG node at 0x{addr:x}")
 
     def get_irsb_at(self, addr):
         n = self._vfg_node(addr)
@@ -38,16 +45,14 @@ class DataGraphMeta(object):
         """
         for e in self.graph.edges():
             data = dict(self.graph.get_edge_data(e[0], e[1]))
-            data['label'] = str(data['label']) + " ; " +  self._simproc_info(e[0]) + self._simproc_info(e[1])
+            data["label"] = str(data["label"]) + " ; " + self._simproc_info(e[0]) + self._simproc_info(e[1])
             self._print_edge(e, data, imarks)
 
     def _print_edge(self, e, data, imarks=False):
         pp = []
         for stmt in e:
-            if imarks is False or stmt[1] == -1: # SimProcedure
-                s = "(0x%x, %d)" % (stmt[0], stmt[1])
-            else:
-                s = "[0x%x]" % self._imarks[stmt]
+            # true case is a SimProcedure
+            s = f"(0x{stmt[0]:x}, {stmt[1]})" if imarks is False or stmt[1] == -1 else f"[0x{self._imarks[stmt]:x}]"
             pp.append(s)
 
         print(pp[0] + " -> " + pp[1] + " : " + str(data))
@@ -67,19 +72,19 @@ class DataGraphMeta(object):
         if isinstance(irsb, SimProcedure):
             self._simproc_map[irsb.addr] = repr(irsb)
 
-        l.debug("--> Branch: running block 0x%x" % irsb.addr)
+        l.debug(f"--> Branch: running block 0x{irsb.addr:x}")
         block = self._make_block(irsb, live_defs)
         self._imarks.update(block._imarks)
-        if block.stop == True:
-            #l.debug(" ### Stopping at block 0x%x" % (irsb.addr))
-            l.debug(" ### End of path %s" % path)
+        if block.stop is True:
+            # l.debug(" ### Stopping at block 0x%x" % (irsb.addr))
+            l.debug(f" ### End of path {path}")
             return irsb.addr
         succ = self._vfg._graph.successors(node)
 
         defer = []
         for s in succ:
             # Consider fake returns last
-            if self._vfg._graph.edge[node][s]['jumpkind'] == 'Ijk_FakeRet':
+            if self._vfg._graph.edge[node][s]["jumpkind"] == "Ijk_FakeRet":
                 defer.append(s)
                 continue
             # We need to make a copy of the dict !
@@ -90,6 +95,7 @@ class DataGraphMeta(object):
             # return.
             for s in defer:
                 self._branch(dict(block.live_defs), s, path)
+        return None
 
     def _make_block(self, vfg_node, live_defs):
         raise DataGraphError("Not Implemented")

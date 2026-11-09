@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import angr
 
-#pylint:disable=arguments-differ
+# pylint:disable=arguments-differ
+
 
 class getpid(angr.SimProcedure):
     def run(self):

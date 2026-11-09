@@ -1,7 +1,9 @@
+from __future__ import annotations
 
 import logging
 
-from ..sim_state import SimState
+from angr.sim_state import SimState
+
 from .plugin import SimStatePlugin
 
 l = logging.getLogger("angr.state_plugins.jni_references")
@@ -14,9 +16,9 @@ class SimStateJNIReferences(SimStatePlugin):
     """
 
     def __init__(self, local_refs=None, global_refs=None):
-        super(SimStateJNIReferences, self).__init__()
-        self.local_refs = local_refs if local_refs else {}
-        self.global_refs = global_refs if global_refs else {}
+        super().__init__()
+        self.local_refs = local_refs or {}
+        self.global_refs = global_refs or {}
 
     def lookup(self, opaque_ref):
         """
@@ -29,8 +31,11 @@ class SimStateJNIReferences(SimStatePlugin):
         # check global refs
         if opaque_ref_value in self.global_refs:
             return self.global_refs[opaque_ref_value]
-        raise KeyError("Unknown JNI reference %d. Local references: %s Global references: %s"
-                       % (opaque_ref_value, self.local_refs, self.global_refs))
+        raise KeyError(
+            f"Unknown JNI reference {opaque_ref_value}. "
+            f"Local references: {self.local_refs} "
+            f"Global references: {self.global_refs}"
+        )
 
     def create_new_reference(self, obj, global_ref=False):
         """
@@ -71,22 +76,14 @@ class SimStateJNIReferences(SimStatePlugin):
 
     def _get_reference_value(self, opaque_ref):
         if self.state.solver.symbolic(opaque_ref):
-            raise NotImplementedError("Opaque reference %s is symbolic." % opaque_ref.to_claripy())
+            raise NotImplementedError(f"Opaque reference {opaque_ref.to_claripy()} is symbolic.")
         return self.state.solver.eval(opaque_ref)
 
     @SimStatePlugin.memo
-    def copy(self, memo): # pylint: disable=unused-argument
-        return SimStateJNIReferences(local_refs=self.local_refs,
-                                     global_refs=self.global_refs)
+    def copy(self, memo):  # pylint: disable=unused-argument
+        return SimStateJNIReferences(local_refs=self.local_refs, global_refs=self.global_refs)
 
-    def merge(self, others, merge_conditions, common_ancestor=None): # pylint: disable=unused-argument
-        l.warning("Merging is not implemented for JNI references!")
-        return False
-
-    def widen(self, others): # pylint: disable=unused-argument
-        l.warning("Widening is not implemented for JNI references!")
-        return False
 
 # TODO use a default JavaVM preset
 #      see for reference: angr/engines/__init__.py
-SimState.register_default('jni_references', SimStateJNIReferences)
+SimState.register_default("jni_references", SimStateJNIReferences)

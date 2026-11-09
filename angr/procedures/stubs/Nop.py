@@ -1,8 +1,6 @@
-import angr
+from __future__ import annotations
 
-######################################
-# Doing nothing
-######################################
+import angr
 
 
 class Nop(angr.SimProcedure):

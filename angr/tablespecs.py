@@ -1,6 +1,9 @@
-import claripy
+from __future__ import annotations
 
-class StringTableSpec(object):
+from angr import claripy
+
+
+class StringTableSpec:
     def __init__(self, byte_width=8):
         self._contents = []
         self._str_len = 0
@@ -33,7 +36,7 @@ class StringTableSpec(object):
                 else:
                     raise TypeError("Value in env must be either string or bitvector")
 
-                self.add_string(k.concat(claripy.BVV(b'='), v))
+                self.add_string(k.concat(claripy.BVV(b"="), v))
         else:
             for v in env:
                 self.add_string(v)
@@ -45,23 +48,23 @@ class StringTableSpec(object):
             string = string.encode()
 
         if type(string) is bytes:
-            self._contents.append(('string', claripy.BVV(string+b'\0')))
+            self._contents.append(("string", claripy.BVV(string + b"\0")))
             self._str_len += len(string) + 1
         elif isinstance(string, claripy.ast.Bits):
-            self._contents.append(('string', string.concat(claripy.BVV(0, self._byte_width))))
+            self._contents.append(("string", string.concat(claripy.BVV(0, self._byte_width))))
             self._str_len += len(string) // self._byte_width + 1
         else:
-            raise ValueError('String must be either string literal or claripy AST')
+            raise ValueError("String must be either string literal or claripy AST")
 
     def add_pointer(self, pointer):
-        self._contents.append(('pointer', pointer))
+        self._contents.append(("pointer", pointer))
 
     def add_null(self):
         self.add_pointer(0)
 
     def dump(self, state, end_addr, align=0x10):
         if isinstance(end_addr, int):
-            end_addr = state.solver.BVV(end_addr, state.arch.bits)
+            end_addr = claripy.BVV(end_addr, state.arch.bits)
         ptr_size = len(self._contents) * state.arch.bytes
         size = self._str_len + ptr_size
         start_addr = end_addr - size
@@ -72,18 +75,18 @@ class StringTableSpec(object):
         ptr_i = start_addr
         str_i = start_str
         for itemtype, item in self._contents:
-            if itemtype == 'string':
+            if itemtype == "string":
                 state.memory.store(ptr_i, str_i, endness=state.arch.memory_endness)
                 state.memory.store(str_i, item)
                 ptr_i += state.arch.bytes
-                str_i += len(item)//self._byte_width
+                str_i += len(item) // self._byte_width
             else:
                 if isinstance(item, int):
-                    item = state.solver.BVV(item, state.arch.bits)
+                    item = claripy.BVV(item, state.arch.bits)
                 state.memory.store(ptr_i, item, endness=state.arch.memory_endness)
                 ptr_i += state.arch.bytes
 
         if zero_fill != 0:
-            state.memory.store(end_addr - zero_fill, state.solver.BVV(0, self._byte_width*zero_fill))
+            state.memory.store(end_addr - zero_fill, claripy.BVV(0, self._byte_width * zero_fill))
 
         return start_addr

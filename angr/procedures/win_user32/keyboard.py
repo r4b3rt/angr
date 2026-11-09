@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import angr
+
 
 class GetKeyboardType(angr.SimProcedure):
     def run(self, param):

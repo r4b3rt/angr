@@ -1,10 +1,12 @@
+from __future__ import annotations
 
 import logging
 
 from archinfo import ArchSoot
 
+from angr.engines.soot.values.thisref import SimSootValue_ThisRef
+
 from .base import SimSootExpr
-from ..values.thisref import SimSootValue_ThisRef
 
 l = logging.getLogger("angr.engines.soot.expressions.cast")
 
@@ -17,9 +19,6 @@ class SimSootExpr_Cast(SimSootExpr):
         # cast value
         if self.expr.cast_type in ArchSoot.primitive_types:
             javavm_simos = self.state.project.simos
-            self.expr = javavm_simos.cast_primitive(self.state,
-                                                    value_uncasted,
-                                                    to_type=self.expr.cast_type)
+            self.expr = javavm_simos.cast_primitive(self.state, value_uncasted, to_type=self.expr.cast_type)
         else:
-            self.expr = SimSootValue_ThisRef(heap_alloc_id=value_uncasted.heap_alloc_id,
-                                             type_=self.expr.cast_type)
+            self.expr = SimSootValue_ThisRef(heap_alloc_id=value_uncasted.heap_alloc_id, type_=self.expr.cast_type)

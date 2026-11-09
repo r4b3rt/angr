@@ -1,18 +1,23 @@
+from __future__ import annotations
 
-from ...sim_type import SimTypeFunction, SimTypePointer, SimTypeChar, SimTypeBottom
-from .. import SIM_PROCEDURES as P
+from angr.procedures.procedure_dict import SIM_PROCEDURES as P
+from angr.sim_type import SimTypeBottom, SimTypeChar, SimTypeFunction, SimTypePointer
+
 from . import SimCppLibrary
-
 
 libstdcpp = SimCppLibrary()
 
-libstdcpp.set_library_names('libstdc++.so', 'libstdc++.so.6')
+libstdcpp.set_library_names("libstdc++.so", "libstdc++.so.6")
 libstdcpp.add_all_from_dict(P["libstdcpp"])
 
 
 _decls = {
-    "std::__throw_logic_error(char const*)": SimTypeFunction([SimTypePointer(SimTypeChar())], SimTypeBottom(label="void"), arg_names=("error",)),
-    "std::__throw_length_error(char const*)": SimTypeFunction([SimTypePointer(SimTypeChar())], SimTypeBottom(label="void"), arg_names=("error",)),
+    "std::__throw_logic_error(char const*)": SimTypeFunction(
+        [SimTypePointer(SimTypeChar())], SimTypeBottom(label="void"), arg_names=("error",)
+    ),
+    "std::__throw_length_error(char const*)": SimTypeFunction(
+        [SimTypePointer(SimTypeChar())], SimTypeBottom(label="void"), arg_names=("error",)
+    ),
 }
 
 

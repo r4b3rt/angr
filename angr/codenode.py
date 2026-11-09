@@ -1,22 +1,41 @@
+from __future__ import annotations
+
 import logging
+import weakref
+from typing import TYPE_CHECKING
+
+from archinfo.arch_soot import SootMethodDescriptor
+
+import angr
+from angr.errors import SimMemoryError
+
+if TYPE_CHECKING:
+    from angr.knowledge_plugins.functions import Function
+
+    from . import SimProcedure
+
 l = logging.getLogger(name=__name__)
 
 
-def repr_addr(addr):
+def repr_addr[K: (int, SootMethodDescriptor)](addr: K) -> str:
     if isinstance(addr, int):
         return hex(addr)
     return repr(addr)
 
 
-class CodeNode:
+class CodeNode[K: (int, SootMethodDescriptor)]:
+    """
+    The base class of nodes in a function graph.
+    """
 
-    __slots__ = ['addr', 'size', '_graph', 'thumb', '_hash']
+    __slots__ = ["_hash", "_owner", "addr", "size", "thumb"]
 
-    def __init__(self, addr, size, graph=None, thumb=False):
+    def __init__(self, addr: K, size: int, thumb=False):
         self.addr = addr
-        self.size = size
+        self.size: int = size
         self.thumb = thumb
-        self._graph = graph
+        # A weak reference to the Function that this node belongs to
+        self._owner: weakref.ref[Function] | None = None
 
         self._hash = None
 
@@ -24,13 +43,15 @@ class CodeNode:
         return self.size
 
     def __eq__(self, other):
-        if type(other) is Block:  # pylint: disable=unidiomatic-typecheck
+        if isinstance(other, angr.Block):
             raise TypeError("You do not want to be comparing a CodeNode to a Block")
-        return type(self) is type(other) and \
-            self.addr == other.addr and \
-            self.size == other.size and \
-            self.is_hook == other.is_hook and \
-            self.thumb == other.thumb
+        return (
+            type(self) is type(other)
+            and self.addr == other.addr
+            and self.size == other.size
+            and self.is_hook == other.is_hook
+            and self.thumb == other.thumb
+        )
 
     def __ne__(self, other):
         return not self == other
@@ -43,95 +64,233 @@ class CodeNode:
             self._hash = hash((self.addr, self.size))
         return self._hash
 
-    def successors(self):
-        if self._graph is None:
-            raise ValueError("Cannot calculate successors for graphless node")
-        return list(self._graph.successors(self))
+    def set_owner(self, func) -> None:
+        self._owner = weakref.ref(func)
 
-    def predecessors(self):
-        if self._graph is None:
-            raise ValueError("Cannot calculate predecessors for graphless node")
-        return list(self._graph.predecessors(self))
+    @property
+    def owner(self) -> Function | None:
+        """
+        The Function this node belongs to, or None if it was never registered with one or that Function is gone.
+        """
+        return None if self._owner is None else self._owner()
 
-    def __getstate__(self):
-        return (self.addr, self.size)
+    def _require_owner(self) -> Function:
+        owner = self.owner
+        if owner is None:
+            raise ValueError(f"Cannot calculate successors or predecessors of {self!r}: it belongs to no function")
+        return owner
 
-    def __setstate__(self, dat):
+    def successors(self) -> list[CodeNode]:
+        return self._require_owner()._successors_of(self)  # pylint:disable=protected-access
+
+    def predecessors(self) -> list[CodeNode]:
+        return self._require_owner()._predecessors_of(self)  # pylint:disable=protected-access
+
+    def __getstate__(self) -> tuple:
+        return self.addr, self.size
+
+    def __setstate__(self, dat: tuple):
         self.__init__(*dat)
 
     is_hook = None
 
 
-class BlockNode(CodeNode):
+class BlockNode[K: (int, SootMethodDescriptor)](CodeNode[K]):
+    """
+    Represents a block of code in a function graph.
+    """
 
-    __slots__ = ['bytestr']
+    __slots__ = ["_bytestr", "delta"]
 
     is_hook = False
-    def __init__(self, addr, size, bytestr=None, **kwargs):
-        super(BlockNode, self).__init__(addr, size, **kwargs)
-        self.bytestr = bytestr
+
+    def __init__(
+        self,
+        addr: K,
+        size: int,
+        bytestr: bytes | None = None,
+        thumb: bool = False,
+        delta: int | None = None,
+    ):
+        """
+        :param bytestr: The bytes of the block, given only when the bytes are from user-specified binary code.
+        :param delta:   The block's bytes are at ``addr + delta``. Defaults to -1 for ARM Thumb nodes. Note that delta
+                        is not part of the identity of a BlockNode.
+        """
+        super().__init__(addr, size, thumb=thumb)
+        self.delta = (-1 if thumb else 0) if delta is None else delta
+        self._bytestr = bytestr
+
+    @property
+    def manual_bytes(self) -> bool:
+        """
+        True if the node has user-supplied bytes rather than reading bytes from the loader.
+        """
+        return self._bytestr is not None
+
+    @property
+    def raw_bytestr(self) -> bytes | None:
+        """
+        The bytes of the block if they were supplied by the user. None otherwise.
+        """
+        return self._bytestr
+
+    def bytestr(self, project: angr.Project, original: bool = True) -> bytes | None:
+        """
+        Get the bytes of the block.
+
+        :param project:     The angr Project to use to read the bytes if they are not user-supplied.
+        :param original:    Whether to read the original bytes from the loader (True) or the potentially patched
+                            bytes (False).
+        """
+        if self._bytestr is not None:
+            return self._bytestr
+        if not isinstance(project, angr.Project):
+            raise TypeError(f"BlockNode.bytestr() expects a Project, not {type(project).__name__}")
+        if not self.size or not isinstance(self.addr, int):
+            return None
+
+        if original or project.kb.patches.has_patches() is False:
+            # go through the loader to read the original bytes
+            loader = project.loader
+            memory = loader.memory_ro_view if loader.memory_ro_view is not None else loader.memory
+            try:
+                data = memory.load(self.addr + self.delta, self.size)
+            except (KeyError, ValueError, SimMemoryError):
+                return None
+            if data is None or len(data) != self.size:
+                return None
+            return bytes(data)
+
+        # go through the project to read the potentially patched bytes
+        try:
+            blk = project.factory.block(self.addr + self.delta, size=self.size)
+            return blk.bytes
+        except (KeyError, ValueError, SimMemoryError):
+            return None
 
     def __repr__(self):
-        return '<BlockNode at %s (size %d)>' % (repr_addr(self.addr), self.size)
+        return f"<BlockNode at {repr_addr(self.addr)} (size {self.size})>"
 
-    def __getstate__(self):
-        return (self.addr, self.size, self.bytestr, self.thumb)
+    def __getstate__(self) -> tuple:
+        return self.addr, self.size, self._bytestr, self.thumb, self.delta
 
-    def __setstate__(self, dat):
-        self.__init__(*dat[:-1], thumb=dat[-1])
+    def __setstate__(self, dat: tuple):
+        addr, size, bytestr, thumb, delta = dat
+        self.__init__(addr, size, bytestr=bytestr, thumb=thumb, delta=delta)
 
 
-class SootBlockNode(BlockNode):
+class SootBlockNode(BlockNode[SootMethodDescriptor]):
+    """
+    Represents a Soot block of code in a function graph.
+    """
 
-    __slots__ = ['stmts']
+    __slots__ = ["stmts"]
 
-    def __init__(self, addr, size, stmts, **kwargs):
-        super(SootBlockNode, self).__init__(addr, size, **kwargs)
+    def __init__(self, addr: SootMethodDescriptor, size, stmts, **kwargs):
+        super().__init__(addr, size, **kwargs)
         self.stmts = stmts
 
         assert (stmts is None and size == 0) or (size == len(stmts))
 
     def __repr__(self):
-        return '<SootBlockNode at %s (%d statements)>' % (repr_addr(self.addr), self.size)
+        return f"<SootBlockNode at {repr_addr(self.addr)} ({self.size} statements)>"
 
-    def __getstate__(self):
+    def __getstate__(self) -> tuple:
         return self.addr, self.size, self.stmts
 
-    def __setstate__(self, data):
+    def __setstate__(self, data: tuple):
         self.__init__(*data)
 
 
-class HookNode(CodeNode):
+class FuncNode[K: (int, SootMethodDescriptor)](CodeNode[K]):
+    """
+    Represents a function callee in a function graph.
+    """
 
-    __slots__ = ['sim_procedure']
+    __slots__ = ("func_name",)
+
+    def __init__(self, addr: K, func_name: str | None = None, **kwargs):
+        super().__init__(addr, 0, **kwargs)
+        self.func_name = func_name  # only used when addr is -1 (unknown address)
+
+    @property
+    def is_addr_known(self) -> bool:
+        return self.addr >= 0
+
+    def __repr__(self) -> str:
+        if self.func_name is not None:
+            return f"<FuncNode {self.func_name}@{self.addr:#x}>"
+        return f"<FuncNode {self.addr:#x}>"
+
+    def __hash__(self):
+        return hash((self.addr, self.func_name))
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, FuncNode)
+            and super().__eq__(other)
+            and (self.is_addr_known or (not self.is_addr_known and self.func_name == other.func_name))
+        )
+
+    def __getstate__(self) -> tuple:
+        return self.addr, self.func_name
+
+    def __setstate__(self, state: tuple):
+        self.__init__(*state)
+
+
+class HookNode[K: (int, SootMethodDescriptor)](CodeNode[K]):
+    """
+    Represents a hook in a function graph.
+    """
+
+    __slots__ = ["sim_procedure"]
 
     is_hook = True
-    def __init__(self, addr, size, sim_procedure, **kwargs):
+
+    def __init__(self, addr, size, sim_procedure: SimProcedure | None, **kwargs):
         """
         :param type sim_procedure: the the sim_procedure class
         """
-        super(HookNode, self).__init__(addr, size, **kwargs)
+        super().__init__(addr, size, **kwargs)
         self.sim_procedure = sim_procedure
 
     def __repr__(self):
-        return '<HookNode %r at %s (size %s)>' % (self.sim_procedure, repr_addr(self.addr), self.size)
+        return f"<HookNode {self.sim_procedure!r} at {repr_addr(self.addr)} (size {self.size})>"
 
     def __hash__(self):
-        return hash((self.addr, self.size, self.sim_procedure))
+        # class objects hash by id; keep the hash value-only so set order is stable across processes
+        return hash((self.addr, self.size))
 
-    def __eq__(self, other):
-        return super(HookNode, self).__eq__(other) and \
-            self.sim_procedure == other.sim_procedure
+    def __eq__(self, other: CodeNode):
+        return (
+            isinstance(other, HookNode)
+            and super().__eq__(other)
+            and (
+                (self.sim_procedure is None and other.sim_procedure is None)
+                or (
+                    self.sim_procedure is not None
+                    and other.sim_procedure is not None
+                    and self.sim_procedure.__class__ == other.sim_procedure.__class__
+                    and self.sim_procedure.display_name == other.sim_procedure.display_name
+                )
+            )
+        )
 
-    def __getstate__(self):
-        return (self.addr, self.size, self.sim_procedure)
+    def __getstate__(self) -> tuple:
+        return self.addr, self.size, self.sim_procedure
 
-    def __setstate__(self, dat):
+    def __setstate__(self, dat: tuple):
         self.__init__(*dat)
 
-class SyscallNode(HookNode):
-    is_hook = False
-    def __repr__(self):
-        return '<SyscallNode %r at %#x (size %s)>' % (self.sim_procedure, self.addr, self.size)
 
-from .block import Block
+class SyscallNode[K: (int, SootMethodDescriptor)](HookNode[K]):
+    """
+    Represents a syscall in a function graph.
+    """
+
+    is_hook = False
+
+    def __repr__(self):
+        return f"<SyscallNode {self.sim_procedure!r} at {self.addr:#x} (size {self.size})>"

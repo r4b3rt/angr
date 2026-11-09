@@ -1,31 +1,33 @@
 # pylint:disable=arguments-differ,unused-argument,no-member
-from typing import Set, Optional
+from __future__ import annotations
 
-from angr.storage.memory_mixins import MemoryMixin
+from angr.rustylib import SegmentList
+from angr.storage.memory_mixins.memory_mixin import MemoryMixin
+
 from .refcount_mixin import RefcountMixin
 
-
 MAX_HISTORY_DEPTH = 50
+DUMMY_SORT = ""
 
 
 class HistoryTrackingMixin(RefcountMixin, MemoryMixin):
     """
     Tracks the history of memory writes.
     """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._parent = None
         self._history_depth = 0
-        self._changed_offsets = set()
+        self._changed_offsets: SegmentList = SegmentList()
 
     def store(self, addr, data, size=None, **kwargs):
-        for i in range(size):
-            self._changed_offsets.add(addr + i)
+        if size > 0:
+            self._changed_offsets.occupy(addr, size, DUMMY_SORT)
         return super().store(addr, data, **kwargs)
 
     def copy(self, memo):
-        o = super().copy(memo)
-        return o
+        return super().copy(memo)
 
     def acquire_unique(self):
         page = super().acquire_unique()
@@ -38,7 +40,7 @@ class HistoryTrackingMixin(RefcountMixin, MemoryMixin):
                 page._history_depth = 0
             else:
                 page._parent = self
-                page._changed_offsets = set()
+                page._changed_offsets = SegmentList()
         return page
 
     def parents(self):
@@ -47,11 +49,11 @@ class HistoryTrackingMixin(RefcountMixin, MemoryMixin):
             yield parent
             parent = parent._parent
 
-    def changed_bytes(self, other, **kwargs) -> Optional[Set[int]]:
-        candidates: Set[int] = set()
+    def changed_bytes(self, other, **kwargs) -> set[int] | None:
+        candidates = SegmentList()
 
-        self_history_list = [self] + list(self.parents())
-        other_history_list = [other] + list(other.parents())
+        self_history_list = [self, *list(self.parents())]
+        other_history_list = [other, *list(other.parents())]
         if self_history_list and other_history_list and self_history_list[-1] is other_history_list[-1]:
             # two pages have the same root. we can get a list of candidate offsets this way
 
@@ -64,19 +66,27 @@ class HistoryTrackingMixin(RefcountMixin, MemoryMixin):
                 i -= 1
                 j -= 1
 
-            for page_ in self_history_list[:i+1]:
-                candidates |= page_._changed_offsets
-            for page_ in other_history_list[:j+1]:
-                candidates |= page_._changed_offsets
-            return candidates
+            for page in self_history_list[: i + 1]:
+                candidates.update(page._changed_offsets)
+            for page in other_history_list[: j + 1]:
+                candidates.update(page._changed_offsets)
+
+            # Convert to a set of indices. This can be super slow if the ranges are
+            # large!
+            candidate_set = set()
+
+            for offset in candidates:
+                candidate_set.update(range(offset.start, offset.end))
+
+            return candidate_set
 
         return None
 
-    def all_bytes_changed_in_history(self) -> Set[int]:
-        changed_bytes: Set[int] = self._changed_offsets.copy()
+    def all_bytes_changed_in_history(self) -> SegmentList:
+        changed_bytes: SegmentList = self._changed_offsets.copy()
 
-        parent = self._parent
-        while parent is not None:
-            changed_bytes |= parent._changed_offsets
-            parent = parent._parent
+        mem = self._parent
+        while mem is not None:
+            changed_bytes.update(mem._changed_offsets)
+            mem = mem._parent
         return changed_bytes

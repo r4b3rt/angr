@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 import logging
 import re
@@ -5,21 +6,26 @@ import string
 import struct
 from collections import defaultdict
 from itertools import count
+from typing import TYPE_CHECKING
 
 import capstone
 import cle
 import networkx
 import pyvex
 
-from . import Analysis
+from angr.analyses.analysis import AnalysesHub, Analysis
+from angr.block import CapstoneBlock, CapstoneInsn
+from angr.codenode import CodeNode, FuncNode
+from angr.knowledge_base import KnowledgeBase
+from angr.knowledge_plugins.cfg.memory_data import MemoryDataSort
+from angr.sim_variable import SimMemoryVariable, SimTemporaryVariable
+
 from .cfg.cfg_emulated import CFGEmulated
-from .ddg import DDG
 from .cfg.cfg_fast import CFGFast
-from ..codenode import CodeNode
-from ..knowledge_plugins.cfg.memory_data import MemoryDataSort
-from ..knowledge_plugins.functions import Function
-from ..knowledge_base import KnowledgeBase
-from ..sim_variable import SimMemoryVariable, SimTemporaryVariable
+from .ddg import DDG
+
+if TYPE_CHECKING:
+    from .cfg import CFGNode
 
 l = logging.getLogger(name=__name__)
 
@@ -27,6 +33,7 @@ l = logging.getLogger(name=__name__)
 #
 # Exceptions
 #
+
 
 class BinaryError(Exception):
     pass
@@ -39,6 +46,7 @@ class InstructionError(BinaryError):
 class ReassemblerFailureNotice(BinaryError):
     pass
 
+
 #
 # Constants
 #
@@ -49,19 +57,19 @@ OP_TYPE_MEM = 3
 OP_TYPE_RAW = 4
 
 OP_TYPE_MAP = {
-    OP_TYPE_REG: 'REG',
-    OP_TYPE_IMM: 'IMM',
-    OP_TYPE_MEM: 'MEM',
-    OP_TYPE_RAW: 'RAW',
+    OP_TYPE_REG: "REG",
+    OP_TYPE_IMM: "IMM",
+    OP_TYPE_MEM: "MEM",
+    OP_TYPE_RAW: "RAW",
 }
 
 CAPSTONE_OP_TYPE_MAP = {
-    'X86': {
+    "X86": {
         capstone.x86.X86_OP_REG: OP_TYPE_REG,
         capstone.x86.X86_OP_IMM: OP_TYPE_IMM,
         capstone.x86.X86_OP_MEM: OP_TYPE_MEM,
     },
-    'AMD64': {
+    "AMD64": {
         capstone.x86.X86_OP_REG: OP_TYPE_REG,
         capstone.x86.X86_OP_IMM: OP_TYPE_IMM,
         capstone.x86.X86_OP_MEM: OP_TYPE_MEM,
@@ -70,51 +78,48 @@ CAPSTONE_OP_TYPE_MAP = {
 
 CAPSTONE_REG_MAP = {
     # will be filled up by fill_reg_map()
-    'X86': {
-    },
-    'AMD64': {
-    }
+    "X86": {},
+    "AMD64": {},
 }
 
 # Utils
 
-def string_escape(s):
 
+def string_escape(s):
     if isinstance(s, bytes):
         s = "".join(chr(i) for i in s)
 
-    s = s.encode('unicode_escape').decode("utf-8")
+    s = s.encode("unicode_escape").decode("utf-8")
 
     s = s.replace("\\'", "'")
-    s = s.replace("\"", "\\\"")
+    return s.replace('"', '\\"')
 
-    return s
 
 def fill_reg_map():
     # TODO: Support more architectures
     for attr in dir(capstone.x86):
-        if attr.startswith('X86_REG_'):
+        if attr.startswith("X86_REG_"):
             reg_name = attr[8:]
             reg_offset = getattr(capstone.x86, attr)
-            CAPSTONE_REG_MAP['X86'][reg_offset] = reg_name.lower()
+            CAPSTONE_REG_MAP["X86"][reg_offset] = reg_name.lower()
 
     for attr in dir(capstone.x86):
-        if attr.startswith('X86_REG_'):
+        if attr.startswith("X86_REG_"):
             reg_name = attr[8:]
             reg_offset = getattr(capstone.x86, attr)
-            CAPSTONE_REG_MAP['AMD64'][reg_offset] = reg_name.lower()
+            CAPSTONE_REG_MAP["AMD64"][reg_offset] = reg_name.lower()
+
 
 def split_operands(s):
-
-    operands = [ ]
+    operands = []
     operand = ""
-    in_paranthesis = False
+    in_parenthesis = False
     for i, c in enumerate(s):
-        if in_paranthesis and c == ")":
-            in_paranthesis = False
+        if in_parenthesis and c == ")":
+            in_parenthesis = False
         if c == "(":
-            in_paranthesis = True
-        if not in_paranthesis and c == "," and (i == len(s) - 1 or s[i + 1] == ' '):
+            in_parenthesis = True
+        if not in_parenthesis and c == "," and (i == len(s) - 1 or s[i + 1] == " "):
             operands.append(operand)
             operand = ""
             continue
@@ -125,12 +130,14 @@ def split_operands(s):
 
     return operands
 
+
 def is_hex(s):
     try:
         int(s, 16)
         return True
     except ValueError:
         return False
+
 
 fill_reg_map()
 
@@ -139,7 +146,6 @@ class Label:
     g_label_ctr = count()
 
     def __init__(self, binary, name, original_addr=None):
-
         self.binary = binary
         self.name = name
 
@@ -148,7 +154,7 @@ class Label:
         self.var_size = None
 
         if self.name is None:
-            self.name = "label_%d" % next(Label.g_label_ctr)
+            self.name = f"label_{next(Label.g_label_ctr)}"
 
         self.original_addr = original_addr
         self.base_addr = None
@@ -163,11 +169,10 @@ class Label:
         :return:
         """
 
-        #if self.var_size is not None:
+        # if self.var_size is not None:
         #    s = ".type {name},@object\n.comm {name},{size},{size}".format(name=self.name, size=self.var_size)
-        #else:
-        s = ".{name}:".format(name=self.name)
-        return s
+        # else:
+        return f".{self.name}:"
 
     def __hash__(self):
         return hash(self.name)
@@ -182,12 +187,11 @@ class Label:
     @property
     def operand_str(self):
         if self.base_addr is None:
-            return ".%s" % self.name
-        else:
-            offset = self.offset
-            sign = '+' if offset >= 0 else '-'
-            offset = abs(offset)
-            return ".%s%s%d" % (self.name, sign, offset)
+            return f".{self.name}"
+        offset = self.offset
+        sign = "+" if offset >= 0 else "-"
+        offset = abs(offset)
+        return f".{self.name}{sign}{offset}"
 
     @property
     def offset(self):
@@ -203,10 +207,9 @@ class Label:
     def new_label(binary, name=None, function_name=None, original_addr=None, data_label=False):
         if function_name is not None:
             return FunctionLabel(binary, function_name, original_addr)
-        elif data_label:
+        if data_label:
             return DataLabel(binary, original_addr)
-        else:
-            return Label(binary, name, original_addr=original_addr)
+        return Label(binary, name, original_addr=original_addr)
 
 
 class DataLabel(Label):
@@ -217,18 +220,16 @@ class DataLabel(Label):
     def operand_str(self):
         if self.base_addr is None:
             return self.name
-        else:
-            offset = self.offset
-            sign = '+' if offset >= 0 else '-'
-            offset = abs(offset)
-            return '(%s%s%s)' % (self.name, sign, offset)
+        offset = self.offset
+        sign = "+" if offset >= 0 else "-"
+        offset = abs(offset)
+        return f"({self.name}{sign}{offset})"
 
     def __str__(self):
-        #if self.var_size is not None:
+        # if self.var_size is not None:
         #    s = ".comm {name},{size},{size}".format(name=self.name, size=self.var_size)
-        #else:
-        s = "%s:" % (self.name)
-        return s
+        # else:
+        return f"{self.name}:"
 
 
 class FunctionLabel(Label):
@@ -246,9 +247,7 @@ class FunctionLabel(Label):
         return self.name
 
     def __str__(self):
-        return ("\t.globl {func_name}\n" +
-                "\t.type {func_name}, @function\n" +
-                "{func_name}:").format(
+        return ("\t.globl {func_name}\n" + "\t.type {func_name}, @function\n" + "{func_name}:").format(
             func_name=self.function_name
         )
 
@@ -268,9 +267,7 @@ class ObjectLabel(Label):
         return self.name
 
     def __str__(self):
-        return ("\t.globl {symbol_name}\n" +
-                "\t.type {symbol_name}, @object\n" +
-                "{symbol_name}:").format(
+        return ("\t.globl {symbol_name}\n" + "\t.type {symbol_name}, @object\n" + "{symbol_name}:").format(
             symbol_name=self.symbol_name
         )
 
@@ -290,9 +287,7 @@ class NotypeLabel(Label):
         return self.name
 
     def __str__(self):
-        return ("\t.globl {symbol_name}\n" +
-                "\t.type {symbol_name}, @notype\n" +
-                "{symbol_name}:").format(
+        return ("\t.globl {symbol_name}\n" + "\t.type {symbol_name}, @notype\n" + "{symbol_name}:").format(
             symbol_name=self.symbol_name
         )
 
@@ -301,6 +296,7 @@ class SymbolManager:
     """
     SymbolManager manages all symbols in the binary.
     """
+
     def __init__(self, binary, cfg):
         """
         Constructor.
@@ -324,14 +320,13 @@ class SymbolManager:
 
         i = 0
         while True:
-            name = "%s_%d" % (symbol_name, i)
+            name = f"{symbol_name}_{i}"
             if name not in self.symbol_names:
                 self.symbol_names.add(name)
                 return name
             i += 1
 
     def new_label(self, addr, name=None, is_function=None, force=False):
-
         if force:
             if self.binary.main_nonexecutable_regions_contain(addr):
                 label = DataLabel(self.binary, addr, name=name)
@@ -354,8 +349,8 @@ class SymbolManager:
             symbol = self.project.loader.find_symbol(addr)
             if symbol.owner is self.project.loader.main_object:
                 symbol_name = symbol.name
-                if '@' in symbol_name:
-                    symbol_name = symbol_name[ : symbol_name.index('@') ]
+                if "@" in symbol_name:
+                    symbol_name = symbol_name[: symbol_name.index("@")]
 
                 # check the type...
                 if symbol.type == cle.SymbolType.TYPE_FUNCTION:
@@ -378,13 +373,13 @@ class SymbolManager:
                         name = None
                     label = Label.new_label(self.binary, name=name, original_addr=addr)
                 else:
-                    raise Exception('Unsupported symbol type %s. Bug Fish about it!' % symbol.type)
+                    raise Exception(f"Unsupported symbol type {symbol.type}. Bug Fish about it!")
 
             else:
-                raise Exception("the symbol %s is not owned by the main object. Try reload the project with"
-                                "\"auto_load_libs=False\". If that does not solve the issue, please report to GitHub."
-                                % symbol.name
-                                )
+                raise Exception(
+                    f"the symbol {symbol.name} is not owned by the main object. Try reload the project with"
+                    '"auto_load_libs=False". If that does not solve the issue, please report to GitHub.'
+                )
 
         elif (addr is not None and addr in self.cfg.functions) or is_function:
             # It's a function identified by angr's CFG recovery
@@ -424,7 +419,9 @@ class SymbolManager:
 
 
 class Operand:
-    def __init__(self, binary, insn_addr, insn_size, capstone_operand, operand_str, mnemonic, operand_offset, syntax=None):
+    def __init__(
+        self, binary, insn_addr, insn_size, capstone_operand, operand_str, mnemonic, operand_offset, syntax=None
+    ):
         """
         Constructor.
 
@@ -446,7 +443,6 @@ class Operand:
         self.mnemonic = mnemonic
         self.operand_offset = operand_offset
         self.syntax = self.binary.syntax if syntax is None else syntax
-        self.type = None
         self.size = capstone_operand.size
 
         # IMM
@@ -478,94 +474,88 @@ class Operand:
     def assembly(self):
         if self.type == OP_TYPE_IMM and self.label:
             if self.label_offset > 0:
-                return "%s + %d" % (self.label.operand_str, self.label_offset)
-            elif self.label_offset < 0:
-                return "%s - %d" % (self.label.operand_str, abs(self.label_offset))
-            else:
-                return self.label.operand_str
+                return f"{self.label.operand_str} + {self.label_offset}"
+            if self.label_offset < 0:
+                return f"{self.label.operand_str} - {abs(self.label_offset)}"
+            return self.label.operand_str
 
-        elif self.type == OP_TYPE_MEM:
-
+        if self.type == OP_TYPE_MEM:
             disp = ""
             if self.disp:
                 if self.disp_label:
                     if self.disp_label_offset > 0:
-                        disp = "%s + %d" % (self.disp_label.operand_str, self.disp_label_offset)
+                        disp = f"{self.disp_label.operand_str} + {self.disp_label_offset}"
                     elif self.disp_label_offset < 0:
-                        disp = "%s - %d" % (self.disp_label.operand_str, abs(self.disp_label_offset))
+                        disp = f"{self.disp_label.operand_str} - {abs(self.disp_label_offset)}"
                     else:
                         disp = self.disp_label.operand_str
                 else:
-                    disp = "%d" % self.disp
+                    disp = f"{self.disp}"
 
             base = ""
             if self.base:
                 base = CAPSTONE_REG_MAP[self.project.arch.name][self.base]
 
-            if self.syntax == 'at&t':
+            if self.syntax == "at&t":
                 # displacement(base, index, scale)
-                base = "%%%s" % base if base else ""
+                base = f"%{base}" if base else ""
 
                 if "*" in self.operand_str and disp:
                     # absolute memory address
                     disp = "*" + disp
 
                 if self.index:
-                    s = "%s(%s, %%%s, %d)" % (disp, base, CAPSTONE_REG_MAP[self.project.arch.name][self.index],
-                                              self.scale
-                                              )
+                    s = f"{disp}({base}, %{CAPSTONE_REG_MAP[self.project.arch.name][self.index]}, {self.scale})"
                 elif self.base:  # not self.index
-                    s = "%s(%s)" % (disp, base)
+                    s = f"{disp}({base})"
                 else:
                     s = disp
 
                 return s
 
-            else:
-                s = [ ]
-                if base:
-                    s.append(base)
+            s = []
+            if base:
+                s.append(base)
 
-                if self.index and self.scale:
-                    if s:
-                        s.append('+')
-                    s.append("(%s * %d)" % (CAPSTONE_REG_MAP[self.project.arch.name][self.index], self.scale))
+            if self.index and self.scale:
+                if s:
+                    s.append("+")
+                s.append(f"({CAPSTONE_REG_MAP[self.project.arch.name][self.index]} * {self.scale})")
 
-                if disp:
-                    if disp.startswith('-'):
-                        s.append('-')
-                        s.append(disp[1:])
-                    else:
-                        if s:
-                            s.append('+')
-                        s.append(disp)
-
-                asm = " ".join(s)
-
-                # we need to specify the size here
-                if self.size == 16:
-                    asm = 'xmmword ptr [%s]' % asm
-                elif self.size == 10:
-                    asm = 'xword ptr [%s]' % asm
-                elif self.size == 8:
-                    asm = 'qword ptr [%s]' % asm
-                elif self.size == 4:
-                    asm = 'dword ptr [%s]' % asm
-                elif self.size == 2:
-                    asm = 'word ptr [%s]' % asm
-                elif self.size == 1:
-                    asm = 'byte ptr [%s]' % asm
+            if disp:
+                if disp.startswith("-"):
+                    s.append("-")
+                    s.append(disp[1:])
                 else:
-                    raise BinaryError('Unsupported memory operand size for operand "%s"' % self.operand_str)
+                    if s:
+                        s.append("+")
+                    s.append(disp)
 
-                return asm
+            asm = " ".join(s)
 
-        elif self.type == OP_TYPE_RAW:
+            # we need to specify the size here
+            if self.size == 16:
+                asm = f"xmmword ptr [{asm}]"
+            elif self.size == 10:
+                asm = f"xword ptr [{asm}]"
+            elif self.size == 8:
+                asm = f"qword ptr [{asm}]"
+            elif self.size == 4:
+                asm = f"dword ptr [{asm}]"
+            elif self.size == 2:
+                asm = f"word ptr [{asm}]"
+            elif self.size == 1:
+                asm = f"byte ptr [{asm}]"
+            else:
+                raise BinaryError(f'Unsupported memory operand size for operand "{self.operand_str}"')
+
+            return asm
+
+        if self.type == OP_TYPE_RAW:
             return self.raw_asm
 
-        else:
-            # Nothing special
-            return None
+        # Nothing special
+        return None
 
     #
     # Overridden predefined methods
@@ -586,9 +576,8 @@ class Operand:
             ref_type = "DATAREF"
 
         if ref_type:
-            return "%s <%s>" % (op_type, ref_type)
-        else:
-            return op_type
+            return f"{op_type} <{ref_type}>"
+        return op_type
 
     #
     # Properties
@@ -607,7 +596,6 @@ class Operand:
     #
 
     def _initialize(self, capstone_operand):
-
         arch_name = self.project.arch.name
         self.type = CAPSTONE_OP_TYPE_MAP[arch_name][capstone_operand.type]
 
@@ -615,40 +603,37 @@ class Operand:
             # Check if this is a reference to code
             imm = capstone_operand.imm
 
-            self.is_coderef, self.is_dataref, baseaddr = \
-                self._imm_to_ptr(imm, self.type, self.mnemonic)
+            self.is_coderef, self.is_dataref, baseaddr = self._imm_to_ptr(imm, self.type, self.mnemonic)
 
             if self.is_coderef or self.is_dataref:
                 self.label = self.binary.symbol_manager.new_label(addr=baseaddr)
                 self.label_offset = imm - baseaddr
 
-                if self.mnemonic.startswith('j') or self.mnemonic.startswith('loop'):
-                    sort = 'jump'
-                elif self.mnemonic.startswith('call'):
-                    sort = 'call'
+                if self.mnemonic.startswith("j") or self.mnemonic.startswith("loop"):
+                    sort = "jump"
+                elif self.mnemonic.startswith("call"):
+                    sort = "call"
                 else:
-                    sort = 'absolute'
+                    sort = "absolute"
                 self.binary.register_instruction_reference(self.insn_addr, imm, sort, self.operand_offset)
 
         elif self.type == OP_TYPE_MEM:
-
             self.base = capstone_operand.mem.base
             self.index = capstone_operand.mem.index
             self.scale = capstone_operand.mem.scale
             self.disp = capstone_operand.mem.disp
 
-            if self.binary.project.arch.name == 'AMD64' and CAPSTONE_REG_MAP['AMD64'][self.base] == 'rip':
+            if self.binary.project.arch.name == "AMD64" and CAPSTONE_REG_MAP["AMD64"][self.base] == "rip":
                 # rip-relative addressing
                 self.disp += self.insn_addr + self.insn_size
 
-            self.disp_is_coderef, self.disp_is_dataref, baseaddr = \
-                self._imm_to_ptr(self.disp, self.type, self.mnemonic)
+            self.disp_is_coderef, self.disp_is_dataref, baseaddr = self._imm_to_ptr(self.disp, self.type, self.mnemonic)
 
             if self.disp_is_coderef or self.disp_is_dataref:
                 self.disp_label = self.binary.symbol_manager.new_label(addr=baseaddr)
                 self.disp_label_offset = self.disp - baseaddr
 
-                self.binary.register_instruction_reference(self.insn_addr, self.disp, 'absolute', self.operand_offset)
+                self.binary.register_instruction_reference(self.insn_addr, self.disp, "absolute", self.operand_offset)
 
     def _imm_to_ptr(self, imm, operand_type, mnemonic):  # pylint:disable=no-self-use,unused-argument
         """
@@ -664,24 +649,25 @@ class Operand:
         is_coderef, is_dataref = False, False
         baseaddr = None
 
-        if not is_coderef and not is_dataref:
-            if self.binary.main_executable_regions_contain(imm):
-                # does it point to the beginning of an instruction?
-                if imm in self.binary.all_insn_addrs:
-                    is_coderef = True
-                    baseaddr = imm
+        if (
+            not is_coderef
+            and not is_dataref
+            and self.binary.main_executable_regions_contain(imm)
+            # does it point to the beginning of an instruction?
+            and imm in self.binary.all_insn_addrs
+        ):
+            is_coderef = True
+            baseaddr = imm
 
-        if not is_coderef and not is_dataref:
-            if self.binary.main_nonexecutable_regions_contain(imm):
-                is_dataref = True
-                baseaddr = imm
+        if not is_coderef and not is_dataref and self.binary.main_nonexecutable_regions_contain(imm):
+            is_dataref = True
+            baseaddr = imm
 
         if not is_coderef and not is_dataref:
             tolerance_before = 1024 if operand_type == OP_TYPE_MEM else 64
-            contains_, baseaddr_ = self.binary.main_nonexecutable_region_limbos_contain(imm,
-                                                                                        tolerance_before=tolerance_before,
-                                                                                        tolerance_after=1024
-                                                                                        )
+            contains_, baseaddr_ = self.binary.main_nonexecutable_region_limbos_contain(
+                imm, tolerance_before=tolerance_before, tolerance_after=1024
+            )
             if contains_:
                 is_dataref = True
                 baseaddr = baseaddr_
@@ -699,6 +685,7 @@ class Instruction:
     """
     High-level representation of an instruction in the binary
     """
+
     def __init__(self, binary, addr, size, insn_bytes, capstone_instr):
         """
 
@@ -718,20 +705,20 @@ class Instruction:
 
         self.mnemonic = capstone_instr.mnemonic
         self.op_str = capstone_instr.op_str
-        self.capstone_operand_types = [ operand.type for operand in capstone_instr.operands ]
+        self.capstone_operand_types = [operand.type for operand in capstone_instr.operands]
 
-        self.operands = [ ]
+        self.operands = []
 
-        self.labels = [ ]
+        self.labels = []
 
-        operand_offsets = [ ]
+        operand_offsets = []
         for operand in capstone_instr.operands:
             if operand.type == capstone.CS_OP_IMM:
                 operand_offsets.append(capstone_instr.imm_offset)
             elif operand.type == capstone.CS_OP_MEM:
                 operand_offsets.append(capstone_instr.disp_offset)
             else:
-                operand_offsets.append(None)
+                operand_offsets.append(0)
 
         if self.addr is not None:
             self._initialize(capstone_instr.operands, operand_offsets)
@@ -745,15 +732,13 @@ class Instruction:
         :return:
         """
 
-        assembly = self.assembly(comments=True, symbolized=False)
-        return assembly
+        return self.assembly(comments=True, symbolized=False)
 
     #
     # Public methods
     #
 
     def assign_labels(self):
-
         if self.addr in self.binary.symbol_manager.addr_to_label:
             labels = self.binary.symbol_manager.addr_to_label[self.addr]
             for label in labels:
@@ -761,11 +746,9 @@ class Instruction:
                     self.labels.append(label)
 
     def dbg_comments(self):
-        operands = ", ".join([ str(operand) for operand in self.operands ])
-        capstone_str = "%#08x:\t%s\t%s" % (self.addr, self.mnemonic, self.op_str)
-        comments = "\t# %s [%s]" % (capstone_str, operands)
-
-        return comments
+        operands = ", ".join([str(operand) for operand in self.operands])
+        capstone_str = f"{self.addr:#08x}:\t{self.mnemonic}\t{self.op_str}"
+        return f"\t# {capstone_str} [{operands}]"
 
     def assembly(self, comments=False, symbolized=True):
         """
@@ -773,12 +756,9 @@ class Instruction:
         :return:
         """
 
-        if comments:
-            dbg_comments = self.dbg_comments()
-        else:
-            dbg_comments = ""
+        dbg_comments = self.dbg_comments() if comments else ""
 
-        labels = "\n".join([ str(lbl) for lbl in self.labels ])
+        labels = "\n".join([str(lbl) for lbl in self.labels])
 
         inserted_asm_before_label = ""
         if self.addr in self.binary.inserted_asm_before_label:
@@ -796,11 +776,11 @@ class Instruction:
             inserted_asm_after_label = "\n".join(self.binary.inserted_asm_after_label[self.addr])
             inserted_asm_after_label += "\n"
 
-        not_symbolized = "\t%s\t%s" % (self.mnemonic, self.op_str)
+        not_symbolized = f"\t{self.mnemonic}\t{self.op_str}"
         if not symbolized:
             asm = not_symbolized
 
-        elif not any([ (operand.symbolized or operand.type == OP_TYPE_RAW) for operand in self.operands ]):
+        elif not any((operand.symbolized or operand.type == OP_TYPE_RAW) for operand in self.operands):
             # No label is involved
             asm = not_symbolized
 
@@ -812,9 +792,9 @@ class Instruction:
             # Now it's the tricky part. capstone doesn't give us anyway to print individual operand. We gotta parse it
             # by ourselves
             # Remove the address
-            #capstone_str = capstone_str[capstone_str.find('\t') + 1 : ]
+            # capstone_str = capstone_str[capstone_str.find('\t') + 1 : ]
 
-            all_operands = [ operand.operand_str for operand in self.operands]
+            all_operands = [operand.operand_str for operand in self.operands]
             mnemonic = self.mnemonic
 
             for i, op in enumerate(self.operands):
@@ -823,27 +803,27 @@ class Instruction:
                     if op.type in (OP_TYPE_IMM, OP_TYPE_MEM, OP_TYPE_RAW):
                         all_operands[i] = op_asm
                     else:
-                        raise BinaryError("Unsupported operand type %d." % op.type)
+                        raise BinaryError(f"Unsupported operand type {op.type}.")
 
                     if op.type != OP_TYPE_RAW and self.capstone_operand_types[i] == capstone.CS_OP_IMM:
-                        if mnemonic.startswith('j') or mnemonic.startswith('call') or mnemonic.startswith('loop'):
+                        if mnemonic.startswith(("j", "call", "loop")):
                             pass
                         else:
                             # mark the size of the variable
                             if op.is_dataref:
                                 op.label.var_size = op.size
-                            if self.binary.syntax == 'at&t':
+                            if self.binary.syntax == "at&t":
                                 all_operands[i] = "$" + all_operands[i]
                             else:
-                                all_operands[i] = 'OFFSET FLAT:' + all_operands[i]
+                                all_operands[i] = "OFFSET FLAT:" + all_operands[i]
 
-            asm = "\t%s%s" % (mnemonic, "\t" + ", ".join(all_operands))
+            asm = "\t{}{}".format(mnemonic, "\t" + ", ".join(all_operands))
 
         if self.addr in self.binary._removed_instructions:
             contents = [dbg_comments, inserted_asm_before_label, labels, inserted_asm_after_label]
         else:
-            contents = [ dbg_comments, inserted_asm_before_label, labels, inserted_asm_after_label, asm ]
-        contents = [ a for a in contents if a ]
+            contents = [dbg_comments, inserted_asm_before_label, labels, inserted_asm_after_label, asm]
+        contents = [a for a in contents if a]
 
         return "\n".join(contents)
 
@@ -859,7 +839,7 @@ class Instruction:
         """
 
         if self.addr is None:
-            raise InstructionError('self.addr must be specified')
+            raise InstructionError("self.addr must be specified")
 
         self._initialize_operands(capstone_operands, operand_offsets)
 
@@ -870,17 +850,23 @@ class Instruction:
         """
 
         all_operands = split_operands(self.op_str)
-        capstone_operands = capstone_operands[ - len(all_operands) : ] # sometimes there are more operands than expected...
-        operand_offsets = operand_offsets[ - len(all_operands) : ]
+        capstone_operands = capstone_operands[
+            -len(all_operands) :
+        ]  # sometimes there are more operands than expected...
+        operand_offsets = operand_offsets[-len(all_operands) :]
 
         for operand, operand_str, offset in zip(capstone_operands, all_operands, operand_offsets):
-            self.operands.append(Operand(self.binary, self.addr, self.size, operand, operand_str, self.mnemonic, offset))
+            self.operands.append(
+                Operand(self.binary, self.addr, self.size, operand, operand_str, self.mnemonic, offset)
+            )
+
 
 class BasicBlock:
     """
     BasicBlock represents a basic block in the binary.
     """
-    def __init__(self, binary, addr, size, x86_getpc_retsite: bool=False):
+
+    def __init__(self, binary, addr, size, x86_getpc_retsite: bool = False):
         """
         Constructor.
 
@@ -897,7 +883,7 @@ class BasicBlock:
         self.size = size
         self.x86_getpc_retsite = x86_getpc_retsite
 
-        self.instructions = [ ]
+        self.instructions = []
 
         self._initialize()
 
@@ -914,8 +900,7 @@ class BasicBlock:
         return self.assembly(symbolized=False)
 
     def __repr__(self):
-
-        return "<BasicBlock %#08x>" % self.addr
+        return f"<BasicBlock {self.addr:#08x}>"
 
     #
     # Public methods
@@ -926,12 +911,10 @@ class BasicBlock:
             ins.assign_labels()
 
     def assembly(self, comments=False, symbolized=True):
-        s = "\n".join([ins.assembly(comments=comments, symbolized=symbolized) for ins in self.instructions])
-
-        return s
+        return "\n".join([ins.assembly(comments=comments, symbolized=symbolized) for ins in self.instructions])
 
     def instruction_addresses(self):
-        return sorted([ (ins.addr, ins.size) for ins in self.instructions ], key=lambda x: x[0])
+        return sorted([(ins.addr, ins.size) for ins in self.instructions], key=lambda x: x[0])
 
     #
     # Private methods
@@ -945,7 +928,7 @@ class BasicBlock:
 
         # re-lifting
         block = self.project.factory.fresh_block(self.addr, self.size)
-        capstone_obj = block.capstone
+        capstone_obj = self.binary.disassemble_block(block)
 
         # Fill in instructions
         for idx, instr in enumerate(capstone_obj.insns):
@@ -953,29 +936,33 @@ class BasicBlock:
             instruction = Instruction(self.binary, instr.address, instr.size, None, instr)
 
             if self.x86_getpc_retsite and idx == 0:
-                if (self.binary.syntax == "at&t"
-                        and instr.mnemonic == "addl"
-                        and instr.operands[1].type == capstone.CS_OP_REG
-                        and instr.operands[0].type == capstone.CS_OP_IMM
+                if (
+                    self.binary.syntax == "at&t"
+                    and instr.mnemonic == "addl"
+                    and instr.operands[1].type == capstone.CS_OP_REG
+                    and instr.operands[0].type == capstone.CS_OP_IMM
                 ):
                     instruction.operands[0].type = OP_TYPE_RAW
                     instruction.operands[0].raw_asm = "$_GLOBAL_OFFSET_TABLE_"
-                elif (self.binary.syntax == "intel"
-                        and instr.mnemonic == "add"
-                        and instr.operands[0].type == capstone.CS_OP_REG
-                        and instr.operands[1].type == capstone.CS_OP_IMM
+                elif (
+                    self.binary.syntax == "intel"
+                    and instr.mnemonic == "add"
+                    and instr.operands[0].type == capstone.CS_OP_REG
+                    and instr.operands[1].type == capstone.CS_OP_IMM
                 ):
-                    instruction.operands[1].type == OP_TYPE_RAW
+                    instruction.operands[1].type = OP_TYPE_RAW
                     instruction.operands[1].raw_asm = "OFFSET FLAG:_GLOBAL_OFFSET_TABLE_"
 
             self.instructions.append(instruction)
 
         self.instructions = sorted(self.instructions, key=lambda x: x.addr)
 
+
 class Procedure:
     """
     Procedure in the binary.
     """
+
     def __init__(self, binary, function=None, addr=None, size=None, name=None, section=".text", asm_code=None):
         """
         Constructor.
@@ -1000,7 +987,7 @@ class Procedure:
 
         else:
             self.addr = function.addr
-            self.size = None # FIXME:
+            self.size = None  # FIXME:
 
             self.function = function
             self._name = function.name
@@ -1008,7 +995,7 @@ class Procedure:
         self.asm_code = asm_code
         self.section = section
 
-        self.blocks = [ ]
+        self.blocks = []
 
         self._initialize()
 
@@ -1103,16 +1090,11 @@ class Procedure:
         :rtype: list
         """
 
-        assembly = [ ]
+        assembly = []
 
-        header = "\t.section\t{section}\n\t.align\t{alignment}\n".format(section=self.section,
-                                                 alignment=self.binary.section_alignment(self.section)
-                                                 )
-        if self.addr is not None:
-            procedure_name = "%#x" % self.addr
-        else:
-            procedure_name = self._name
-        header += "\t#Procedure %s\n" % procedure_name
+        header = f"\t.section\t{self.section}\n\t.align\t{self.binary.section_alignment(self.section)}\n"
+        procedure_name = f"{self.addr:#x}" if self.addr is not None else self._name
+        header += f"\t#Procedure {procedure_name}\n"
 
         if self._output_function_label:
             if self.addr:
@@ -1127,7 +1109,8 @@ class Procedure:
             s = self.asm_code
             assembly.append((self.addr, s))
         elif self.blocks:
-            for b in sorted(self.blocks, key=lambda x:x.addr):  # type: BasicBlock
+            b: BasicBlock
+            for b in sorted(self.blocks, key=lambda x: x.addr):
                 s = b.assembly(comments=comments, symbolized=symbolized)
                 assembly.append((b.addr, s))
 
@@ -1141,8 +1124,9 @@ class Procedure:
         :rtype: list
         """
 
-        addrs = [ ]
-        for b in sorted(self.blocks, key=lambda x: x.addr):  # type: BasicBlock
+        addrs = []
+        b: BasicBlock
+        for b in sorted(self.blocks, key=lambda x: x.addr):
             addrs.extend(b.instruction_addresses())
 
         return sorted(set(addrs), key=lambda x: x[0])
@@ -1152,28 +1136,36 @@ class Procedure:
     #
 
     def _initialize(self):
-
         if self.function is None:
             if not self.asm_code:
-                raise BinaryError('Unsupported procedure type. You must either specify a angr.knowledge.Function '
-                                  'object, or specify assembly code.')
-
+                raise BinaryError(
+                    "Unsupported procedure type. You must either specify a angr.knowledge.Function "
+                    "object, or specify assembly code."
+                )
 
         else:
             x86_getpc_retsites = set()
-            if self.project.arch.name == "X86":
-                if 'pc_reg' in self.function.info:
-                    # this is an x86-PIC function that calls a get_pc thunk
-                    # we need to fix the "add e{a,b,c}x, offset" instruction right after the get_pc call
-                    # first let's identify which function is the get_pc function
-                    for src, dst, data in self.function.transition_graph.edges(data=True):
-                        if isinstance(src, CodeNode) and isinstance(dst, Function):
-                            if 'get_pc' in dst.info:
-                                # found it!
-                                x86_getpc_retsites.add(src.addr + src.size)
+            if self.project.arch.name == "X86" and "pc_reg" in self.function.info:
+                # this is an x86-PIC function that calls a get_pc thunk
+                # we need to fix the "add e{a,b,c}x, offset" instruction right after the get_pc call
+                # first let's identify which function is the get_pc function
+                for src, dst, _data in self.function.transition_graph.edges(data=True):
+                    if (
+                        isinstance(src, CodeNode)
+                        and isinstance(dst, FuncNode)
+                        and self.project.kb.functions.contains_addr(dst.addr)
+                    ):
+                        dst_func = self.project.kb.functions.get_by_addr(dst.addr)
+                        if "get_pc" in dst_func.info:
+                            # found it!
+                            x86_getpc_retsites.add(src.addr + src.size)
             for block_addr in self.function.block_addrs:
-                b = BasicBlock(self.binary, block_addr, self.function._block_sizes[block_addr],
-                               x86_getpc_retsite=block_addr in x86_getpc_retsites)
+                b = BasicBlock(
+                    self.binary,
+                    block_addr,
+                    self.function.get_block_size(block_addr),
+                    x86_getpc_retsite=block_addr in x86_getpc_retsites,
+                )
                 self.blocks.append(b)
 
             self.blocks = sorted(self.blocks, key=lambda x: x.addr)
@@ -1198,14 +1190,14 @@ class Procedure:
             return True
         if not the_block.instructions:
             return True
-        if not the_block.instructions[0].labels:
-            return True
-        return False
+        return bool(not the_block.instructions[0].labels)
+
 
 class ProcedureChunk(Procedure):
     """
     Procedure chunk.
     """
+
     def __init__(self, project, addr, size):
         """
         Constructor.
@@ -1220,9 +1212,18 @@ class ProcedureChunk(Procedure):
 
 
 class Data:
-    def __init__(self, binary, memory_data=None, section=None, section_name=None, name=None, size=None, sort=None,
-                 addr=None, initial_content=None):
-
+    def __init__(
+        self,
+        binary,
+        memory_data=None,
+        section=None,
+        section_name=None,
+        name=None,
+        size=None,
+        sort=None,
+        addr=None,
+        initial_content=None,
+    ):
         self.binary = binary
         self.project = binary.project
         self.memory_data = memory_data
@@ -1235,11 +1236,11 @@ class Data:
         self.sort = sort
         self._initial_content = initial_content  # only used by patcherex
 
-        self._content = None
+        self._content: list = []
 
-        self.labels = [ ] # a list of tuples like (address, label)
-        self.end_labels = [ ]  # a list of labels only show up at the end of this memory data entry. mostly because the
-                               # data block after this one is removed for some reason. only assigned by other methods.
+        self.labels = []  # a list of tuples like (address, label)
+        self.end_labels = []  # a list of labels only show up at the end of this memory data entry. mostly because the
+        # data block after this one is removed for some reason. only assigned by other methods.
 
         self.null_terminated = None
 
@@ -1248,7 +1249,7 @@ class Data:
         self._initialize()
 
     def __repr__(self):
-        return "<DataItem %s@%#08x, %d bytes>" % (self.sort, self.addr, self.size)
+        return f"<DataItem {self.sort}@{self.addr:#08x}, {self.size} bytes>"
 
     @property
     def content(self):
@@ -1268,22 +1269,22 @@ class Data:
         self.size = new_size
 
         if self.sort == MemoryDataSort.String:
-            self.null_terminated = False # string without the null byte terminator
-            self._content[0] = self._content[0][ : self.size]
+            self.null_terminated = False  # string without the null byte terminator
+            self._content[0] = self._content[0][: self.size]
 
         elif self.sort == MemoryDataSort.PointerArray:
             pointer_size = self.binary.project.arch.bytes
 
             if self.size % pointer_size != 0:
                 # it's not aligned?
-                raise BinaryError('Fails at Data.shrink()')
+                raise BinaryError("Fails at Data.shrink()")
 
             pointers = self.size // pointer_size
-            self._content = self._content[ : pointers]
+            self._content = self._content[:pointers]
 
         else:
             # unknown
-            self._content =  [ self._content[0][ : self.size ] ]
+            self._content = [self._content[0][: self.size]]
 
     def desymbolize(self):
         """
@@ -1298,10 +1299,9 @@ class Data:
 
         self.sort = MemoryDataSort.Unknown
         content = self.binary.fast_memory_load(self.addr, self.size, bytes)
-        self.content = [ content ]
+        self.content = [content]
 
     def assign_labels(self):
-
         # TODO: What if it's not aligned for some sort of data, like pointer array?
 
         if self.addr is None:
@@ -1332,17 +1332,16 @@ class Data:
 
         if comments:
             if self.addr is not None:
-                s += "\t# data @ %#08x\n" % self.addr
+                s += f"\t# data @ {self.addr:#08x}\n"
             else:
-                s += "\t# data (%s)\n" % self.name
+                s += f"\t# data ({self.name})\n"
 
         if self.skip:
             return s
 
         if self.sort == MemoryDataSort.String:
-
             if symbolized:
-                ss = [ ]
+                ss = []
                 last_pos = 0
                 for i, tpl in enumerate(self.labels):
                     addr, lbl = tpl
@@ -1350,102 +1349,87 @@ class Data:
                     # split the string
                     pos = addr - self.addr
                     # endpos = self.labels[i + 1][0] - self.addr + 1 if i < len(self.labels) - 1 else self.size
-                    string_piece = self.content[0][last_pos : pos]
+                    string_piece = self.content[0][last_pos:pos]
 
                     last_pos = pos
 
-                    if i == len(self.labels) - 1 and pos == self.size:
-                        directive = '.asciz' # null at the end
-                    else:
-                        directive = '.ascii'
+                    # null at the end in true case
+                    directive = ".asciz" if i == len(self.labels) - 1 and pos == self.size else ".ascii"
 
                     if string_piece:
-                        ss.append("\t{directive} \"{str}\"".format(
-                            str=string_escape(string_piece),
-                            directive=directive,
-                            )
-                        )
-                    ss.append("%s" % str(lbl))
+                        ss.append(f'\t{directive} "{string_escape(string_piece)}"')
+                    ss.append(f"{lbl!s}")
 
                 if last_pos <= self.size - 1:
-                    string_piece = self.content[0][last_pos: ]
+                    string_piece = self.content[0][last_pos:]
                     directive = ".ascii" if self.null_terminated is False else ".asciz"
 
-                    ss.append("\t{directive} \"{str}\"".format(
-                        str=string_escape(string_piece),
-                        directive=directive,
-                    ))
+                    ss.append(f'\t{directive} "{string_escape(string_piece)}"')
 
                 s += "\n".join(ss)
             else:
-                if self.null_terminated is False:
-                    directive = ".ascii"
-                else:
-                    directive = ".asciz"
-                s += "\t.{directive} \"{str}\"".format(directive=directive, str=string_escape(self.content[0]))
-            s += '\n'
+                directive = ".ascii" if self.null_terminated is False else ".asciz"
+                s += f'\t.{directive} "{string_escape(self.content[0])}"'
+            s += "\n"
 
         elif self.sort == MemoryDataSort.PointerArray:
-
             if self.binary.project.arch.bits == 32:
-                directive = '.long'
+                directive = ".long"
             elif self.binary.project.arch.bits == 64:
-                directive = '.quad'
+                directive = ".quad"
             else:
-                raise BinaryError('Unsupported pointer size %d', self.binary.project.arch.bits)
+                raise BinaryError("Unsupported pointer size %d", self.binary.project.arch.bits)
 
             if symbolized:
                 addr_to_labels = {}
                 for k, v in self.labels:
                     if k not in addr_to_labels:
-                        addr_to_labels[k] = [ ]
+                        addr_to_labels[k] = []
                     addr_to_labels[k].append(v)
 
                 i = 0
                 if self.name is not None:
-                    s += "%s:\n" % self.name
+                    s += f"{self.name}:\n"
                 for symbolized_label in self.content:
-
                     if self.addr is not None and (self.addr + i) in addr_to_labels:
                         for label in addr_to_labels[self.addr + i]:
-                            s += "%s\n" % str(label)
+                            s += f"{label!s}\n"
                     elif self.addr is not None and (self.addr + i) in self.binary.symbol_manager.addr_to_label:
                         labels = self.binary.symbol_manager.addr_to_label[self.addr + i]
                         for label in labels:
-                            s += "%s\n" % str(label)
+                            s += f"{label!s}\n"
                     i += self.project.arch.bytes
 
                     if isinstance(symbolized_label, int):
-                        s += "\t%s %d\n" % (directive, symbolized_label)
+                        s += f"\t{directive} {symbolized_label}\n"
                     else:
-                        s += "\t%s %s\n" % (directive, symbolized_label.operand_str)
+                        s += f"\t{directive} {symbolized_label.operand_str}\n"
 
             else:
                 for label in self.content:
-                    s += "\t%s %s\n" % (directive, label.operand_str)
+                    s += f"\t{directive} {label.operand_str}\n"
 
         elif self.sort == MemoryDataSort.SegmentBoundary:
-
             if symbolized:
                 for _, label in self.labels:
-                    s += "\t%s\n" % str(label)
+                    s += f"\t{label!s}\n"
 
         elif self.sort == MemoryDataSort.Integer:
             # display it as bytes only when there are references pointing to the middle
-            content = [ ]
+            content = []
 
             if self.size == 1:
-                directive = '.byte'
-                fmt_str = 'B'
+                directive = ".byte"
+                fmt_str = "B"
             elif self.size == 2:
-                directive = '.short'
-                fmt_str = '<H'
+                directive = ".short"
+                fmt_str = "<H"
             elif self.size == 4:
-                directive = '.long'
-                fmt_str = '<I'
+                directive = ".long"
+                fmt_str = "<I"
             elif self.size == 8:
-                directive = '.quad'
-                fmt_str = '<Q'
+                directive = ".quad"
+                fmt_str = "<Q"
             else:
                 # we'll have to display it as a bunch of bytes
                 directive = None
@@ -1459,25 +1443,29 @@ class Data:
                     addr_to_labels[k].append(v)
 
                 show_integer = False
-                if len(addr_to_labels) == 0:
+                if len(addr_to_labels) == 0 or (
+                    (
+                        len(addr_to_labels) == 1
+                        and self.addr is not None
+                        and next(iter(addr_to_labels.keys())) == self.addr
+                    )
+                    or (self.addr is None and next(iter(addr_to_labels.keys())) == 0)
+                ):
                     show_integer = True
-                elif len(addr_to_labels) == 1:
-                    if self.addr is not None and next(iter(addr_to_labels.keys())) == self.addr:
-                        show_integer = True
-                    elif self.addr is None and next(iter(addr_to_labels.keys())) == 0:
-                        show_integer = True
 
                 if directive is not None and show_integer:
                     # nice, we should display it as an integer
                     if addr_to_labels:
                         for label in next(iter(addr_to_labels.values())):
-                            content += [ "%s" % str(label) ]
+                            content += [f"{label!s}"]
 
                     integer = struct.unpack(fmt_str, self.content[0])[0]
-                    content += ['\t{directive} {integer}'.format(
-                        directive=directive,
-                        integer='%#x' % integer,
-                    )]
+                    content += [
+                        "\t{directive} {integer}".format(
+                            directive=directive,
+                            integer=f"{integer:#x}",
+                        )
+                    ]
 
                 else:
                     # display it as bytes...
@@ -1486,17 +1474,19 @@ class Data:
                         for c in piece:
                             if addr in addr_to_labels:
                                 for label in addr_to_labels[addr]:
-                                    content += [ "%s" % str(label) ]
+                                    content += [f"{label!s}"]
                             addr += 1
 
-                            content += ['\t.byte %d' % c]
+                            content += [f"\t.byte {c}"]
 
             else:
                 integer = struct.unpack(fmt_str, self.content[0])[0]
-                content += ['\t{directive} {integer}'.format(
-                    directive=directive,
-                    integer='%#x' % integer,
-                )]
+                content += [
+                    "\t{directive} {integer}".format(
+                        directive=directive,
+                        integer=f"{integer:#x}",
+                    )
+                ]
 
             s += "\n".join(content)
             s += "\n"
@@ -1518,13 +1508,13 @@ class Data:
                     for c in piece:
                         if addr in addr_to_labels:
                             for label in addr_to_labels[addr]:
-                                content += [ "%s" % str(label) ]
+                                content += [f"{label!s}"]
                         addr += 1
 
-                        content += ['\t.byte %d' % c]
+                        content += [f"\t.byte {c}"]
             else:
                 for piece in self.content:
-                    content += ['\t.byte %d' % c for c in piece]
+                    content += [f"\t.byte {c}" for c in piece]
 
             s += "\n".join(content)
             s += "\n"
@@ -1533,7 +1523,7 @@ class Data:
             content = []
 
             if symbolized:
-                addr_to_labels = { }
+                addr_to_labels = {}
                 for k, v in self.labels:
                     if k not in addr_to_labels:
                         addr_to_labels[k] = []
@@ -1544,20 +1534,20 @@ class Data:
                     for c in piece:
                         if addr in addr_to_labels:
                             for label in addr_to_labels[addr]:
-                                content += [ "%s" % str(label) ]
+                                content += [f"{label!s}"]
                         addr += 1
 
-                        content += ['\t.byte %d' % c]
+                        content += [f"\t.byte {c}"]
             else:
                 for piece in self.content:
-                    content += [ '\t.byte %d' % c for c in piece ]
+                    content += [f"\t.byte {c}" for c in piece]
 
             s += "\n".join(content)
             s += "\n"
 
         if self.end_labels:
             for label in self.end_labels:
-                s += "%s\n" % label
+                s += f"{label}\n"
 
         return s.strip("\n")
 
@@ -1566,23 +1556,20 @@ class Data:
     #
 
     def _initialize(self):
-
         if self.memory_data is None:
-
-            if self.size is None or self._initial_content is None and self.sort is None:
-                raise BinaryError('You must at least specify size, initial_content, and sort.')
+            if self.size is None or (self._initial_content is None and self.sort is None):
+                raise BinaryError("You must at least specify size, initial_content, and sort.")
 
             if self.sort == MemoryDataSort.PointerArray:
-
                 lbl = DataLabel(self.binary, -1, name=self.name)
                 self.labels.append((0, lbl))
 
                 # symbolize the pointer array
 
-                self._content = [ ]
+                self._content = []
 
                 fmt_str = ""
-                if self.project.arch.memory_endness == 'Iend_LE':
+                if self.project.arch.memory_endness == "Iend_LE":
                     fmt_str += "<"
                 else:
                     fmt_str += ">"
@@ -1597,8 +1584,8 @@ class Data:
                     addr_str = self._initial_content[i : i + pointer_size]
                     addr = struct.unpack(fmt_str, addr_str)[0]
                     if addr != 0 and (
-                                self.binary.main_executable_regions_contain(addr) or
-                                self.binary.main_nonexecutable_regions_contain(addr)
+                        self.binary.main_executable_regions_contain(addr)
+                        or self.binary.main_nonexecutable_regions_contain(addr)
                     ):
                         label = self.binary.symbol_manager.new_label(addr)
                     else:
@@ -1612,11 +1599,10 @@ class Data:
                     self._content.append(label)
 
             elif self.sort in {MemoryDataSort.String, MemoryDataSort.Unknown, MemoryDataSort.Integer}:
-
                 lbl = DataLabel(self.binary, -1, name=self.name)
                 self.labels.append((0, lbl))
 
-                self._content = [ self._initial_content ]
+                self._content = [self._initial_content]
 
             elif self.sort == MemoryDataSort.SegmentBoundary:
                 label = self.binary.symbol_manager.new_label(self.addr)
@@ -1624,7 +1610,7 @@ class Data:
                 self._content = []
 
             else:
-                raise BinaryError('Unsupported data sort "%s"' % self.sort)
+                raise BinaryError(f'Unsupported data sort "{self.sort}"')
 
         else:
             self.addr = self.memory_data.address
@@ -1639,16 +1625,17 @@ class Data:
 
                 self._content = []
                 for i in range(pointers):
-                    addr = self.binary.fast_memory_load(self.addr + i * pointer_size, pointer_size, int,
-                                                        endness=self.project.arch.memory_endness
-                                                        )
+                    addr = self.binary.fast_memory_load(
+                        self.addr + i * pointer_size, pointer_size, int, endness=self.project.arch.memory_endness
+                    )
                     if addr is None:
                         continue
                     obj = self.project.loader.find_object_containing(addr)
                     if obj is self.project.loader.main_object:
                         # a dynamic pointer
-                        if self.binary.main_executable_regions_contain(addr) or \
-                                self.binary.main_nonexecutable_regions_contain(addr):
+                        if self.binary.main_executable_regions_contain(
+                            addr
+                        ) or self.binary.main_nonexecutable_regions_contain(addr):
                             label = self.binary.symbol_manager.new_label(addr)
                             self._content.append(label)
 
@@ -1665,7 +1652,7 @@ class Data:
                 data = self.binary.fast_memory_load(self.addr, self.size, bytes)
                 if data[-1] == 0:
                     self.null_terminated = True
-                    data = data[:-1] # remove the null-byte. we'll use .asciz for it instead.
+                    data = data[:-1]  # remove the null-byte. we'll use .asciz for it instead.
                 else:
                     self.null_terminated = False
 
@@ -1673,20 +1660,20 @@ class Data:
 
             elif self.sort == MemoryDataSort.Integer:
                 data = self.binary.fast_memory_load(self.addr, self.size, bytes)
-                self._content = [ data ]
+                self._content = [data]
 
             elif self.sort == MemoryDataSort.SegmentBoundary:
                 label = self.binary.symbol_manager.new_label(self.addr)
                 self.labels.append((self.addr, label))
 
-                self._content = [ ]
+                self._content = []
 
             elif self.sort == MemoryDataSort.FloatingPoint:
                 # floating-point integers
                 # Python has some trouble in dealing with floating point numbers
                 # just store them as bytes
                 data = self.binary.fast_memory_load(self.addr, self.size, bytes)
-                self._content = [ data ]
+                self._content = [data]
 
             else:
                 # other sorts
@@ -1704,8 +1691,7 @@ class Relocation:
         self.sort = sort
 
     def __repr__(self):
-        s = "<Reloc %s %#x (%#x)>" % (self.sort, self.addr, self.ref_addr)
-        return s
+        return f"<Reloc {self.sort} {self.addr:#x} ({self.ref_addr:#x})>"
 
 
 class Reassembler(Analysis):
@@ -1715,23 +1701,24 @@ class Reassembler(Analysis):
 
     Tested on CGC, x86 and x86-64 binaries.
 
-    Discliamer: The reassembler is an empirical solution. Don't be surprised if it does not work on some binaries.
+    Disclaimer: The reassembler is an empirical solution. Don't be surprised if it does not work on some binaries.
     """
-    def __init__(self, syntax="intel", remove_cgc_attachments=True, log_relocations=True):
 
+    def __init__(self, syntax="intel", remove_cgc_attachments=True, log_relocations=True):
         self.syntax = syntax
         self._remove_cgc_attachments = remove_cgc_attachments
 
-        self.symbol_manager = None
-        self.cfg = None
+        # a dedicated capstone instance for AT&T syntax; created on demand in disassemble_block()
+        self._att_capstone = None
+
         self._cgc_attachments_removed = False
         self.log_relocations = log_relocations
 
-        self.procedures = [ ]
-        self.data = [ ]
+        self.procedures = []
+        self.data = []
 
-        self.extra_rodata = [ ]
-        self.extra_data = [ ]
+        self.extra_rodata = []
+        self.extra_data = []
 
         self._main_executable_regions = None
         self._main_nonexecutable_regions = None
@@ -1744,11 +1731,12 @@ class Reassembler(Analysis):
         # all instruction addresses
         self.all_insn_addrs = set()
 
-        self._relocations = [ ]
+        self._relocations = []
 
         self._inserted_asm_before_label = defaultdict(list)
         self._inserted_asm_after_label = defaultdict(list)
         self._removed_instructions = set()
+        self._extra_memory_regions = [(0x4347C000, 0x4347C000 + 0x1000)]
 
         self._initialize()
 
@@ -1762,9 +1750,7 @@ class Reassembler(Analysis):
         :return:
         """
 
-        s = "\n".join([str(proc) for proc in self.procedures])
-
-        return s
+        return "\n".join([str(proc) for proc in self.procedures])
 
     #
     # Properties
@@ -1778,11 +1764,10 @@ class Reassembler(Analysis):
         :rtype: tuple
         """
 
-        raise NotImplementedError()
+        raise NotImplementedError
 
     @property
     def relocations(self):
-
         return self._relocations
 
     @property
@@ -1837,7 +1822,7 @@ class Reassembler(Analysis):
 
             if obj.sections:
                 for sec in obj.sections:
-                    if sec.name in {'.eh_frame', '.eh_frame_hdr'}:
+                    if sec.name in {".eh_frame", ".eh_frame_hdr"}:
                         # hack for ELF binaries...
                         continue
                     if not sec.is_executable:
@@ -1860,6 +1845,29 @@ class Reassembler(Analysis):
     # Public methods
     #
 
+    def disassemble_block(self, block):
+        """
+        Disassemble a block using the assembly syntax configured for this Reassembler.
+
+        When AT&T syntax is requested, a capstone instance dedicated to this analysis is used, so that neither the
+        project-wide Arch object nor the capstone instance cached on it is modified.
+
+        :param block: The angr Block to disassemble.
+        :return: A CapstoneBlock instance.
+        :rtype: CapstoneBlock
+        """
+
+        arch = self.project.arch
+        if self.syntax == "at&t" and arch.name in {"X86", "AMD64"}:
+            if self._att_capstone is None:
+                self._att_capstone = capstone.Cs(arch.cs_arch, arch.cs_mode)
+                self._att_capstone.syntax = capstone.CS_OPT_SYNTAX_ATT
+                self._att_capstone.detail = True
+            block_bytes = block.bytes if block.size is None else block.bytes[: block.size]
+            insns = [CapstoneInsn(insn) for insn in self._att_capstone.disasm(block_bytes, block.addr)]
+            return CapstoneBlock(block.addr, insns, block.thumb, arch)
+        return block.capstone
+
     def section_alignment(self, section_name):
         """
         Get the alignment for the specific section. If the section is not found, 16 is used as default.
@@ -1877,10 +1885,7 @@ class Reassembler(Analysis):
         :param addr:
         :return:
         """
-        for start, end in self.main_executable_regions:
-            if start <= addr < end:
-                return True
-        return False
+        return any(start <= addr < end for start, end in self.main_executable_regions)
 
     def main_executable_region_limbos_contain(self, addr):
         """
@@ -1898,14 +1903,12 @@ class Reassembler(Analysis):
         least_limbo = None
 
         for start, end in self.main_executable_regions:
-            if start - TOLERANCE <= addr < start:
-                if least_limbo is None or start - addr < least_limbo:
-                    closest_region = (True, start)
-                    least_limbo = start - addr
-            if end <= addr < end + TOLERANCE:
-                if least_limbo is None or addr - end < least_limbo:
-                    closest_region = (True, end)
-                    least_limbo = addr - end
+            if start - TOLERANCE <= addr < start and (least_limbo is None or start - addr < least_limbo):
+                closest_region = (True, start)
+                least_limbo = start - addr
+            if end <= addr < end + TOLERANCE and (least_limbo is None or addr - end < least_limbo):
+                closest_region = (True, end)
+                least_limbo = addr - end
 
         if closest_region is not None:
             return closest_region
@@ -1918,10 +1921,7 @@ class Reassembler(Analysis):
         :return: True if the address is inside a non-executable region, False otherwise.
         :rtype: bool
         """
-        for start, end in self.main_nonexecutable_regions:
-            if start <= addr < end:
-                return True
-        return False
+        return any(start <= addr < end for start, end in self.main_nonexecutable_regions)
 
     def main_nonexecutable_region_limbos_contain(self, addr, tolerance_before=64, tolerance_after=64):
         """
@@ -1937,21 +1937,18 @@ class Reassembler(Analysis):
         least_limbo = None
 
         for start, end in self.main_nonexecutable_regions:
-            if start - tolerance_before <= addr < start:
-                if least_limbo is None or start - addr < least_limbo:
-                    closest_region = (True, start)
-                    least_limbo = start - addr
-            if end <= addr < end + tolerance_after:
-                if least_limbo is None or addr - end < least_limbo:
-                    closest_region = (True, end)
-                    least_limbo = addr - end
+            if (start - tolerance_before <= addr < start) and (least_limbo is None or start - addr < least_limbo):
+                closest_region = (True, start)
+                least_limbo = start - addr
+            if (end <= addr < end + tolerance_after) and (least_limbo is None or addr - end < least_limbo):
+                closest_region = (True, end)
+                least_limbo = addr - end
 
         if closest_region is not None:
             return closest_region
         return False, None
 
     def register_instruction_reference(self, insn_addr, ref_addr, sort, operand_offset):
-
         if not self.log_relocations:
             return
 
@@ -1961,11 +1958,10 @@ class Reassembler(Analysis):
         self._relocations.append(r)
 
     def register_data_reference(self, data_addr, ref_addr):
-
         if not self.log_relocations:
             return
 
-        r = Relocation(data_addr, ref_addr, 'absolute')
+        r = Relocation(data_addr, ref_addr, "absolute")
 
         self._relocations.append(r)
 
@@ -2021,19 +2017,22 @@ class Reassembler(Analysis):
         :return: None
         """
 
-        if readonly:
-            section_name = ".rodata"
-        else:
-            section_name = '.data'
+        section_name = ".rodata" if readonly else ".data"
 
         if initial_content is None:
             initial_content = b""
         initial_content = initial_content.ljust(size, b"\x00")
-        data = Data(self, memory_data=None, section_name=section_name, name=name, initial_content=initial_content,
-                    size=size, sort=sort
-                    )
+        data = Data(
+            self,
+            memory_data=None,
+            section_name=section_name,
+            name=name,
+            initial_content=initial_content,
+            size=size,
+            sort=sort,
+        )
 
-        if section_name == '.rodata':
+        if section_name == ".rodata":
             self.extra_rodata.append(data)
         else:
             self.extra_data.append(data)
@@ -2053,15 +2052,14 @@ class Reassembler(Analysis):
         :return:
         """
 
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def symbolize(self):
-
         # clear the flag
         self._symbolization_needed = False
 
         # sanity checks
-        #if self._has_integer_used_as_pointers():
+        # if self._has_integer_used_as_pointers():
         #    raise ReassemblerFailureNotice('Integer-used-as-pointer detected. Reassembler will not work safely on '
         #                                   'this binary. Ping Fish if you believe the detection is wrong.'
         #                                   )
@@ -2073,15 +2071,16 @@ class Reassembler(Analysis):
             data.assign_labels()
 
         # Get all instruction addresses, and modify those labels pointing to the middle of an instruction
-        insn_addrs =  [ ]
-        for proc in self.procedures:  # type: Procedure
+        insn_addrs = []
+        proc: Procedure
+        for proc in self.procedures:
             insn_addrs.extend(proc.instruction_addresses())
         # just to be safe
         insn_addrs = sorted(set(insn_addrs), key=lambda x: x[0])
 
         pos = 0
 
-        changed_labels = [ ]
+        changed_labels = []
 
         for label_addr in sorted(self.symbol_manager.addr_to_label.keys()):
             while pos < len(insn_addrs) and label_addr > insn_addrs[pos][0]:
@@ -2113,7 +2112,6 @@ class Reassembler(Analysis):
                 proc.assign_labels()
 
     def assembly(self, comments=False, symbolized=True):
-
         if symbolized and self._symbolization_needed:
             self.symbolize()
 
@@ -2122,12 +2120,12 @@ class Reassembler(Analysis):
 
         s = ""
 
-        if self.syntax == 'intel':
+        if self.syntax == "intel":
             s += "\t.intel_syntax noprefix\n"
 
-        all_assembly_lines = [ ]
+        all_assembly_lines = []
 
-        addr_and_assembly = [ ]
+        addr_and_assembly = []
         for proc in self.procedures:
             addr_and_assembly.extend(proc.assembly(comments=comments, symbolized=symbolized))
         # sort it by the address - must be a stable sort!
@@ -2145,13 +2143,15 @@ class Reassembler(Analysis):
         for data in all_data:
             if last_section is None or data.section_name != last_section:
                 last_section = data.section_name
-                all_assembly_lines.append("\t.section {section}\n\t.align {alignment}".format(
-                    section=(last_section if last_section != '.init_array' else '.data'),
-                    alignment=self.section_alignment(last_section)
-                ))
+                all_assembly_lines.append(
+                    "\t.section {section}\n\t.align {alignment}".format(
+                        section=(last_section if last_section != ".init_array" else ".data"),
+                        alignment=self.section_alignment(last_section),
+                    )
+                )
             all_assembly_lines.append(data.assembly(comments=comments, symbolized=symbolized))
 
-        s = "\n".join(all_assembly_lines)
+        s += "\n".join(all_assembly_lines)
 
         return s
 
@@ -2167,9 +2167,9 @@ class Reassembler(Analysis):
         cgc_extended_application = None
 
         for data in self.data:
-            if data.sort == 'cgc-package-list':
+            if data.sort == "cgc-package-list":
                 cgc_package_list = data
-            elif data.sort == 'cgc-extended-application':
+            elif data.sort == "cgc-extended-application":
                 cgc_extended_application = data
 
         if not cgc_package_list or not cgc_extended_application:
@@ -2194,8 +2194,10 @@ class Reassembler(Analysis):
             return False
 
         # check if the irsb addresses are the same
-        if next(iter(refs.get_xrefs_by_dst(cgcpl_memory_data.addr))).block_addr != \
-                next(iter(refs.get_xrefs_by_dst(cgcea_memory_data.addr))).block_addr:
+        if (
+            next(iter(refs.get_xrefs_by_dst(cgcpl_memory_data.addr))).block_addr
+            != next(iter(refs.get_xrefs_by_dst(cgcea_memory_data.addr))).block_addr
+        ):
             return False
 
         insn_addr = next(iter(refs.get_xrefs_by_dst(cgcpl_memory_data.addr))).ins_addr
@@ -2212,9 +2214,9 @@ class Reassembler(Analysis):
             return False
         function = self.cfg.functions[func_addr]
         # traverse the graph and make sure there is only one call edge
-        calling_targets = [ ]
+        calling_targets = []
         for _, dst, data in function.transition_graph.edges(data=True):
-            if 'type' in data and data['type'] == 'call':
+            if "type" in data and data["type"] == "call":
                 calling_targets.append(dst.addr)
 
         if len(calling_targets) != 1:
@@ -2262,7 +2264,7 @@ class Reassembler(Analysis):
         cgc_package_list.skip = True
         cgc_extended_application.skip = True
 
-        l.info('CGC attachments are removed.')
+        l.info("CGC attachments are removed.")
 
         return True
 
@@ -2276,7 +2278,7 @@ class Reassembler(Analysis):
         # determine if the binary is compiled against glibc
         is_glibc = False
         for dep in self.project.loader.main_object.deps:
-            if dep.lower() in {'libc.so.6', 'libc.so'}:
+            if dep.lower() in {"libc.so.6", "libc.so"}:
                 is_glibc = True
                 break
         if is_glibc:
@@ -2284,62 +2286,68 @@ class Reassembler(Analysis):
 
     def remove_unnecessary_stuff_glibc(self):
         glibc_functions_blacklist = {
-            '_start',
-            'init',
-            '_init',
-            'fini',
-            '_fini',
-            '__gmon_start__',
-            '__do_global_dtors_aux',
-            'frame_dummy',
-            'atexit',
-            'deregister_tm_clones',
-            'register_tm_clones',
-            '__x86.get_pc_thunk.bx',
-            '__libc_csu_init',
-            '__libc_csu_fini',
+            "_start",
+            "init",
+            "_init",
+            "fini",
+            "_fini",
+            "__gmon_start__",
+            "__do_global_dtors_aux",
+            "frame_dummy",
+            "atexit",
+            "deregister_tm_clones",
+            "register_tm_clones",
+            "__x86.get_pc_thunk.bx",
+            "__libc_csu_init",
+            "__libc_csu_fini",
         }
 
         glibc_data_blacklist = {
-            '__TMC_END__',
-            '_GLOBAL_OFFSET_TABLE_',
-            '__JCR_END__',
-            '__dso_handle',
-            '__init_array_start',
-            '__init_array_end',
-
-            #
-            'stdout',
-            'stderr',
-            'stdin',
-            'program_invocation_short_',
-            'program_invocation_short_name',
-            'program_invocation_name',
-            '__progname_full',
-            '_IO_stdin_used',
-            'obstack_alloc_failed_hand',
-            'optind',
-            'optarg',
-            '__progname',
-            '_environ',
-            'environ',
-            '__environ',
+            "__TMC_END__",
+            "_GLOBAL_OFFSET_TABLE_",
+            "__JCR_END__",
+            "__dso_handle",
+            "__init_array_start",
+            "__init_array_end",
+            "stdout",
+            "stderr",
+            "stdin",
+            "program_invocation_short_",
+            "program_invocation_short_name",
+            "program_invocation_name",
+            "__progname_full",
+            "_IO_stdin_used",
+            "obstack_alloc_failed_hand",
+            "optind",
+            "optarg",
+            "__progname",
+            "_environ",
+            "environ",
+            "__environ",
         }
 
         glibc_references_blacklist = {
-            'frame_dummy',
-            '__do_global_dtors_aux',
+            "frame_dummy",
+            "__do_global_dtors_aux",
         }
 
         self.procedures = [p for p in self.procedures if p.name not in glibc_functions_blacklist and not p.is_plt]
 
         # special handling for _init_proc
         try:
-            init_func = self.cfg.functions['init']
-            callees = [ node for node in init_func.transition_graph.nodes()
-                        if isinstance(node, Function) and node.addr != self.cfg._unresolvable_call_target_addr ]
+            init_func = self.cfg.functions["init"]
+            callees = [
+                node
+                for node in init_func.transition_graph.nodes()
+                if isinstance(node, FuncNode) and node.addr != self.cfg._unresolvable_call_target_addr
+            ]
+            callee_funcs = [
+                self.cfg.functions.get_by_addr(callee.addr)
+                for callee in callees
+                if self.cfg.functions.contains_addr(callee.addr)
+            ]
             # special handling for GCC-generated X86 PIE binaries
-            non_getpc_callees = [ callee for callee in callees if 'get_pc' not in callee.info ]
+            non_getpc_callees = [callee for callee in callee_funcs if "get_pc" not in callee.info]
             if len(non_getpc_callees) == 1:
                 # we found the _init_proc
                 _init_proc = non_getpc_callees[0]
@@ -2355,18 +2363,18 @@ class Reassembler(Analysis):
                     ptr = d.content[i]
                     if isinstance(ptr, Label) and ptr.name in glibc_references_blacklist:
                         d.content[i] = 0
-            elif d.sort == MemoryDataSort.SegmentBoundary:
-                if d.labels:
-                    new_labels = [ ]
-                    for rebased_addr, label in d.labels:
-                        # check if this label belongs to a removed function
-                        if self.cfg.functions.contains_addr(rebased_addr) and \
-                                self.cfg.functions[rebased_addr].name in glibc_functions_blacklist:
-                            # we need to remove this label...
-                            continue
-                        else:
-                            new_labels.append((rebased_addr, label))
-                    d.labels = new_labels
+            elif d.sort == MemoryDataSort.SegmentBoundary and d.labels:
+                new_labels = []
+                for rebased_addr, label in d.labels:
+                    # check if this label belongs to a removed function
+                    if (
+                        self.cfg.functions.contains_addr(rebased_addr)
+                        and self.cfg.functions[rebased_addr].name in glibc_functions_blacklist
+                    ):
+                        # we need to remove this label...
+                        continue
+                    new_labels.append((rebased_addr, label))
+                d.labels = new_labels
 
     #
     # Private methods
@@ -2404,54 +2412,48 @@ class Reassembler(Analysis):
 
             self._section_alignments[section.name] = alignment
 
-        l.debug('Generating CFG...')
-        cfg = self.project.analyses[CFGFast].prep()(normalize=True, resolve_indirect_jumps=True, data_references=True,
-                                        extra_memory_regions=[(0x4347c000, 0x4347c000 + 0x1000)],
-                                        data_type_guessing_handlers=[
-                                            self._sequence_handler,
-                                            self._cgc_extended_application_handler,
-                                            self._unknown_data_size_handler,
-                                        ],
-                                        )
+        l.debug("Generating CFG...")
+        cfg = self.project.analyses[CFGFast].prep()(
+            normalize=True,
+            resolve_indirect_jumps=True,
+            data_references=True,
+            extra_memory_regions=self._extra_memory_regions,
+            data_type_guessing_handlers=[
+                self._sequence_handler,
+                self._cgc_extended_application_handler,
+                self._unknown_data_size_handler,
+            ],
+        )
 
         self.cfg = cfg
-
-        old_capstone_syntax = self.project.arch.capstone_x86_syntax
-        if old_capstone_syntax is None:
-            old_capstone_syntax = 'intel'
-
-        if self.syntax == 'at&t':
-            # switch capstone to AT&T style
-            self.project.arch.capstone_x86_syntax = "at&t"
-            # clear the block cache in lifter!
-            self.project.factory.default_engine.clear_cache()
 
         # initialize symbol manager
         self.symbol_manager = SymbolManager(self, cfg)
 
         # collect address of all instructions
-        l.debug('Collecting instruction addresses...')
-        for cfg_node in self.cfg.nodes():
+        l.debug("Collecting instruction addresses...")
+        for cfg_node in self.cfg.model.nodes():
             self.all_insn_addrs |= set(cfg_node.instruction_addrs)
 
         # Functions
 
-        l.debug('Creating functions...')
+        l.debug("Creating functions...")
         for f in cfg.kb.functions.values():
             # Skip all SimProcedures
-            if self.project.is_hooked(f.addr):
-                continue
-            elif self.project.simos.is_syscall_addr(f.addr):
+            if self.project.is_hooked(f.addr) or self.project.simos.is_syscall_addr(f.addr):
                 continue
 
             # Check which section the start address belongs to
-            section = next(iter(sec.name for sec in self.project.loader.main_object.sections
-                                if f.addr >= sec.vaddr and f.addr < sec.vaddr + sec.memsize
-                                ),
-                           ".text"
-                           )
+            section = next(
+                iter(
+                    sec.name
+                    for sec in self.project.loader.main_object.sections
+                    if f.addr >= sec.vaddr and f.addr < sec.vaddr + sec.memsize
+                ),
+                ".text",
+            )
 
-            if section in {'.got', '.plt', 'init', 'fini', '.init', '.fini'}:
+            if section in {".got", ".plt", "init", "fini", ".init", ".fini"}:
                 continue
 
             procedure = Procedure(self, function=f, section=section)
@@ -2463,13 +2465,12 @@ class Reassembler(Analysis):
 
         has_sections = len(self.project.loader.main_object.sections) > 0
 
-        l.debug('Creating data entries...')
+        l.debug("Creating data entries...")
         for addr, memory_data in cfg._memory_data.items():
-
-            if memory_data.sort in ('code reference', ):
+            if memory_data.sort == "code reference":
                 continue
 
-            if memory_data.sort == 'string':
+            if memory_data.sort == "string":
                 # it might be the CGC package list
                 new_sort, new_size = self._cgc_package_list_identifier(memory_data.address, memory_data.size)
                 if new_sort is not None:
@@ -2479,21 +2480,26 @@ class Reassembler(Analysis):
 
             if has_sections:
                 # Check which section the start address belongs to
-                section = next(iter(sec for sec in self.project.loader.main_object.sections
-                                    if sec.vaddr <= addr < sec.vaddr + sec.memsize
-                                    ),
-                               None
-                               )
+                section = next(
+                    iter(
+                        sec
+                        for sec in self.project.loader.main_object.sections
+                        if sec.vaddr <= addr < sec.vaddr + sec.memsize
+                    ),
+                    None,
+                )
 
-                if section is not None and section.name not in ('.note.gnu.build-id', ):  # ignore certain section names
+                if section is not None and section.name != ".note.gnu.build-id":  # ignore certain section names
                     data = Data(self, memory_data, section=section)
                     self.data.append(data)
-                elif memory_data.sort == 'segment-boundary':
+                elif memory_data.sort == "segment-boundary":
                     # it just points to the end of the segment or a section
-                    section = next(iter(sec for sec in self.project.loader.main_object.sections
-                                        if addr == sec.vaddr + sec.memsize),
-                                   None
-                                   )
+                    section = next(
+                        iter(
+                            sec for sec in self.project.loader.main_object.sections if addr == sec.vaddr + sec.memsize
+                        ),
+                        None,
+                    )
                     if section is not None:
                         data = Data(self, memory_data, section=section)
                         self.data.append(data)
@@ -2506,31 +2512,51 @@ class Reassembler(Analysis):
                 # the binary does not have any section
                 # we use segment information instead
                 # TODO: this logic needs reviewing
-                segment = next(iter(seg for seg in self.project.loader.main_object.segments
-                                    if seg.vaddr <= addr <= seg.vaddr + seg.memsize
-                                    ),
-                               None
-                               )
+                segment = next(
+                    iter(
+                        seg
+                        for seg in self.project.loader.main_object.segments
+                        if seg.vaddr <= addr <= seg.vaddr + seg.memsize
+                    ),
+                    None,
+                )
 
                 if segment is not None:
-                    data = Data(self, memory_data, section_name='.data')
+                    data = Data(self, memory_data, section_name=".data")
                     self.data.append(data)
 
         # remove all data that belong to GCC-specific sections
-        section_names_to_ignore = {'.init', '.fini', '.fini_array', '.jcr', '.dynamic', '.got', '.got.plt',
-                                   '.eh_frame_hdr', '.eh_frame', '.rel.dyn', '.rel.plt', '.rela.dyn', '.rela.plt',
-                                   '.dynstr', '.dynsym', '.interp', '.note.ABI-tag', '.note.gnu.build-id', '.gnu.hash',
-                                   '.gnu.version', '.gnu.version_r'
-                                   }
+        section_names_to_ignore = {
+            ".init",
+            ".fini",
+            ".fini_array",
+            ".jcr",
+            ".dynamic",
+            ".got",
+            ".got.plt",
+            ".eh_frame_hdr",
+            ".eh_frame",
+            ".rel.dyn",
+            ".rel.plt",
+            ".rela.dyn",
+            ".rela.plt",
+            ".dynstr",
+            ".dynsym",
+            ".interp",
+            ".note.ABI-tag",
+            ".note.gnu.build-id",
+            ".gnu.hash",
+            ".gnu.version",
+            ".gnu.version_r",
+        }
 
         # make sure there are always memory data entries pointing at the end of sections
-        all_data_addrs = set(d.addr for d in self.data)
-        all_procedure_addrs = set(f.addr for f in self.procedures)
+        all_data_addrs = {d.addr for d in self.data}
+        all_procedure_addrs = {f.addr for f in self.procedures}
         all_addrs = all_data_addrs | all_procedure_addrs
 
         if has_sections:
             for section in self.project.loader.main_object.sections:
-
                 if section.name in section_names_to_ignore:
                     # skip all sections that are CGC specific
                     continue
@@ -2551,9 +2577,9 @@ class Reassembler(Analysis):
 
                 section_boundary_addr = section.vaddr + section.memsize
                 if section_boundary_addr not in all_addrs:
-                    data = Data(self, addr=section_boundary_addr, size=0, sort='segment-boundary',
-                                section_name=section.name
-                                )
+                    data = Data(
+                        self, addr=section_boundary_addr, size=0, sort="segment-boundary", section_name=section.name
+                    )
                     self.data.append(data)
                     # add the address to all_data_addrs so we don't end up adding another boundary in
                     all_data_addrs.add(section_boundary_addr)
@@ -2564,43 +2590,41 @@ class Reassembler(Analysis):
 
         # Go through data entry list and refine them
         for i, data in enumerate(self.data):
-
             if i in data_indices_to_remove:
                 continue
 
             # process the overlapping ones
-            if i < len(self.data) - 1:
-                if data.addr + data.size > self.data[i + 1].addr:
-                    # they are overlapping :-(
+            if i < len(self.data) - 1 and data.addr + data.size > self.data[i + 1].addr:
+                # they are overlapping :-(
 
-                    # TODO: make sure new_size makes sense
-                    new_size = self.data[i + 1].addr - data.addr
+                # TODO: make sure new_size makes sense
+                new_size = self.data[i + 1].addr - data.addr
 
-                    # there are cases that legit data is misclassified as pointers
-                    # we are able to detect some of them here
-                    if data.sort == 'pointer-array':
-                        pointer_size = self.project.arch.bytes
-                        if new_size % pointer_size != 0:
-                            # the self.data[i+1] cannot be pointed to by a pointer
-                            # remove that guy later
-                            data_indices_to_remove.add(i + 1)
-                            # mark the source as a non-pointer
-                            # apparently the original Reassembleable Disassembler paper cannot get this case
-                            source_addr = self.data[i + 1].memory_data.pointer_addr
-                            if source_addr is not None:
-                                # find the original data
-                                original_data = next((d for d in self.data if d.addr <= source_addr < d.addr + d.size),
-                                                     None
-                                                     )
-                                if original_data is not None:
-                                    original_data.desymbolize()
+                # there are cases that legit data is misclassified as pointers
+                # we are able to detect some of them here
+                if data.sort == "pointer-array":
+                    pointer_size = self.project.arch.bytes
+                    if new_size % pointer_size != 0:
+                        # the self.data[i+1] cannot be pointed to by a pointer
+                        # remove that guy later
+                        data_indices_to_remove.add(i + 1)
+                        # mark the source as a non-pointer
+                        # apparently the original Reassembleable Disassembler paper cannot get this case
+                        source_addr = self.data[i + 1].memory_data.pointer_addr
+                        if source_addr is not None:
+                            # find the original data
+                            original_data = next(
+                                (d for d in self.data if d.addr <= source_addr < d.addr + d.size), None
+                            )
+                            if original_data is not None:
+                                original_data.desymbolize()
 
-                            continue
+                        continue
 
-                    data.shrink(new_size)
+                data.shrink(new_size)
 
             # process those ones whose type is unknown
-            if data.sort == 'unknown' and data.size == 0:
+            if data.sort == "unknown" and data.size == 0:
                 # increase its size until reaching the next item
 
                 if i + 1 == len(self.data):
@@ -2611,44 +2635,34 @@ class Reassembler(Analysis):
                     data.size = self.data[i + 1].addr - data.addr
 
         for i in sorted(data_indices_to_remove, reverse=True):
-            self.data = self.data[ : i] + self.data[i + 1 : ]
+            self.data = self.data[:i] + self.data[i + 1 :]
 
         # CGC-specific data filtering
-        self.data = [ d for d in self.data if d.section_name not in section_names_to_ignore ]
+        self.data = [d for d in self.data if d.section_name not in section_names_to_ignore]
 
-        # restore capstone X86 syntax at the end
-        if self.project.arch.capstone_x86_syntax != old_capstone_syntax:
-            self.project.arch.capstone_x86_syntax = old_capstone_syntax
-            self.project.factory.default_engine.clear_cache()
-
-        l.debug('Initialized.')
+        l.debug("Initialized.")
 
     def _is_sequence(self, cfg, addr, size):
         data = self.fast_memory_load(addr, size, bytes)
         if data is None:
             return False
-        ints = [i for i in data]
-        if len(set([(i - j) for i, j in zip(ints, ints[1:])])) == 1:
+        ints = list(data)
+        if len({(i - j) for i, j in zip(ints, ints[1:])}) == 1:
             # arithmetic progression
             # backoff: it should not be ending with a pointer
-            closest_aligned_addr = (addr + size - 1) & 0xfffffffc
+            closest_aligned_addr = (addr + size - 1) & 0xFFFFFFFC
             ptr = self.fast_memory_load(closest_aligned_addr, 4, int, endness=self.project.arch.memory_endness)
             if ptr is None:
                 return False
-            if self._is_pointer(cfg, ptr):
-                return False
-            return True
+            return not self._is_pointer(cfg, ptr)
         return False
 
-    @staticmethod
-    def _is_pointer(cfg, ptr):
-        if cfg.project.loader.find_section_containing(ptr) is not None or \
-                cfg.project.loader.find_segment_containing(ptr) is not None or \
-                (cfg._extra_memory_regions and
-                     next(((a < ptr < b) for (a, b) in cfg._extra_memory_regions), None)
-                 ):
-            return True
-        return False
+    def _is_pointer(self, cfg, ptr):
+        return bool(
+            cfg.project.loader.find_section_containing(ptr) is not None
+            or cfg.project.loader.find_segment_containing(ptr) is not None
+            or (self._extra_memory_regions and next((a < ptr < b for a, b in self._extra_memory_regions), None))
+        )
 
     def _sequence_handler(self, cfg, irsb, irsb_addr, stmt_idx, data_addr, max_size):  # pylint:disable=unused-argument
         """
@@ -2672,9 +2686,9 @@ class Reassembler(Analysis):
 
         for i in range(5, min(256, max_size)):
             if not self._is_sequence(cfg, data_addr, i):
-                return 'sequence', i - 1
+                return "sequence", i - 1
 
-        return 'sequence', sequence_max_size
+        return "sequence", sequence_max_size
 
     def _cgc_package_list_identifier(self, data_addr, data_size):
         """
@@ -2691,7 +2705,7 @@ class Reassembler(Analysis):
 
         data = self.fast_memory_load(data_addr, data_size, str)
 
-        if data[:10] != 'The DECREE':
+        if data[:10] != "The DECREE":
             return None, None
 
         if not all(i in string.printable for i in data):
@@ -2700,7 +2714,7 @@ class Reassembler(Analysis):
         if not re.match(r"The DECREE packages used in the creation of this challenge binary were:", data):
             return None, None
 
-        return 'cgc-package-list', data_size
+        return "cgc-package-list", data_size
 
     def _cgc_extended_application_handler(self, cfg, irsb, irsb_addr, stmt_idx, data_addr, max_size):  # pylint:disable=unused-argument
         """
@@ -2721,7 +2735,7 @@ class Reassembler(Analysis):
 
         data = self.fast_memory_load(data_addr, 20, bytes)
 
-        if data is not None and data[:4] != b'The ':
+        if data is not None and data[:4] != b"The ":
             return None, None
 
         # read everything in
@@ -2732,17 +2746,17 @@ class Reassembler(Analysis):
             return None, None
         pdf_size = int(m.group(1))
 
-        if '%PDF' not in data:
+        if "%PDF" not in data:
             return None, None
-        if '%%EOF' not in data:
+        if "%%EOF" not in data:
             return None, None
 
-        pdf_data = data[data.index('%PDF') : data.index('%%EOF') + 6]
+        pdf_data = data[data.index("%PDF") : data.index("%%EOF") + 6]
 
         if len(pdf_data) != pdf_size:
             return None, None
 
-        return 'cgc-extended-application', max_size
+        return "cgc-extended-application", max_size
 
     def _unknown_data_size_handler(self, cfg, irsb, irsb_addr, stmt_idx, data_addr, max_size):  # pylint:disable=unused-argument
         """
@@ -2784,10 +2798,9 @@ class Reassembler(Analysis):
 
         if size is not None:
             return "unknown", size
-        elif sequence_offset is not None:
+        if sequence_offset is not None:
             return "unknown", sequence_offset
-        else:
-            return None, None
+        return None, None
 
     def _has_integer_used_as_pointers(self):
         """
@@ -2801,35 +2814,32 @@ class Reassembler(Analysis):
         # classified as a pointer reference
 
         # we only care about unknown memory data that are 4 bytes long, and is directly referenced from an IRSB
-        candidates = [ i for i in self.cfg.memory_data.values() if
-                       i.sort in ('unknown', 'integer') and
-                       i.size == self.project.arch.bytes and
-                       i.irsb_addr is not None
-                       ]
+        candidates = [
+            i
+            for i in self.cfg.memory_data.values()
+            if i.sort in ("unknown", "integer") and i.size == self.project.arch.bytes and i.irsb_addr is not None
+        ]
 
         if not candidates:
             return False
 
         for candidate in candidates:
-
             # if the candidate is in .bss, we don't care about it
             sec = self.cfg.project.loader.find_section_containing(candidate.address)
-            if sec.name in ('.bss', '.got.plt'):
+            if sec.name in (".bss", ".got.plt"):
                 continue
 
             # execute the single basic block and see how the value is used
             base_graph = networkx.DiGraph()
-            candidate_node = self.cfg.model.get_any_node(candidate.irsb_addr)  # type: angr.analyses.cfg_node.CFGNode
+            candidate_node: CFGNode = self.cfg.model.get_any_node(candidate.irsb_addr)
             if candidate_node is None:
                 continue
             base_graph.add_node(candidate_node)
             tmp_kb = KnowledgeBase(self.project)
             cfg = self.project.analyses[CFGEmulated].prep(kb=tmp_kb)(
-                                                    starts=(candidate.irsb_addr,),
-                                                    keep_state=True,
-                                                    base_graph=base_graph
-                                                    )
-            candidate_irsb = cfg.get_any_irsb(candidate.irsb_addr)  # type: SimIRSB
+                starts=(candidate.irsb_addr,), keep_state=True, base_graph=base_graph
+            )
+            candidate_irsb = cfg.get_any_irsb(candidate.irsb_addr)
             ddg = self.project.analyses[DDG].prep(kb=tmp_kb)(cfg=cfg)
 
             mem_var_node = None
@@ -2843,11 +2853,12 @@ class Reassembler(Analysis):
                 continue
 
             # get a sub graph
-            subgraph = ddg.data_sub_graph(mem_var_node,
-                                          simplified=False,
-                                          killing_edges=False,
-                                          excluding_types={'mem_addr'},
-                                          )
+            subgraph = ddg.data_sub_graph(
+                mem_var_node,
+                simplified=False,
+                killing_edges=False,
+                excluding_types={"mem_addr"},
+            )
 
             # is it used as a memory address anywhere?
             # TODO:
@@ -2858,18 +2869,21 @@ class Reassembler(Analysis):
                 next_tmp = candidate_irsb.irsb.next.tmp
 
             if next_tmp is not None:
-                next_tmp_node = next((node for node in subgraph.nodes()
-                                      if isinstance(node.variable, SimTemporaryVariable) and
-                                         node.variable.tmp_id == next_tmp),
-                                     None
-                                     )
+                next_tmp_node = next(
+                    (
+                        node
+                        for node in subgraph.nodes()
+                        if isinstance(node.variable, SimTemporaryVariable) and node.variable.tmp_id == next_tmp
+                    ),
+                    None,
+                )
                 if next_tmp_node is not None:
                     # ouch it's used as a jump target
                     return True
 
         return False
 
-    def fast_memory_load(self, addr, size, data_type, endness='Iend_LE'):
+    def fast_memory_load(self, addr, size, data_type, endness="Iend_LE"):
         """
         Load memory bytes from loader's memory backend.
 
@@ -2896,5 +2910,4 @@ class Reassembler(Analysis):
             return None
 
 
-from angr.analyses import AnalysesHub
-AnalysesHub.register_default('Reassembler', Reassembler)
+AnalysesHub.register_default("Reassembler", Reassembler)

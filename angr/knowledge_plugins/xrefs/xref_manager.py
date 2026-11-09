@@ -1,29 +1,55 @@
-from typing import Set, Dict
+from __future__ import annotations
+
 import logging
-from collections import defaultdict
 
-from ...serializable import Serializable
-from ...protos import xrefs_pb2
-from ..plugin import KnowledgeBasePlugin
+from sortedcontainers import SortedDict
+
+from angr.knowledge_plugins.plugin import KnowledgeBasePlugin
+from angr.protos import xrefs_pb2
+from angr.serializable import Serializable
+
 from .xref import XRef, XRefType
-
 
 l = logging.getLogger(name=__name__)
 
 
+class XrefDict(SortedDict):
+    """
+    A SortedDict that maps addresses to sets of XRefs.
+    It adds defaultdict-like behavior around SortedDict.
+    """
+
+    def __missing__(self, key):
+        value = set()
+        super().__setitem__(key, value)
+        return value
+
+    def get_xrefs_in_range(self, start, end):
+        """
+        Get a set of XRef objects that point to addresses in the given range.
+        """
+        result = set()
+        for k in self.islice(self.bisect_left(start), self.bisect_right(end) + 1):
+            result.update(self[k])
+        return result
+
+
 class XRefManager(KnowledgeBasePlugin, Serializable):
     def __init__(self, kb):
-        super().__init__()
-        self._kb = kb
+        super().__init__(kb=kb)
 
-        self.xrefs_by_ins_addr: Dict[int,Set[XRef]] = defaultdict(set)
-        self.xrefs_by_dst: Dict[int,Set[XRef]] = defaultdict(set)
+        self.xrefs_by_ins_addr = XrefDict()
+        self.xrefs_by_dst = XrefDict()
 
     def copy(self):
         xm = XRefManager(self._kb)
         xm.xrefs_by_ins_addr = self.xrefs_by_ins_addr.copy()
         xm.xrefs_by_dst = self.xrefs_by_dst.copy()
         return xm
+
+    def clear(self):
+        self.xrefs_by_ins_addr = XrefDict()
+        self.xrefs_by_dst = XrefDict()
 
     def add_xref(self, xref):
         to_remove = set()
@@ -61,24 +87,24 @@ class XRefManager(KnowledgeBasePlugin, Serializable):
         bounded by start and end.
         Will only return absolute xrefs, not relative ones (like SP offsets)
         """
-        f = lambda x: isinstance(x, int) and start <= x <= end
-        addrs = filter(f, self.xrefs_by_dst.keys())
-        refs = set()
-        for addr in addrs:
-            refs = refs.union(self.xrefs_by_dst[addr])
-        return refs
+        return self.xrefs_by_dst.get_xrefs_in_range(start, end)
 
-    def get_xrefs_by_ins_addr_region(self, start, end) -> Set[XRef]:
+    def get_next_xref_addr_by_dst(self, addr: int) -> int | None:
+        """
+        Get the next XRef object whose address is greater than or equal to the given address.
+        Will only return absolute xrefs, not relative ones (like SP offsets)
+        """
+        try:
+            return next(self.xrefs_by_dst.irange(minimum=addr))
+        except StopIteration:
+            return None
+
+    def get_xrefs_by_ins_addr_region(self, start, end) -> set[XRef]:
         """
         Get a set of XRef objects that originate at a given address region
         bounded by start and end.  Useful for finding references from a basic block or function.
         """
-        f = lambda x: isinstance(x, int) and start <= x <= end
-        addrs = filter(f, self.xrefs_by_ins_addr.keys())
-        refs = set()
-        for addr in addrs:
-            refs = refs.union(self.xrefs_by_ins_addr[addr])
-        return refs
+        return self.xrefs_by_ins_addr.get_xrefs_in_range(start, end)
 
     # TODO: Maybe add some helpers that accept Function or Block objects for the sake of clean analyses.
 
@@ -99,7 +125,6 @@ class XRefManager(KnowledgeBasePlugin, Serializable):
 
     @classmethod
     def parse_from_cmessage(cls, cmsg, cfg_model=None, kb=None, **kwargs):  # pylint:disable=arguments-differ
-
         model = XRefManager(kb)
         bits = kb._project.arch.bits
 
@@ -116,4 +141,4 @@ class XRefManager(KnowledgeBasePlugin, Serializable):
         return model
 
 
-KnowledgeBasePlugin.register_default('xrefs', XRefManager)
+KnowledgeBasePlugin.register_default("xrefs", XRefManager)

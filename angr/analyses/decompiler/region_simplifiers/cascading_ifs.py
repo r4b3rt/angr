@@ -1,8 +1,18 @@
 # pylint:disable=unused-argument,arguments-differ
-import ailment
+from __future__ import annotations
 
-from ..sequence_walker import SequenceWalker
-from ..structurer_nodes import SequenceNode, CodeNode, MultiNode, LoopNode, ConditionNode, CascadingConditionNode
+from angr import ailment
+from angr.analyses.decompiler.peephole_optimizations import PeepholeOptimizationExprBase, X87CmpF
+from angr.analyses.decompiler.sequence_walker import SequenceWalker
+from angr.analyses.decompiler.structurer_nodes import (
+    CascadingConditionNode,
+    CodeNode,
+    ConditionNode,
+    LoopNode,
+    MultiNode,
+    SequenceNode,
+)
+from angr.analyses.decompiler.utils import is_empty_node, peephole_optimize_expr
 
 
 class CascadingIfsRemover(SequenceWalker):
@@ -21,7 +31,8 @@ class CascadingIfsRemover(SequenceWalker):
             true_body
         } else { }
     """
-    def __init__(self, node):
+
+    def __init__(self, node, manager):
         handlers = {
             SequenceNode: self._handle_Sequence,
             CodeNode: self._handle_Code,
@@ -32,6 +43,9 @@ class CascadingIfsRemover(SequenceWalker):
         }
 
         super().__init__(handlers)
+        self.manager = manager
+        # the merged condition may pair a comparison with its own NaN guard
+        self._cond_opts: list[PeepholeOptimizationExprBase] = [X87CmpF(None, None, manager)]
         self.walk(node)
 
     def _handle_Condition(self, node, parent=None, index=None, **kwargs):
@@ -50,25 +64,30 @@ class CascadingIfsRemover(SequenceWalker):
         if node.true_node is not None and node.false_node is None:
             if isinstance(node.true_node, SequenceNode):
                 last_node = None
-                if len(node.true_node.nodes) > 1 and \
-                        all(self.is_empty_node(node_) for node_ in node.true_node.nodes[:-1]):
+                if len(node.true_node.nodes) > 1 and all(is_empty_node(node_) for node_ in node.true_node.nodes[:-1]):
                     last_node = node.true_node.nodes[-1]
                 elif len(node.true_node.nodes) == 1:
                     last_node = node.true_node.nodes[0]
 
                 true_node = last_node
+            elif isinstance(node.true_node, ConditionNode):
+                true_node = node.true_node
+            else:
+                return
 
-                if isinstance(true_node, ConditionNode) and \
-                        true_node.true_node is not None and \
-                        true_node.false_node is None:
-                    node.condition = ailment.BinaryOp(None, "LogicalAnd", (node.condition, true_node.condition), False,
-                                                      **node.condition.tags)
-                    node.true_node = true_node.true_node
-
-    @staticmethod
-    def is_empty_node(node):
-        if isinstance(node, ailment.Block):
-            return not node.statements
-        if isinstance(node, SequenceNode):
-            return all(CascadingIfsRemover.is_empty_node(n) for n in node.nodes)
-        return False
+            if (
+                isinstance(true_node, ConditionNode)
+                and true_node.true_node is not None
+                and true_node.false_node is None
+            ):
+                node.condition = peephole_optimize_expr(
+                    ailment.BinaryOp(
+                        self.manager.next_atom(),
+                        "LogicalAnd",
+                        (node.condition, true_node.condition),
+                        False,
+                        **node.condition.tags,
+                    ),
+                    self._cond_opts,
+                )
+                node.true_node = true_node.true_node

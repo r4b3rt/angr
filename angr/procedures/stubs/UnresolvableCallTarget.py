@@ -1,12 +1,10 @@
-import angr
+from __future__ import annotations
 
-######################################
-# Unresolvable Call Target
-######################################
+import angr
 
 
 class UnresolvableCallTarget(angr.SimProcedure):
     NO_RET = False
 
-    def run(self):#pylint: disable=arguments-differ
+    def run(self):  # pylint: disable=arguments-differ
         return

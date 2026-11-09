@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import logging
 
 from angr.procedures.stubs.format_parser import FormatParser
 
 l = logging.getLogger(name=__name__)
+
 
 class printf(FormatParser):
     def run(self, fmt):
@@ -16,6 +19,7 @@ class printf(FormatParser):
 
         stdout.write_data(out_str, out_str.size() // 8)
         return out_str.size() // 8
+
 
 class __printf_chk(FormatParser):
     def run(self, _, fmt):

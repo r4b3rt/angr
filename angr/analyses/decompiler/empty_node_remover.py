@@ -1,12 +1,29 @@
-# pylint:disable=unused-argument
-import claripy
-import ailment
+# pylint:disable=unused-argument,no-self-use
+from __future__ import annotations
 
-from .sequence_walker import SequenceWalker
-from .region_identifier import MultiNode
-from .structurer_nodes import SequenceNode, CodeNode, ConditionNode, SwitchCaseNode, ConditionalBreakNode, \
-    BreakNode, LoopNode, CascadingConditionNode
+from collections import OrderedDict
+from typing import TYPE_CHECKING
+
+from angr import ailment, claripy
+from angr.ailment.expression import negate
+
 from .condition_processor import ConditionProcessor
+from .sequence_walker import SequenceWalker
+from .structurer_nodes import (
+    BreakNode,
+    CascadingConditionNode,
+    CodeNode,
+    ConditionalBreakNode,
+    ConditionNode,
+    ContinueNode,
+    LoopNode,
+    MultiNode,
+    SequenceNode,
+    SwitchCaseNode,
+)
+
+if TYPE_CHECKING:
+    from angr.ailment import Manager
 
 
 class EmptyNodeRemover:
@@ -19,12 +36,14 @@ class EmptyNodeRemover:
     :ivar _claripy_ast_conditions:  True if all node conditions are claripy ASTs. False if all node conditions are AIL
                                     expressions.
     """
-    def __init__(self, node, claripy_ast_conditions: bool=True):
+
+    def __init__(self, node, ail_manager: Manager, claripy_ast_conditions: bool = True):
         self.root = node
+        self.ail_manager = ail_manager
         self._claripy_ast_conditions = claripy_ast_conditions
 
-        self.removed_sequences = [ ]
-        self.replaced_sequences = { }
+        self.removed_sequences = []
+        self.replaced_sequences = {}
 
         handlers = {
             SequenceNode: self._handle_Sequence,
@@ -33,17 +52,16 @@ class EmptyNodeRemover:
             CascadingConditionNode: self._handle_CascadingCondition,
             SwitchCaseNode: self._handle_SwitchCase,
             LoopNode: self._handle_Loop,
-
+            ContinueNode: self._handle_Continue,
             MultiNode: self._handle_MultiNode,
             BreakNode: self._handle_Default,
             ConditionalBreakNode: self._handle_Default,
-
             ailment.Block: self._handle_Block,
         }
         self._walker = SequenceWalker(handlers=handlers)
         r = self._walker.walk(self.root)
         if r is None:
-            self.result = SequenceNode(None, nodes=[])
+            self.result = SequenceNode(node.addr, nodes=[])
         else:
             # Make sure it's still a sequence node
             if not isinstance(r, SequenceNode):
@@ -55,8 +73,7 @@ class EmptyNodeRemover:
     #
 
     def _handle_Sequence(self, node, **kwargs):
-
-        new_nodes = [ ]
+        new_nodes = []
         for node_ in node.nodes:
             new_node = self._walker._handle(node_)
             if new_node is not None:
@@ -78,8 +95,7 @@ class EmptyNodeRemover:
         return sn
 
     def _handle_MultiNode(self, node: MultiNode, **kwargs):
-
-        new_nodes = [ ]
+        new_nodes = []
         for node_ in node.nodes:
             new_node = self._walker._handle(node_)
             if new_node is not None:
@@ -99,9 +115,11 @@ class EmptyNodeRemover:
         inner_node = self._walker._handle(node.node)
         if inner_node is None:
             return None
-        if self._claripy_ast_conditions \
-                and node.reaching_condition is not None \
-                and claripy.is_true(node.reaching_condition):
+        if (
+            self._claripy_ast_conditions
+            and node.reaching_condition is not None
+            and claripy.is_true(node.reaching_condition)
+        ):
             # Remove the unnecessary CodeNode
             return inner_node
         if self._claripy_ast_conditions and isinstance(inner_node, CodeNode):
@@ -110,54 +128,71 @@ class EmptyNodeRemover:
         return CodeNode(inner_node, node.reaching_condition)
 
     def _handle_Condition(self, node, **kwargs):
-
         true_node = self._walker._handle(node.true_node)
         false_node = self._walker._handle(node.false_node)
 
         if true_node is None and false_node is None:
             # empty node
             return None
-        if true_node is None and false_node is not None and self._claripy_ast_conditions:
+        if true_node is None and false_node is not None:
             # swap them
-            return ConditionNode(node.addr,
-                                 node.reaching_condition,
-                                 ConditionProcessor.simplify_condition(claripy.Not(node.condition)),
-                                 false_node,
-                                 false_node=None)
-        if self._claripy_ast_conditions \
-                and claripy.is_true(node.condition) \
-                and node.true_node is not None and node.false_node is None:
+            return ConditionNode(
+                node.addr,
+                node.reaching_condition,
+                (
+                    ConditionProcessor.simplify_condition(claripy.Not(node.condition))
+                    if self._claripy_ast_conditions
+                    else negate(node.condition, self.ail_manager)
+                ),
+                false_node,
+                false_node=None,
+            )
+        if (
+            self._claripy_ast_conditions
+            and claripy.is_true(node.condition)
+            and node.true_node is not None
+            and node.false_node is None
+        ):
             return node.true_node
         return ConditionNode(node.addr, node.reaching_condition, node.condition, true_node, false_node=false_node)
 
     def _handle_CascadingCondition(self, node: CascadingConditionNode, **kwargs):
+        new_else_node = None if node.else_node is None else self._walker._handle(node.else_node)
 
-        new_cond_and_nodes = [ ]
+        new_cond_and_nodes = []
         for cond, child_node in node.condition_and_nodes:
             new_node = self._walker._handle(child_node)
             if new_node is not None:
                 new_cond_and_nodes.append((cond, new_node))
-
-        new_else_node = None if node.else_node is None else self._walker._handle(node.else_node)
+            else:
+                if new_else_node is not None:
+                    # do not allow any empty condition nodes, otherwise the condition for the else node will be wrong
+                    new_cond_and_nodes.append((cond, child_node))
 
         if not new_cond_and_nodes and new_else_node is None:
             # empty node
             return None
         return CascadingConditionNode(node.addr, new_cond_and_nodes, else_node=new_else_node)
 
-    def _handle_Loop(self, node, **kwargs):
+    def _handle_Loop(self, node: LoopNode, **kwargs):
         new_seq = self._walker._handle(node.sequence_node)
 
-        if new_seq is None:
+        if (
+            new_seq is None
+            and node.sort == "while"
+            and (node.condition is None or (isinstance(node.condition, ailment.Const) and node.condition.value == 0))
+        ):
             return None
 
         result = node.copy()
         result.sequence_node = new_seq
         return result
 
-    def _handle_SwitchCase(self, node, **kwargs):
+    def _handle_Continue(self, node: ContinueNode, **kwargs):
+        return node
 
-        new_cases = { }
+    def _handle_SwitchCase(self, node, **kwargs):
+        new_cases = OrderedDict()
 
         for idx, case in node.cases.items():
             new_case = self._walker._handle(case)
@@ -169,11 +204,7 @@ class EmptyNodeRemover:
         if not new_cases and new_default_node is None:
             return None
 
-        return SwitchCaseNode(node.switch_expr,
-                              new_cases,
-                              new_default_node,
-                              addr=node.addr
-                              )
+        return SwitchCaseNode(node.switch_expr, new_cases, new_default_node, addr=node.addr)
 
     @staticmethod
     def _handle_Default(node, **kwargs):

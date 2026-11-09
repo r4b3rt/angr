@@ -1,11 +1,15 @@
 # pylint:disable=no-self-use,arguments-renamed,isinstance-second-argument-not-valid-type
-from typing import Optional
+from __future__ import annotations
 
-import ailment
-import claripy
+from typing import TYPE_CHECKING
 
-from ..structurer_nodes import ConditionNode, CascadingConditionNode
-from ..sequence_walker import SequenceWalker
+from angr import ailment, claripy
+from angr.analyses.decompiler.sequence_walker import SequenceWalker
+from angr.analyses.decompiler.structurer_nodes import CascadingConditionNode, ConditionNode
+from angr.errors import AngrRuntimeError
+
+if TYPE_CHECKING:
+    from angr.ailment import Manager
 
 
 class CascadingConditionTransformer(SequenceWalker):
@@ -13,36 +17,38 @@ class CascadingConditionTransformer(SequenceWalker):
     Identifies and transforms `if { ... } else { if { ... } else { ... } }` to
     `if { ... } else if { ... } else if { ... }`.
     """
-    def __init__(self, node):
+
+    def __init__(self, node, manager: Manager):
         handlers = {
             ConditionNode: self._handle_Condition,
         }
         super().__init__(handlers)
-        self.cascading_if_node: Optional[CascadingConditionNode] = None
+        self.manager = manager
+        self.cascading_if_node: CascadingConditionNode | None = None
 
         self.walk(node)
 
-    def _negate_ailexpr(self, expr: ailment.Expression) -> ailment.Expression:
-        return ailment.UnaryOp(None, 'Not', expr, **expr.tags)
-
     def _handle_Condition(self, cond_node: ConditionNode, **kwargs):
-        if cond_node.false_node is not None \
-                and isinstance(cond_node.false_node, (ConditionNode, CascadingConditionNode)) \
-                and not isinstance(cond_node.true_node, (ConditionNode, CascadingConditionNode)) \
-                and cond_node.true_node is not None:
-
+        if (
+            cond_node.false_node is not None
+            and isinstance(cond_node.false_node, (ConditionNode, CascadingConditionNode))
+            and not isinstance(cond_node.true_node, (ConditionNode, CascadingConditionNode))
+            and cond_node.true_node is not None
+        ):
             cond_0 = cond_node.condition
             node_0 = cond_node.true_node
             remaining_node = cond_node.false_node
 
-        elif cond_node.true_node is not None \
-                and isinstance(cond_node.true_node, (ConditionNode, CascadingConditionNode)) \
-                and not isinstance(cond_node.false_node, (ConditionNode, CascadingConditionNode)) \
-                and cond_node.false_node is not None:
+        elif (
+            cond_node.true_node is not None
+            and isinstance(cond_node.true_node, (ConditionNode, CascadingConditionNode))
+            and not isinstance(cond_node.false_node, (ConditionNode, CascadingConditionNode))
+            and cond_node.false_node is not None
+        ):
             if isinstance(cond_node.condition, claripy.ast.Base):
                 cond_0 = claripy.Not(cond_node.condition)
             else:
-                cond_0 = self._negate_ailexpr(cond_node.condition)
+                cond_0 = ailment.expression.negate(cond_node.condition, self.manager)
             node_0 = cond_node.false_node
             remaining_node = cond_node.true_node
 
@@ -62,7 +68,7 @@ class CascadingConditionTransformer(SequenceWalker):
                 if isinstance(structured.condition, claripy.ast.Base):
                     negated_structured_condition = claripy.Not(structured.condition)
                 else:
-                    negated_structured_condition = self._negate_ailexpr(structured.condition)
+                    negated_structured_condition = ailment.expression.negate(structured.condition, self.manager)
                 cond_and_nodes = [
                     (cond_0, node_0),
                     (negated_structured_condition, structured.false_node),
@@ -83,13 +89,11 @@ class CascadingConditionTransformer(SequenceWalker):
 
         elif isinstance(structured, CascadingConditionNode):
             # merge two nodes
-            cond_and_nodes = [
-                                 (cond_0, node_0)
-                             ] + structured.condition_and_nodes
+            cond_and_nodes = [(cond_0, node_0), *structured.condition_and_nodes]
             else_node = structured.else_node
 
         else:
             # unexpected!
-            raise RuntimeError("Impossible happened")
+            raise AngrRuntimeError("Impossible happened")
 
         return CascadingConditionNode(cond_node.addr, cond_and_nodes, else_node=else_node)

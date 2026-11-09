@@ -1,14 +1,13 @@
+from __future__ import annotations
+
 import angr
 
-######################################
-# std::throw_logic_error
-######################################
 
-class std____throw_logic_error(angr.SimProcedure): #pylint:disable=redefined-builtin
-    #pylint:disable=arguments-differ
+class std____throw_logic_error(angr.SimProcedure):  # pylint:disable=redefined-builtin
+    # pylint:disable=arguments-differ
 
     NO_RET = True
-    ALT_NAMES = ('std::__throw_logic_error(char const*)', )
+    ALT_NAMES = ("std::__throw_logic_error(char const*)",)
 
     def run(self, error):  # pylint:disable=unused-argument
         # FIXME: we need the concept of C++ exceptions to implement this right

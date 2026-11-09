@@ -1,11 +1,12 @@
-from typing import Optional
+from __future__ import annotations
 
 import logging
 
 import networkx
 
-from ..utils.graph import compute_dominance_frontier, PostDominators, TemporaryNode
-from . import Analysis
+import angr
+from angr.analyses.analysis import AnalysesHub, Analysis
+from angr.utils.graph import PostDominators, TemporaryNode, compute_dominance_frontier
 
 _l = logging.getLogger(name=__name__)
 
@@ -23,23 +24,19 @@ class CDG(Analysis):
         :param start:           The starting point to begin constructing the control dependence graph
         :param no_construct:    Skip the construction step. Only used in unit-testing.
         """
-        self._binary = self.project.loader.main_object
         self._start = start if start is not None else self.project.entry
         self._cfg = cfg
 
         self._ancestor = None
         self._semi = None
-        self._post_dom: Optional[networkx.DiGraph] = None
+        self._post_dom: networkx.DiGraph | None = None
 
-        self._graph: Optional[networkx.DiGraph] = None
+        self._graph: networkx.DiGraph | None = None
         self._normalized_cfg = None
 
         if not no_construct:
             if self._cfg is None:
-                # This leads to import cycles otherwise
-                # pylint: disable=import-outside-toplevel
-                from angr.analyses.cfg.cfg_emulated import CFGEmulated
-                self._cfg = self.project.analyses[CFGEmulated].prep()()
+                self._cfg = self.project.analyses[angr.analyses.cfg.CFGEmulated].prep()()
 
             # FIXME: We should not use get_any_irsb in such a real setting...
             self._entry = self._cfg.model.get_any_node(self._start)
@@ -70,8 +67,7 @@ class CDG(Analysis):
         """
         if run in self._graph.nodes():
             return list(self._graph.successors(run))
-        else:
-            return []
+        return []
 
     def get_guardians(self, run):
         """
@@ -79,8 +75,7 @@ class CDG(Analysis):
         """
         if run in self._graph.nodes():
             return list(self._graph.predecessors(run))
-        else:
-            return []
+        return []
 
     #
     # Private methods
@@ -94,13 +89,13 @@ class CDG(Analysis):
         Form by Ron Cytron, etc.
         """
 
-        if not self._cfg._model.ident.startswith('CFGEmulated'):
+        if not self._cfg._model.ident.startswith("CFGEmulated"):
             raise ValueError("CDG is only supported by CFGEmulated.")
 
         self._acyclic_cfg = self._cfg.copy()
         # TODO: Cycle-removing is not needed - confirm it later
         # The CFG we use should be acyclic!
-        #self._acyclic_cfg.remove_cycles()
+        # self._acyclic_cfg.remove_cycles()
 
         # Pre-process the acyclic CFG
         self._pre_process_cfg()
@@ -108,7 +103,7 @@ class CDG(Analysis):
         # Construct post-dominator tree
         self._pd_construct()
 
-        self._graph: networkx.DiGraph  = networkx.DiGraph()
+        self._graph: networkx.DiGraph = networkx.DiGraph()
 
         # Construct the reversed dominance frontier mapping
         rdf = compute_dominance_frontier(self._normalized_cfg, self._post_dom)
@@ -127,13 +122,13 @@ class CDG(Analysis):
         - Change all FakeRet edges to normal edges when necessary (e.g. the normal/expected return edge does not exist)
         """
         for _, dst, data in self._acyclic_cfg.graph.edges(data=True):
-            if 'jumpkind' in data and data['jumpkind'] == 'Ijk_FakeRet':
-                all_edges_to_dst = self._acyclic_cfg.graph.in_edges([ dst ], data=True)
-                if not any((s, d) for s, d, da in all_edges_to_dst if da['jumpkind'] != 'Ijk_FakeRet' ):
+            if "jumpkind" in data and data["jumpkind"] == "Ijk_FakeRet":
+                all_edges_to_dst = self._acyclic_cfg.graph.in_edges([dst], data=True)
+                if not any((s, d) for s, d, da in all_edges_to_dst if da["jumpkind"] != "Ijk_FakeRet"):
                     # All in edges are FakeRets
                     # Change them to a normal edge
                     for _, _, data_ in all_edges_to_dst:
-                        data_['jumpkind'] = 'Ijk_Boring'
+                        data_["jumpkind"] = "Ijk_Boring"
 
     def _post_process(self):
         """
@@ -152,7 +147,6 @@ class CDG(Analysis):
     #
 
     def _pd_construct(self):
-
         pdoms = PostDominators(self._acyclic_cfg, self._entry, successors_func=self._pd_graph_successors)
 
         self._post_dom = pdoms.post_dom
@@ -166,15 +160,8 @@ class CDG(Analysis):
 
     @staticmethod
     def _pd_graph_successors(graph, node):
-
-        if type(node) is TemporaryNode:
-            # This is for testing
-            successors = graph.graph.successors(node)
-        else:
-            # Real CFGNode!
-            successors = graph.model.get_successors(node)
-
-        return successors
+        # The true condition is for testing
+        return graph.graph.successors(node) if type(node) is TemporaryNode else graph.model.get_successors(node)
 
     def _pd_post_process(self, cfg):
         """
@@ -195,5 +182,5 @@ class CDG(Analysis):
                 else:
                     _l.debug("%s is not in post dominator dict.", b2)
 
-from angr.analyses import AnalysesHub
-AnalysesHub.register_default('CDG', CDG)
+
+AnalysesHub.register_default("CDG", CDG)

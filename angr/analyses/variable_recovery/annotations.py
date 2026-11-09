@@ -1,23 +1,19 @@
+from __future__ import annotations
 
-from claripy import Annotation
+from angr.claripy import Annotation
 
 
 class StackLocationAnnotation(Annotation):
+    eliminatable = False
+    relocatable = False
+
     def __init__(self, offset):
-        super(StackLocationAnnotation, self).__init__()
+        super().__init__()
 
         self.offset = offset
 
-    @property
-    def eliminatable(self):
-        return False
-
-    @property
-    def relocatable(self):
-        return False
-
     def __hash__(self):
-        return hash(('stack_location', self.offset))
+        return hash(("stack_location", self.offset))
 
     def __eq__(self, other):
         if not isinstance(other, StackLocationAnnotation):
@@ -27,20 +23,15 @@ class StackLocationAnnotation(Annotation):
 
 
 class VariableSourceAnnotation(Annotation):
+    eliminatable = False
+    relocatable = False
+
     def __init__(self, block_addr, stmt_idx, ins_addr):
-        super(VariableSourceAnnotation, self).__init__()
+        super().__init__()
 
         self.block_addr = block_addr
         self.stmt_idx = stmt_idx
         self.ins_addr = ins_addr
-
-    @property
-    def eliminatable(self):
-        return False
-
-    @property
-    def relocatable(self):
-        return False
 
     def __hash__(self):
         return hash((self.block_addr, self.stmt_idx, self.ins_addr))
@@ -49,9 +40,9 @@ class VariableSourceAnnotation(Annotation):
         if not isinstance(other, VariableSourceAnnotation):
             return False
 
-        return self.block_addr == other.block_addr and \
-               self.stmt_idx == other.stmt_idx and \
-               self.ins_addr == other.ins_addr
+        return (
+            self.block_addr == other.block_addr and self.stmt_idx == other.stmt_idx and self.ins_addr == other.ins_addr
+        )
 
     @staticmethod
     def from_state(state):

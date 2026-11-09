@@ -1,11 +1,18 @@
 # pylint:disable=unused-argument,arguments-differ
-import ailment
+from __future__ import annotations
 
-from ..sequence_walker import SequenceWalker
-from ..structurer_nodes import SequenceNode, CodeNode, MultiNode, LoopNode, ConditionNode, EmptyBlockNotice, \
-    CascadingConditionNode
-from ..condition_processor import ConditionProcessor
-from ..utils import insert_node
+from angr.analyses.decompiler.condition_processor import ConditionProcessor
+from angr.analyses.decompiler.sequence_walker import SequenceWalker
+from angr.analyses.decompiler.structurer_nodes import (
+    CascadingConditionNode,
+    CodeNode,
+    ConditionNode,
+    EmptyBlockNotice,
+    LoopNode,
+    MultiNode,
+    SequenceNode,
+)
+from angr.analyses.decompiler.utils import insert_node, is_statement_terminating
 
 
 class IfElseFlattener(SequenceWalker):
@@ -13,6 +20,7 @@ class IfElseFlattener(SequenceWalker):
     Remove unnecessary else branches and make the else node a direct successor of the previous If node if the If node
     always returns.
     """
+
     def __init__(self, node, functions):
         handlers = {
             SequenceNode: self._handle_Sequence,
@@ -27,42 +35,57 @@ class IfElseFlattener(SequenceWalker):
         self.functions = functions
         self.walk(node)
 
-    def _handle_Condition(self, node, parent=None, index=None, **kwargs):
-        """
-
-        :param ConditionNode node:
-        :param successor:
-        :return:
-        """
-
-        if node.true_node is not None and node.false_node is not None:
-            try:
-                last_stmts = ConditionProcessor.get_last_statements(node.true_node)
-            except EmptyBlockNotice:
-                last_stmts = None
-            if last_stmts is not None and all(self._is_statement_terminating(stmt) for stmt in last_stmts):
-                # all end points in the true node are returning
-
-                # remove the else node and make it a new node following node
-                else_node = node.false_node
-                node.false_node = None
-                insert_node(parent, index + 1, else_node, index)
-
+    def _handle_Condition(self, node: ConditionNode, parent=None, index=None, **kwargs):
         if node.true_node is not None:
             self._handle(node.true_node, parent=node, index=0)
         if node.false_node is not None:
             self._handle(node.false_node, parent=node, index=1)
 
-    def _is_statement_terminating(self, stmt):
-
-        if isinstance(stmt, ailment.Stmt.Return):
-            return True
-        if isinstance(stmt, ailment.Stmt.Call) and isinstance(stmt.target, ailment.Expr.Const):
-            # is it calling a non-returning function?
-            target_func_addr = stmt.target.value
+        if node.true_node is not None and node.false_node is not None:
             try:
-                func = self.functions.get_by_addr(target_func_addr)
-                return func.returning is False
-            except KeyError:
-                pass
-        return False
+                true_last_stmts = ConditionProcessor.get_last_statements(node.true_node)
+            except EmptyBlockNotice:
+                true_last_stmts = None
+            if (
+                true_last_stmts is not None
+                and None not in true_last_stmts
+                and all(is_statement_terminating(stmt, self.functions) for stmt in true_last_stmts)
+            ):
+                # all end points in the true node are returning
+                try:
+                    false_last_stmts = ConditionProcessor.get_last_statements(node.false_node)
+                except EmptyBlockNotice:
+                    false_last_stmts = None
+                if (
+                    false_last_stmts is not None
+                    and None not in false_last_stmts
+                    and not all(is_statement_terminating(stmt, self.functions) for stmt in false_last_stmts)
+                ):
+                    # not all end points in the false node are returning. in this case, we remove the else node and
+                    # make it a new node following node
+                    else_node = node.false_node
+                    node.false_node = None
+                    insert_node(parent, "after", else_node, index, **kwargs)
+
+    def _handle_CascadingCondition(self, node: CascadingConditionNode, parent=None, index=None, **kwargs):
+        super()._handle_CascadingCondition(node, parent=parent, index=index, **kwargs)
+
+        if node.else_node is not None:
+            last_stmts = []
+            for _, subnode in node.condition_and_nodes:
+                try:
+                    last_stmts.extend(ConditionProcessor.get_last_statements(subnode))
+                except EmptyBlockNotice:
+                    last_stmts.append(None)
+
+            if (
+                last_stmts
+                and None not in last_stmts
+                and all(is_statement_terminating(stmt, self.functions) for stmt in last_stmts)
+            ):
+                # all end points in the true node are returning
+
+                # remove the else node and make it a new node following node
+                else_node = node.else_node
+                node.else_node = None
+                insert_node(parent, "after", else_node, index, **kwargs)

@@ -1,35 +1,50 @@
-from typing import Optional
-import logging
+from __future__ import annotations
 
-import claripy
+import logging
+import struct
+
 import pyvex
 
-from . import irop
-from . import ccall
-from ..light import VEXMixin
-from .... import errors
-from .... import sim_options as o
+from angr import claripy, errors
+from angr import sim_options as o
+from angr.engines.vex.light import VEXMixin
+
+from . import ccall, irop
 
 l = logging.getLogger(__name__)
 zero = claripy.BVV(0, 32)
 
-def value(ty, val, size: Optional[int]=None):
-    if ty == 'Ity_F32':
+
+def value(ty: str, val: float, size: int | None = None):
+    if ty == "Ity_F32":
         return claripy.FPV(float(val), claripy.FSORT_FLOAT)
-    elif ty == 'Ity_F64':
+    if ty == "Ity_F64":
         return claripy.FPV(float(val), claripy.FSORT_DOUBLE)
-    else:
-        if size is not None:
-            return claripy.BVV(int(val), size)
-        return claripy.BVV(int(val), pyvex.get_type_size(ty))
+    if size is not None:
+        return claripy.BVV(int(val), size)
+    return claripy.BVV(int(val), pyvex.get_type_size(ty))
+
+
+def value_bv(ty: str, val: float, size: int | None = None) -> claripy.ast.BV:
+    """
+    Like value(), but floating-point constants are returned as bitvectors holding their IEEE bit pattern.
+    """
+    if ty == "Ity_F32":
+        return claripy.BVV(struct.pack(">f", val))
+    if ty == "Ity_F64":
+        return claripy.BVV(struct.pack(">d", val))
+    if size is not None:
+        return claripy.BVV(int(val), size)
+    return claripy.BVV(int(val), pyvex.get_type_size(ty))
+
 
 def symbol(ty, name):
-    if ty == 'Ity_F32':
+    if ty == "Ity_F32":
         return claripy.FPS(name, claripy.FSORT_FLOAT)
-    elif ty == 'Ity_F64':
+    if ty == "Ity_F64":
         return claripy.FPS(name, claripy.FSORT_DOUBLE)
-    else:
-        return claripy.BVS(name, pyvex.get_type_size(ty))
+    return claripy.BVS(name, pyvex.get_type_size(ty))
+
 
 class ClaripyDataMixin(VEXMixin):
     """
@@ -38,20 +53,18 @@ class ClaripyDataMixin(VEXMixin):
 
     # util methods
 
-    def _is_true(self, v):
-        return claripy.is_true(v)
-
-    def _is_false(self, v):
-        return claripy.is_false(v)
-
-    def _optimize_guarded_addr(self, addr, guard):
+    @staticmethod
+    def _optimize_guarded_addr(addr, guard):
         # optimization: is the guard the same as the condition inside the address? if so, unpack the address and remove
         # the guarding condition.
-        if isinstance(guard, claripy.ast.Base) and guard.op == 'If' \
-                and isinstance(addr, claripy.ast.Base) and addr.op == 'If':
-            if guard.args[0] is addr.args[0]:
-                # the address is guarded by the same guard! unpack the addr
-                return addr.args[1]
+        if (
+            isinstance(guard, claripy.ast.Base)
+            and guard.op == "If"
+            and isinstance(addr, claripy.ast.Base)
+            and addr.op == "If"
+        ) and guard.args[0] is addr.args[0]:
+            # the address is guarded by the same guard! unpack the addr
+            return addr.args[1]
         return addr
 
     # consts
@@ -61,6 +74,7 @@ class ClaripyDataMixin(VEXMixin):
 
     # statements
 
+    # pylint: disable=too-many-positional-arguments
     def _perform_vex_stmt_LoadG(self, addr, alt, guard, dst, cvt, end):
         addr = self._optimize_guarded_addr(addr, guard)
         super()._perform_vex_stmt_LoadG(addr, alt, guard, dst, cvt, end)
@@ -83,17 +97,15 @@ class ClaripyDataMixin(VEXMixin):
 
     def _perform_vex_expr_Get(self, offset, ty, **kwargs):
         res = super()._perform_vex_expr_Get(offset, ty, **kwargs)
-        if ty.startswith('Ity_F'):
+        if ty.startswith("Ity_F"):
             return res.raw_to_fp()
-        else:
-            return res
+        return res
 
     def _perform_vex_expr_Load(self, addr, ty, endness, **kwargs):
         res = super()._perform_vex_expr_Load(addr, ty, endness, **kwargs)
-        if ty.startswith('Ity_F'):
+        if ty.startswith("Ity_F"):
             return res.raw_to_fp()
-        else:
-            return res
+        return res
 
     def _perform_vex_stmt_Put(self, offset, data, **kwargs):
         super()._perform_vex_stmt_Put(offset, data.raw_to_bv(), **kwargs)
@@ -104,15 +116,16 @@ class ClaripyDataMixin(VEXMixin):
     # op support
 
     def _perform_vex_expr_ITE(self, cond, ifTrue, ifFalse):
-        return claripy.If(cond != 0, ifTrue, ifFalse)
+        try:
+            return claripy.If(cond != 0, ifTrue, ifFalse)
+        except claripy.ClaripyError as e:
+            raise errors.SimError("Claripy failed") from e
 
     def _perform_vex_expr_Op(self, op, args):
         # TODO: get rid of these hacks (i.e. state options and modes) and move these switches into engine properties
-        options = getattr(self.state, 'options', {o.SUPPORT_FLOATING_POINT})
+        options = getattr(self.state, "options", {o.SUPPORT_FLOATING_POINT})
         simop = irop.vexop_to_simop(
-            op,
-            extended=o.EXTENDED_IROP_SUPPORT in options,
-            fp=o.SUPPORT_FLOATING_POINT in options
+            op, extended=o.EXTENDED_IROP_SUPPORT in options, fp=o.SUPPORT_FLOATING_POINT in options
         )
         return simop.calculate(*args)
 
@@ -126,14 +139,23 @@ class ClaripyDataMixin(VEXMixin):
                 raise errors.UnsupportedCCallError(f"Unsupported ccall {func_name}") from e
 
         try:
-            return func(self.state, *args)
-        except ccall.CCallMultivaluedException as e:
-            cases, to_replace = e.args
-            # pylint: disable=undefined-loop-variable
-            for i, arg in enumerate(args):
-                if arg is to_replace:
-                    break
-            else:
-                raise errors.UnsupportedCCallError("Trying to concretize a value which is not an argument")
-            evaluated_cases = [(case, func(self.state, *args[:i], value_, *args[i+1:])) for case, value_ in cases]
-            return claripy.ite_cases(evaluated_cases, value(ty, 0))
+            try:
+                return func(self.state, *args)
+            except ccall.CCallMultivaluedException as e:
+                cases, to_replace = e.args
+                for i, arg in enumerate(args):
+                    if arg is to_replace:
+                        break
+                else:
+                    raise errors.UnsupportedCCallError("Trying to concretize a value which is not an argument")
+                evaluated_cases = [
+                    (case, func(self.state, *args[:i], value_, *args[i + 1 :])) for case, value_ in cases
+                ]
+                return claripy.ite_cases(evaluated_cases, value(ty, 0))
+        except (claripy.UnsatError, claripy.ClaripySolverInterruptError):
+            # SimulationManager.step_state handles each of these ahead of its
+            # resilience tuple, so converting them would cost the interrupted
+            # stash and the unreachable-state bookkeeping.
+            raise
+        except claripy.ClaripyError as e:
+            raise errors.SimOperationError(f"ccall {func_name} raised {type(e).__name__}") from e

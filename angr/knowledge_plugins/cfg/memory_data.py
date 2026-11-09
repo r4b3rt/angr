@@ -1,6 +1,8 @@
 # pylint:disable=no-member
-from ...protos import cfg_pb2
-from ...serializable import Serializable
+from __future__ import annotations
+
+from angr.protos import cfg_pb2
+from angr.serializable import Serializable
 
 
 class MemoryDataSort:
@@ -13,8 +15,17 @@ class MemoryDataSort:
     SegmentBoundary = "segment-boundary"
     CodeReference = "code reference"
     GOTPLTEntry = "GOT PLT Entry"
-    ELFHeader = 'elf-header'
-    FloatingPoint = 'fp'  # the size is determined by the MemoryData itself
+    ELFHeader = "elf-header"
+    FloatingPoint = "fp"  # the size is determined by the MemoryData itself
+    Alignment = "alignment"
+    PEImportDirectory = "pe-import-directory"
+    PEExportDirectory = "pe-export-directory"
+    PEDelayImportDirectory = "pe-delay-import-directory"
+    EHFuncInfo = "eh-funcinfo"
+    EHUnwindMapEntry = "eh-unwindmapentry"
+    EH4ScopeTable = "eh4-scopetable"
+    EHTryBlockMap = "eh-tryblockmap"
+    EHHandlerType = "eh-handlertype"
 
 
 _SORT_TO_IDX = {
@@ -29,37 +40,76 @@ _SORT_TO_IDX = {
     MemoryDataSort.GOTPLTEntry: cfg_pb2.MemoryData.GOTPLTEntry,
     MemoryDataSort.ELFHeader: cfg_pb2.MemoryData.ELFHeader,
     MemoryDataSort.FloatingPoint: cfg_pb2.MemoryData.FloatingPoint,
+    MemoryDataSort.Alignment: cfg_pb2.MemoryData.Alignment,
+    MemoryDataSort.PEImportDirectory: cfg_pb2.MemoryData.PEImportDirectory,
+    MemoryDataSort.PEExportDirectory: cfg_pb2.MemoryData.PEExportDirectory,
+    MemoryDataSort.PEDelayImportDirectory: cfg_pb2.MemoryData.PEDelayImportDirectory,
+    MemoryDataSort.EHFuncInfo: cfg_pb2.MemoryData.EHFuncInfo,
+    MemoryDataSort.EHUnwindMapEntry: cfg_pb2.MemoryData.EHUnwindMapEntry,
+    MemoryDataSort.EH4ScopeTable: cfg_pb2.MemoryData.EH4ScopeTable,
+    MemoryDataSort.EHTryBlockMap: cfg_pb2.MemoryData.EHTryBlockMap,
+    MemoryDataSort.EHHandlerType: cfg_pb2.MemoryData.EHHandlerType,
 }
 
-_IDX_TO_SORT = dict((v, k) for k, v in _SORT_TO_IDX.items())
+_IDX_TO_SORT = {v: k for k, v in _SORT_TO_IDX.items()}
+
+MEMORY_DATA_SORTS = set(_SORT_TO_IDX)
 
 
 class MemoryData(Serializable):
     """
     MemoryData describes the syntactic content of a single address of memory.
+
+    `reference_size` reflects the size of `content`. It can be different from `size`, which is the actual size of the
+    memory data item in memory. The intended way to get the actual content in memory is `self.content[:self.size]`.
     """
 
-    __slots__ = ('addr', 'size', 'sort', 'max_size', 'pointer_addr', 'content', )
+    __slots__ = (
+        "addr",
+        "content",
+        "max_size",
+        "pointer_addr",
+        "reference_size",
+        "size",
+        "sort",
+    )
 
-    def __init__(self, address, size, sort, pointer_addr=None, max_size=None):
-        self.addr = address
-        self.size = size
-        self.sort = sort
+    def __init__(
+        self,
+        address: int,
+        size: int,
+        sort: str | None,  # temporary type
+        pointer_addr: int | None = None,
+        max_size: int | None = None,
+        reference_size: int | None = None,
+    ):
+        self.addr: int = address
+        self.size: int = size
+        self.reference_size: int = reference_size
+        self.sort: str | None = sort
 
-        self.max_size = max_size
-        self.pointer_addr = pointer_addr
+        self.max_size: int | None = max_size
+        self.pointer_addr: int | None = pointer_addr
 
-        self.content = None  # optional
+        self.content: bytes | None = None  # temporary annotation
+
+    def __eq__(self, other: MemoryData):
+        return (
+            self.addr == other.addr
+            and self.size == other.size
+            and self.reference_size == other.reference_size
+            and self.sort == other.sort
+            and self.max_size == other.max_size
+            and self.pointer_addr == other.pointer_addr
+            and self.content == other.content
+        )
 
     @property
     def address(self):
         return self.addr
 
     def __repr__(self):
-        return "\\%#x, %s, %s/" % (self.address,
-                                   "%d bytes" % self.size if self.size is not None else "size unknown",
-                                   self.sort
-                                   )
+        return f"\\{self.address:#x}, {self.size if self.size is not None else 'size unknown'} bytes, {self.sort}/"
 
     def copy(self):
         """
@@ -82,9 +132,17 @@ class MemoryData(Serializable):
         """
 
         if self.sort == MemoryDataSort.String:
-            self.content = loader.memory.load(self.addr, self.size)
+            self.content = loader.memory.load(
+                self.addr, self.reference_size if self.reference_size is not None else self.size
+            )
             if self.content.endswith(b"\x00"):
                 self.content = self.content.strip(b"\x00")
+        elif self.sort == MemoryDataSort.UnicodeString:
+            self.content = loader.memory.load(
+                self.addr, self.reference_size if self.reference_size is not None else self.size
+            )
+            if self.content.endswith(b"\x00\x00"):
+                self.content = self.content[:-2]
         else:
             # FIXME: Other types are not supported yet
             return
@@ -100,11 +158,18 @@ class MemoryData(Serializable):
     def serialize_to_cmessage(self):
         cmsg = self._get_cmsg()
         cmsg.ea = self.addr
-        cmsg.size = self.size if self.size is not None else 0
+        if self.size is not None:
+            cmsg.size = self.size
+        if self.reference_size is not None:
+            cmsg.reference_size = self.reference_size
         cmsg.type = _SORT_TO_IDX[self.sort]
         return cmsg
 
     @classmethod
     def parse_from_cmessage(cls, cmsg, **kwargs):
-        md = cls(cmsg.ea, cmsg.size, _IDX_TO_SORT[cmsg.type])
-        return md
+        return cls(
+            cmsg.ea,
+            cmsg.size if cmsg.HasField("size") else None,
+            _IDX_TO_SORT[cmsg.type],
+            reference_size=cmsg.reference_size if cmsg.HasField("reference_size") else None,
+        )

@@ -1,30 +1,24 @@
+from __future__ import annotations
 
-import random
 import string
 
-import claripy
-
-from ..func import Func, TestData
+from angr import claripy
+from angr.analyses.identifier.func import Func, TestData, rand_str
 
 
 class sprintf(Func):
     non_null = [chr(i) for i in range(1, 256)]
 
     def __init__(self):
-        super(sprintf, self).__init__()
+        super().__init__()
         self.format_spec_char = None
         self.string_spec_char = None
         self.allows_n = False
 
-    def rand_str(self, length, byte_list=None): #pylint disable=no-self-use
-        if byte_list is None:
-            return "".join(chr(random.randint(0, 255)) for _ in range(length))
-        return "".join(random.choice(byte_list) for _ in range(length))
-
     def num_args(self):
         return 2
 
-    def args(self): #pylint disable=no-self-use
+    def args(self):  # pylint disable=no-self-use
         return ["buf", "format"]
 
     def get_name(self):
@@ -41,8 +35,8 @@ class sprintf(Func):
     def pre_test(self, func, runner):
         # make sure it prints alphanumeric stuff
         length = 10
-        test_str = self.rand_str(length, string.ascii_letters + string.digits)
-        outbuf = self.rand_str(length + 2)
+        test_str = rand_str(length, string.ascii_letters + string.digits)
+        outbuf = rand_str(length + 2)
         test_input = [outbuf, test_str]
         test_output = [test_str + "\x00", test_str]
         max_steps = 20
@@ -51,7 +45,7 @@ class sprintf(Func):
             return False
 
         # find interesting characters
-        test_input = [outbuf, claripy.BVS("input", 10*8)]
+        test_input = [outbuf, claripy.BVS("input", 10 * 8)]
         test_output = [None, None]
         test = TestData(test_input, test_output, None, max_steps)
         s = runner.get_base_call_state(func, test)
@@ -65,7 +59,7 @@ class sprintf(Func):
                         if not a.symbolic:
                             interesting_chars.add(s.solver.eval(a))
 
-        interesting_chars = set(chr(a) for a in interesting_chars if 0 < a < 0x80)
+        interesting_chars = {chr(a) for a in interesting_chars if 0 < a < 0x80}
         alphanum = set(string.ascii_letters + string.digits)
         possible_format_specifiers = [c for c in interesting_chars if c not in alphanum]
         possible_formats = [c for c in interesting_chars if c in alphanum]

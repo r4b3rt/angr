@@ -1,12 +1,17 @@
 """
 These classes perform some python magic that we use to implement the nesting of exploration technique methods.
-This process is formalized as a "hooking" of a python method - each exploration technique's methods "hooks" a method of the same name on the simulation manager class.
+This process is formalized as a "hooking" of a python method - each exploration technique's methods "hooks" a method of
+the same name on the simulation manager class.
 """
+
+from __future__ import annotations
+
 
 class HookSet:
     """
     A HookSet is a static class that provides the capability to apply many hooks to an object.
     """
+
     @staticmethod
     def install_hooks(target, **hooks):
         """
@@ -16,7 +21,7 @@ class HookSet:
 
         :param target:  Any object. Its methods named as keys in `hooks` will be replaced by `HookedMethod` objects.
         :param hooks:   Any keywords will be interpreted as hooks to apply. Each method named will hooked with the
-                        coresponding function value.
+                        corresponding function value.
         """
         for name, hook in hooks.items():
             func = getattr(target, name)
@@ -32,8 +37,8 @@ class HookSet:
 
         :param target:  The object from which to remove hooks. If all hooks are removed from a given method, the
                         HookedMethod object will be removed and replaced with the original function.
-        :param hooks:   Any keywords will be interpreted as hooks to remove. You must provide the exact hook that was applied
-                        so that it can it can be identified for removal among any other hooks.
+        :param hooks:   Any keywords will be interpreted as hooks to remove. You must provide the exact hook that was
+                        applied so that it can it can be identified for removal among any other hooks.
         """
         for name, hook in hooks.items():
             hooked = getattr(target, name)
@@ -41,9 +46,24 @@ class HookSet:
                 try:
                     hooked.pending.remove(hook)
                 except ValueError as e:
-                    raise ValueError("%s is not hooked by %s" % (target, hook)) from e
+                    raise ValueError(f"{target} is not hooked by {hook}") from e
             if not hooked.pending:
                 setattr(target, name, hooked.func)
+
+    @staticmethod
+    def copy_hooks(source, target, domain):
+        """
+        Copy the hooks from source onto target.
+
+        If the current callstack includes hooked methods from source, the already-called methods will not be included in
+        the copy.
+
+        ``domain`` is a list of names that might be hooked.
+        """
+        for name in domain:
+            hooked = getattr(source, name)
+            if isinstance(hooked, HookedMethod):
+                setattr(target, name, hooked.copy_to(getattr(target, name)))
 
 
 class HookedMethod:
@@ -65,8 +85,10 @@ class HookedMethod:
         self.pending = []
 
     def __repr__(self):
-        return "<HookedMethod(%s.%s, %d pending)>" % \
-                (self.func.__self__.__class__.__name__, self.func.__name__, len(self.pending))
+        class_name = self.func.__self__.__class__.__name__
+        func_name = self.func.__name__
+        pending_count = len(self.pending)
+        return f"<HookedMethod({class_name}.{func_name}, {pending_count} pending)>"
 
     def __call__(self, *args, **kwargs):
         if self.pending:
@@ -76,5 +98,9 @@ class HookedMethod:
             finally:
                 self.pending.append(current_hook)
             return result
-        else:
-            return self.func(*args, **kwargs)
+        return self.func(*args, **kwargs)
+
+    def copy_to(self, new_func):
+        new_hooked = HookedMethod(new_func)
+        new_hooked.pending = list(self.pending)
+        return new_hooked

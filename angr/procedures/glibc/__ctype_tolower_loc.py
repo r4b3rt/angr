@@ -1,8 +1,7 @@
+from __future__ import annotations
+
 import angr
 
-######################################
-# __ctype_tolower_loc
-######################################
 
 class __ctype_tolower_loc(angr.SimProcedure):
     """
@@ -20,7 +19,4 @@ class __ctype_tolower_loc(angr.SimProcedure):
     """
 
     def run(self):
-
-        table_ptr = self.state.libc.ctype_tolower_loc_table_ptr
-
-        return table_ptr
+        return self.state.libc.ctype_tolower_loc_table_ptr

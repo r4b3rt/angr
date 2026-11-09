@@ -1,4 +1,7 @@
-from unittest import TestCase
+#!/usr/bin/env python3
+from __future__ import annotations
+
+from unittest import TestCase, main
 
 from angr.analyses.reaching_definitions.heap_allocator import HeapAllocator
 from angr.knowledge_plugins.key_definitions.heap_address import HeapAddress
@@ -11,26 +14,25 @@ class TestHeapAllocator(TestCase):
     def setUp(self):
         self.heap_allocator = HeapAllocator(self.UNKNOWN_SIZE_DEFAULT_CONCRETE_VALUE)
 
-
     def test_allocate_returns_an_entry_address(self):
         address = self.heap_allocator.allocate(0x10)
         self.assertTrue(isinstance(address, HeapAddress))
 
     def test_allocate_create_an_entry_after_the_previous_one(self):
-        size_of_first_chunck = 0x10
-        address = self.heap_allocator.allocate(size_of_first_chunck)
+        size_of_first_chunk = 0x10
+        address = self.heap_allocator.allocate(size_of_first_chunk)
         other_address = self.heap_allocator.allocate(0x10)
 
-        self.assertEqual(other_address.value - address.value, size_of_first_chunck)
+        self.assertEqual(other_address.value - address.value, size_of_first_chunk)
 
     def test_allocate_given_an_undefined_size_still_gives_a_concrete_address(self):
-        size_of_first_chunck = UNKNOWN_SIZE
-        address = self.heap_allocator.allocate(size_of_first_chunck)
+        size_of_first_chunk = UNKNOWN_SIZE
+        address = self.heap_allocator.allocate(size_of_first_chunk)
         other_address = self.heap_allocator.allocate(0x10)
 
         self.assertEqual(other_address.value - address.value, self.UNKNOWN_SIZE_DEFAULT_CONCRETE_VALUE)
 
-    def test_allocated_addresses_keeps_track_of_memory_chuncks_in_use(self):
+    def test_allocated_addresses_keeps_track_of_memory_chunks_in_use(self):
         address = self.heap_allocator.allocate(0x10)
 
         self.assertTrue(address in self.heap_allocator.allocated_addresses)
@@ -40,3 +42,7 @@ class TestHeapAllocator(TestCase):
         self.heap_allocator.free(address)
 
         self.assertFalse(address in self.heap_allocator.allocated_addresses)
+
+
+if __name__ == "__main__":
+    main()

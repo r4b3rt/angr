@@ -1,14 +1,13 @@
+from __future__ import annotations
+
 import angr
 
-######################################
-# std::terminate
-######################################
 
-class std__terminate(angr.SimProcedure): #pylint:disable=redefined-builtin
-    #pylint:disable=arguments-differ
+class std__terminate(angr.SimProcedure):  # pylint:disable=redefined-builtin
+    # pylint:disable=arguments-differ
 
     NO_RET = True
-    ALT_NAMES = ('std::terminate()', )
+    ALT_NAMES = ("std::terminate()",)
 
     def run(self):
         # FIXME: Call terminate handlers

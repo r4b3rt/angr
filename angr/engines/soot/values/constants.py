@@ -1,12 +1,13 @@
+from __future__ import annotations
 
 from .base import SimSootValue
 
-class SimSootValue_IntConstant(SimSootValue):
 
-    __slots__ = [ 'value', 'type' ]
+class SimSootValue_IntConstant(SimSootValue):
+    __slots__ = ["type", "value"]
 
     def __init__(self, value, type_):
-        super(SimSootValue_IntConstant, self).__init__()
+        super().__init__()
         self.value = value
         self.type = type_
 

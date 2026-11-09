@@ -1,12 +1,26 @@
-from typing import Dict, Tuple, Union, Optional
+from __future__ import annotations
 
-import claripy
-import ailment
+from enum import Enum, auto
 
-from ...calling_conventions import SimFunctionArgument, SimRegArg, SimStackArg
-from ...engines.light import SpOffset
+from archinfo import Arch, Endness, RegisterOffset
+
+from angr import ailment, claripy
+from angr.calling_conventions import SimFunctionArgument, SimRegArg, SimStackArg
+from angr.engines.light import SpOffset
+
 from .heap_address import HeapAddress
-from ...storage.memory_mixins.paged_memory.pages.multi_values import MultiValues
+
+
+class AtomKind(Enum):
+    """
+    An enum indicating the class of an atom
+    """
+
+    REGISTER = auto()
+    MEMORY = auto()
+    TMP = auto()
+    GUARD = auto()
+    CONSTANT = auto()
 
 
 class Atom:
@@ -16,121 +30,204 @@ class Atom:
     It could either be a Tmp (temporary variable), a Register, a MemoryLocation.
     """
 
-    __slots__ = ()
+    __slots__ = ("_hash", "size")
+
+    def __init__(self, size):
+        """
+        :param size:  The size of the atom in bytes
+        """
+        self.size = size
+        self._hash = None
+
+    def __getstate__(self):
+        # Exclude the cached hash from the pickle: it folds in per-process-salted
+        # string hashes (e.g. register names), so a persisted value is stale when
+        # unpickled in another process. It is recomputed lazily instead.
+        slotstate = {
+            slot: getattr(self, slot)
+            for klass in type(self).__mro__
+            for slot in getattr(klass, "__slots__", ())
+            if slot != "_hash" and hasattr(self, slot)
+        }
+        return getattr(self, "__dict__", None), slotstate
+
+    def __setstate__(self, state):
+        dictstate, slotstate = state if isinstance(state, tuple) else (None, state)
+        if dictstate:
+            self.__dict__.update(dictstate)
+        for slot, value in (slotstate or {}).items():
+            if slot != "_hash":
+                setattr(self, slot, value)
+        self._hash = None
 
     def __repr__(self):
-        raise NotImplementedError()
+        raise NotImplementedError
 
     @property
-    def size(self) -> int:
-        raise NotImplementedError()
+    def bits(self) -> int:
+        return self.size * 8
+
+    @property
+    def _size(self):
+        return self.size
+
+    @_size.setter
+    def _size(self, v):
+        self.size = v
 
     @staticmethod
-    def from_argument(argument: SimFunctionArgument, registers: Dict[str,Tuple[int,int]]):
+    def from_ail_expr(expr: ailment.Expr.Expression, arch: Arch, full_reg: bool = False) -> Register:
+        if isinstance(expr, ailment.Expr.Register):
+            if full_reg:
+                reg_name = arch.translate_register_name(expr.reg_offset)
+                return Register(arch.registers[reg_name][0], arch.registers[reg_name][1])
+            return Register(expr.reg_offset, expr.size)
+        raise TypeError(f"Expression type {type(expr)} is not yet supported")
+
+    @staticmethod
+    def from_argument(
+        argument: SimFunctionArgument, arch: Arch, full_reg=False, sp: int | None = None
+    ) -> Register | MemoryLocation:
         """
-        Instanciate an `Atom` from a given argument.
+        Instantiate an `Atom` from a given argument.
 
         :param argument: The argument to create a new atom from.
-        :param registers: A mapping representing the registers of a given architecture.
+        :param arch: The argument representing archinfo architecture for argument.
+        :param full_reg: Whether to return an atom indicating the entire register if the argument only specifies a
+                        slice of the register.
+        :param sp:      The current stack offset. Optional. Only used when argument is a SimStackArg.
         """
         if isinstance(argument, SimRegArg):
-            return Register(registers[argument.reg_name][0], argument.size)
-        elif isinstance(argument, SimStackArg):
-            return MemoryLocation(registers["sp"][0] + argument.stack_offset, argument.size)
+            if argument.reg_name not in arch.registers:
+                # e.g., the x87 st0 an X86 calling convention returns floats in
+                raise ValueError(f"Register {argument.reg_name} is unknown to {arch.name}")
+            if full_reg:
+                return Register(arch.registers[argument.reg_name][0], arch.registers[argument.reg_name][1])
+            return Register(arch.registers[argument.reg_name][0] + argument.reg_offset, argument.size)
+        if isinstance(argument, SimStackArg):
+            if sp is None:
+                raise ValueError("You must provide a stack pointer to translate a SimStackArg")
+            return MemoryLocation(
+                SpOffset(arch.bits, argument.stack_offset + sp), argument.size, endness=arch.memory_endness
+            )
+        raise TypeError(f"Argument type {type(argument)} is not yet supported.")
+
+    @staticmethod
+    def reg(thing: str | RegisterOffset, size: int | None = None, arch: Arch | None = None) -> Register:
+        """
+        Create a Register atom.
+
+        :param thing:   The register offset (e.g., project.arch.registers["rax"][0]) or the register name (e.g., "rax").
+        :param size:    Size of the register atom. Must be provided when creating the atom using a register offset.
+        :param arch:    The architecture. Must be provided when creating the atom using a register name.
+        :return:        The Register Atom object.
+        """
+
+        if isinstance(thing, str):
+            if arch is None:
+                raise ValueError(
+                    "Cannot create a Register Atom by register name without having an architecture "
+                    "specified through arch!"
+                )
+            if thing not in arch.registers:
+                raise ValueError(f"Unknown register name {thing} for architecture {arch.name}")
+            reg_offset, size_ = arch.registers[thing]
+            if size is None:
+                size = size_
+        elif isinstance(thing, RegisterOffset):
+            reg_offset = thing
+            if size is None:
+                raise ValueError("You must provide a size when specifying the register offset")
         else:
-            raise TypeError("Argument type %s is not yet supported." % type(argument))
+            raise TypeError(
+                "Unsupported type of register. It must be a string (for register name) or an int (for register offset)"
+            )
+        return Register(reg_offset, size)
+
+    register = reg
+
+    @staticmethod
+    def mem(addr: SpOffset | HeapAddress | int, size: int, endness: Endness | None = None) -> MemoryLocation:
+        """
+        Create a MemoryLocation atom,
+
+        :param addr:        The memory location. Can be an SpOffset for stack variables, an int for global memory
+                            variables, or a HeapAddress for items on the heap.
+        :param size:        Size of the atom.
+        :param endness:     Optional, either "Iend_LE" or "Iend_BE".
+        :return:            The MemoryLocation Atom object.
+        """
+        return MemoryLocation(addr, size, endness=endness)
+
+    memory = mem
+
+    def _identity(self):
+        raise NotImplementedError
+
+    def __hash__(self):
+        if self._hash is None:
+            self._hash = hash(self._identity())
+        return self._hash
+
+    def __eq__(self, other):
+        return type(self) is type(other) and self._identity() == other._identity()
+
+    # The atom is serialized as a wrapping ``Atom`` cmessage carrying the per-kind inner cmessage in a oneof field;
+    # ``parse_from_cmessage`` dispatches on ``WhichOneof("kind")`` to the right subclass.
 
 
 class GuardUse(Atom):
     """
     Implements a guard use.
     """
+
     __slots__ = ("target",)
 
     def __init__(self, target):
+        super().__init__(0)
         self.target = target
 
     def __repr__(self):
-        return '<Guard %#x>' % self.target
+        return f"<Guard {self.target:#x}>"
 
-    @property
-    def size(self) -> int:
-        raise NotImplementedError()
-
-
-class FunctionCall(Atom):
-    __slots__ = ('target', 'callsite')
-
-    def __init__(self, target, callsite):
-        self.target = target
-        self.callsite = callsite
-
-    @property
-    def single_target(self):
-        if type(self.target) is MultiValues and len(self.target.values) == 1 and 0 in self.target.values and \
-                len(self.target.values[0]) == 1 and next(iter(self.target.values[0])).op == 'BVV':
-            return next(iter(self.target.values[0])).args[0]
-        return None
-
-    def __repr__(self):
-        target = self.single_target
-        target_txt = hex(target) if target is not None else '(indirect)'
-        return '<Call %s>' % target_txt
-
-    def __eq__(self, other):
-        return type(other) is FunctionCall and self.callsite == other.callsite
-
-    def __hash__(self):
-        return hash(self.callsite)
-
-    @property
-    def size(self):
-        raise NotImplementedError
+    def _identity(self):
+        return (self.target,)
 
 
 class ConstantSrc(Atom):
-    __slots__ = ('const',)
+    """
+    Represents a constant.
+    """
 
-    def __init__(self, const):
-        self.const = const
+    __slots__ = ("value",)
+
+    def __init__(self, value: int, size: int):
+        super().__init__(size)
+        self.value: int = value
 
     def __repr__(self):
-        return repr(self.const)
+        return f"<Const {self.value}>"
 
-    def __eq__(self, other):
-        return type(other) is ConstantSrc and self.const == other.const
-
-    def __hash__(self):
-        return hash(self.const)
-
-    @property
-    def size(self):
-        return self.const.size
+    def _identity(self):
+        return (self.value, self.size)
 
 
 class Tmp(Atom):
     """
     Represents a variable used by the IR to store intermediate values.
     """
-    __slots__ = ('tmp_idx', '_size', )
+
+    __slots__ = ("tmp_idx",)
 
     def __init__(self, tmp_idx: int, size: int):
-        super().__init__()
+        super().__init__(size)
         self.tmp_idx = tmp_idx
-        self._size = size
 
     def __repr__(self):
-        return "<Tmp %d>" % self.tmp_idx
+        return f"<Tmp {self.tmp_idx}>"
 
-    def __eq__(self, other):
-        return type(other) is Tmp and self.tmp_idx == other.tmp_idx
-
-    def __hash__(self):
-        return hash(('tmp', self.tmp_idx))
-
-    @property
-    def size(self) -> int:
-        return self._size
+    def _identity(self):
+        return hash(("tmp", self.tmp_idx))
 
 
 class Register(Atom):
@@ -144,32 +241,85 @@ class Register(Atom):
     :ivar int reg_offset:    The offset from the base to define its place in the memory bloc.
     :ivar int size:          The size, in number of bytes.
     """
-    __slots__ = ('reg_offset', '_size', )
 
-    def __init__(self, reg_offset: int, size: int):
-        super().__init__()
+    __slots__ = ("reg_offset",)
 
-        self.reg_offset = reg_offset
-        self._size = size
+    def __init__(self, reg_offset: RegisterOffset | int, size: int):
+        super().__init__(size)
+
+        self.reg_offset = RegisterOffset(reg_offset)
 
     def __repr__(self):
-        return "<Reg %d<%d>>" % (self.reg_offset, self.size)
+        return f"<Reg {self.reg_offset}<{self.size}>>"
 
-    def __eq__(self, other):
-        return type(other) is Register and \
-               self.reg_offset == other.reg_offset and \
-               self.size == other.size
+    def _identity(self):
+        return (self.reg_offset, self.size)
 
-    def __hash__(self):
-        return hash(('reg', self.reg_offset, self.size))
+    def name(self, arch: Arch) -> str:
+        return arch.translate_register_name(self.reg_offset, self.size)
+
+
+class VirtualVariable(Atom):
+    """
+    Represents a virtual variable.
+    """
+
+    __slots__ = (
+        "category",
+        "oident",
+        "varid",
+    )
+
+    def __init__(
+        self,
+        varid: int,
+        size: int,
+        category: ailment.Expr.VirtualVariableCategory,
+        oident: str | int | tuple | None = None,
+    ):
+        super().__init__(size)
+
+        self.varid = varid
+        self.category = category
+        self.oident = oident
+
+    def __repr__(self):
+        return f"<VVar {self.varid}<{self.size}>>"
+
+    def _identity(self):
+        return self.varid, self.size
 
     @property
-    def bits(self) -> int:
-        return self._size * 8
+    def was_reg(self) -> bool:
+        return self.category == ailment.Expr.VirtualVariableCategory.REGISTER
 
     @property
-    def size(self) -> int:
-        return self._size
+    def was_stack(self) -> bool:
+        return self.category == ailment.Expr.VirtualVariableCategory.STACK
+
+    @property
+    def was_parameter(self) -> bool:
+        return self.category == ailment.Expr.VirtualVariableCategory.PARAMETER
+
+    @property
+    def was_tmp(self) -> bool:
+        return self.category == ailment.Expr.VirtualVariableCategory.TMP
+
+    @property
+    def reg_offset(self) -> int | None:
+        if self.was_reg:
+            return self.oident
+        return None
+
+    @property
+    def stack_offset(self) -> int | None:
+        if self.was_stack:
+            return self.oident
+        return None
+
+    @property
+    def tmp_idx(self) -> int | None:
+        return self.oident if self.was_tmp else None
 
 
 class MemoryLocation(Atom):
@@ -179,25 +329,27 @@ class MemoryLocation(Atom):
     It is characterized by its address and its size.
     """
 
-    __slots__ = ('addr', '_size', 'endness', )
+    __slots__ = (
+        "addr",
+        "endness",
+    )
 
-    def __init__(self, addr: Union[SpOffset,HeapAddress,int], size: int, endness: Optional[str]=None):
+    def __init__(self, addr: SpOffset | HeapAddress | int, size: int, endness: Endness | None = None):
         """
         :param int addr: The address of the beginning memory location slice.
         :param int size: The size of the represented memory location, in bytes.
         """
-        super().__init__()
+        super().__init__(size)
 
-        self.addr: Union[SpOffset,int,claripy.ast.BV] = addr
-        self._size: int = size
+        self.addr: SpOffset | int | claripy.ast.BV = addr
         self.endness = endness
 
     def __repr__(self):
         address_format = hex(self.addr) if type(self.addr) is int else self.addr
-        stack_format = ' (stack)' if self.is_on_stack else ''
-        size = "%d" % self.size if isinstance(self.size, int) else self.size
+        stack_format = " (stack)" if self.is_on_stack else ""
+        size = f"{self.size}" if isinstance(self.size, int) else self.size
 
-        return "<Mem %s<%s>%s>" % (address_format, size, stack_format)
+        return f"<Mem {address_format}<{size}>{stack_format}>"
 
     @property
     def is_on_stack(self) -> bool:
@@ -207,29 +359,36 @@ class MemoryLocation(Atom):
         return isinstance(self.addr, SpOffset)
 
     @property
-    def bits(self) -> int:
-        return self.size * 8
-
-    @property
-    def size(self) -> int:
-        return self._size
-
-    @property
     def symbolic(self) -> bool:
         if isinstance(self.addr, int):
             return False
-        elif isinstance(self.addr, SpOffset):
-            return not type(self.addr.offset) is int
+        if isinstance(self.addr, SpOffset):
+            return type(self.addr.offset) is not int
         return True
 
     def __eq__(self, other):
         # pylint:disable=isinstance-second-argument-not-valid-type
-        return type(other) is MemoryLocation and \
-               (
-                    self.addr is other.addr if isinstance(self.addr, (claripy.ast.BV)) else self.addr == other.addr
-               ) and \
-               self.size == other.size and \
-               self.endness == other.endness
+        return (
+            type(other) is MemoryLocation
+            and (
+                self.addr is other.addr
+                if (isinstance(self.addr, claripy.ast.BV) or isinstance(other.addr, claripy.ast.BV))
+                else self.addr == other.addr
+            )
+            and self.size == other.size
+            and self.endness == other.endness
+        )
 
-    def __hash__(self):
-        return hash(('mem', self.addr, self.size, self.endness))
+    __hash__ = Atom.__hash__
+
+    def _identity(self):
+        return self.addr, self.size, self.endness
+
+
+atom_kind_mapping = {
+    AtomKind.REGISTER: Register,
+    AtomKind.MEMORY: MemoryLocation,
+    AtomKind.TMP: Tmp,
+    AtomKind.GUARD: GuardUse,
+    AtomKind.CONSTANT: ConstantSrc,
+}

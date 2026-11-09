@@ -1,8 +1,10 @@
-import claripy
+from __future__ import annotations
 
-from . import MemoryMixin
-from .paged_memory.pages.ispo_mixin import ISPOMixin
-from ...errors import SimMergeError
+from angr import claripy
+from angr.errors import SimMergeError
+from angr.storage.memory_mixins.memory_mixin import MemoryMixin
+from angr.storage.memory_mixins.paged_memory.pages.ispo_mixin import ISPOMixin
+
 
 class SlottedMemoryMixin(MemoryMixin):
     def __init__(self, width=None, **kwargs):
@@ -33,14 +35,22 @@ class SlottedMemoryMixin(MemoryMixin):
             addr_set.update(o.contents)
 
         for addr in addr_set:
-            self._single_store(addr, 0, self.width, self.state.solver.ite_cases(zip(merge_conditions[1:], (o._single_load(addr, 0, self.width) for o in others)), self._single_load(addr, 0, self.width)))
+            self._single_store(
+                addr,
+                0,
+                self.width,
+                claripy.ite_cases(
+                    zip(merge_conditions[1:], (o._single_load(addr, 0, self.width) for o in others)),
+                    self._single_load(addr, 0, self.width),
+                ),
+            )
         # FIXME: Return True only when merge actually happens
         return True
 
     def _resolve_access(self, addr, size):
         """
-        Resolves a memory access of a certain size. Returns a sequence of the bases, offsets, and sizes of the accesses required
-        to fulfil this.
+        Resolves a memory access of a certain size. Returns a sequence of the bases, offsets, and sizes of the accesses
+        required to fulfil this.
         """
 
         # if we fit in one word
@@ -53,13 +63,13 @@ class SlottedMemoryMixin(MemoryMixin):
             last_base = addr + size - last_size
 
             result = [(first_base, first_offset, self.width - first_offset)]
-            result.extend((a, 0, self.width) for a in range(first_base+self.width, last_base, self.width))
+            result.extend((a, 0, self.width) for a in range(first_base + self.width, last_base, self.width))
             if last_size != 0:
                 result.append((last_base, 0, last_size))
 
         # little endian: need to slice in reverse and also concatenate in reverse
         # if load endness and storage endness don't match, reverse whole data value before store/after load
-        if self.endness == 'Iend_LE':
+        if self.endness == "Iend_LE":
             result = [(addr, self.width - offset - size, size) for addr, offset, size in reversed(result)]
 
         return result
@@ -71,13 +81,12 @@ class SlottedMemoryMixin(MemoryMixin):
         try:
             d = self.contents[addr]
         except KeyError:
-            d = self._default_value(addr, self.width, self.variable_key_prefix + (addr,), **kwargs)
+            d = self._default_value(addr, self.width, key=(*self.variable_key_prefix, addr), **kwargs)
             self.contents[addr] = d
 
         if offset == 0 and size == self.width:
             return d
-        else:
-            return d.get_bytes(offset, size)
+        return d.get_bytes(offset, size)
 
     def _single_store(self, addr, offset, size, data):
         """
@@ -95,23 +104,34 @@ class SlottedMemoryMixin(MemoryMixin):
         else:
             cur = self._single_load(addr, 0, self.width)
             start = cur.get_bytes(0, offset)
-            end = cur.get_bytes(offset+size, self.width-offset-size)
+            end = cur.get_bytes(offset + size, self.width - offset - size)
             self.contents[addr] = start.concat(data, end)
 
-    def load(self, addr, size=None, endness=None, **kwargs):
+    def load(self, addr, size=None, *, endness=None, **kwargs):
         accesses = self._resolve_access(addr, size)
 
-        value = claripy.Concat(*(self._single_load(addr, offset, size) for addr, offset, size in accesses))
+        pieces = [self._single_load(addr, offset, size) for addr, offset, size in accesses]
+        # Concat pieces if there are multiple
+        value = pieces[0] if len(pieces) == 1 else claripy.Concat(*pieces)
+
         if endness != self.endness:
             value = value.reversed
 
         return value
 
-    def store(self, addr, data, size=None, endness=None, **kwargs):
+    def store(self, addr, data, size=None, *, endness=None, **kwargs):
         if endness != self.endness:
             data = data.reversed
 
         accesses = self._resolve_access(addr, size)
+
+        # If we only have one access, we can skip the splitting and concatenation logic
+        # which has the side affect of creating extra claripy ASTs
+        if len(accesses) == 1:
+            addr, offset, size = accesses[0]
+            self._single_store(addr, offset, size, data)
+            return
+
         cur_offset = 0
         for addr, offset, size in accesses:
             piece = data.get_bytes(cur_offset, size)
@@ -121,11 +141,11 @@ class SlottedMemoryMixin(MemoryMixin):
     def changed_bytes(self, other):
         changes = set()
 
-        for addr,v in self.contents.items():
+        for addr, v in self.contents.items():
             for i in range(self.width):
-                other_byte = other.load(addr+i, 1)
+                other_byte = other.load(addr + i, 1)
                 our_byte = v.get_byte(i)
                 if other_byte is our_byte:
-                    changes.add(addr+i)
+                    changes.add(addr + i)
 
         return changes

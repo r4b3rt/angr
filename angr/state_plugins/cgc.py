@@ -1,7 +1,13 @@
-import operator
-from .plugin import SimStatePlugin
+from __future__ import annotations
 
-class SimStateCGC(SimStatePlugin):
+import operator
+
+from angr.sim_state import SimState
+
+from .plugin import SimStatePlugin, SupportsMerge
+
+
+class SimStateCGC(SimStatePlugin, SupportsMerge):
     """
     This state plugin keeps track of CGC state.
     """
@@ -18,18 +24,18 @@ class SimStateCGC(SimStatePlugin):
     FD_SETSIZE = 1024
     max_allocation = 0x10000000
 
-    #__slots__ = [ 'heap_location', 'max_str_symbolic_bytes' ]
+    # __slots__ = [ 'heap_location', 'max_str_symbolic_bytes' ]
 
     def __init__(self):
         SimStatePlugin.__init__(self)
 
-        self.allocation_base = 0xb8000000
+        self.allocation_base = 0xB8000000
         self.time = 0
 
         self.input_size = 0
 
-        self.input_strings = [ ]
-        self.output_strings = [ ]
+        self.input_strings = []
+        self.output_strings = []
 
         self.sinkholes = set()
 
@@ -38,7 +44,7 @@ class SimStateCGC(SimStatePlugin):
         self.max_receive_size = 0
 
     @SimStatePlugin.memo
-    def copy(self, memo): # pylint: disable=unused-argument
+    def copy(self, memo):  # pylint: disable=unused-argument
         c = super().copy(memo)
 
         c.allocation_base = self.allocation_base
@@ -53,32 +59,36 @@ class SimStateCGC(SimStatePlugin):
         return c
 
     def peek_input(self):
-        if len(self.input_strings) == 0: return None
+        if len(self.input_strings) == 0:
+            return None
         return self.input_strings[0]
 
     def discard_input(self, num_bytes):
-        if len(self.input_strings) == 0: return
+        if len(self.input_strings) == 0:
+            return
 
         self.input_strings[0] = self.input_strings[0][num_bytes:]
-        if self.input_strings[0] == b'':
+        if self.input_strings[0] == b"":
             self.input_strings.pop(0)
 
     def peek_output(self):
-        if len(self.output_strings) == 0: return None
+        if len(self.output_strings) == 0:
+            return None
         return self.output_strings[0]
 
     def discard_output(self, num_bytes):
-        if len(self.output_strings) == 0: return
+        if len(self.output_strings) == 0:
+            return
 
         self.output_strings[0] = self.output_strings[0][num_bytes:]
-        if self.output_strings[0] == b'':
+        if self.output_strings[0] == b"":
             self.output_strings.pop(0)
 
     def addr_invalid(self, a):
         return not self.state.solver.solution(a != 0, True)
 
     def _combine(self, others):
-        merging_occured = False
+        merging_occurred = False
 
         new_allocation_base = max(o.allocation_base for o in others)
         if self.state.solver.symbolic(new_allocation_base):
@@ -89,17 +99,14 @@ class SimStateCGC(SimStatePlugin):
 
         if concrete_allocation_base != concrete_new_allocation_base:
             self.allocation_base = new_allocation_base
-            merging_occured = True
+            merging_occurred = True
 
-        return merging_occured
+        return merging_occurred
 
-    def merge(self, others, merge_conditions, common_ancestor=None): # pylint: disable=unused-argument
+    def merge(self, others, merge_conditions, common_ancestor=None):  # pylint: disable=unused-argument
         return self._combine(others)
 
-    def widen(self, others):
-        return self._combine(others)
-
-### HEAP MANAGEMENT
+    ### HEAP MANAGEMENT
 
     def get_max_sinkhole(self, length):
         """
@@ -111,7 +118,7 @@ class SimStateCGC(SimStatePlugin):
         sinkhole is removed.
         """
 
-        ordered_sinks = sorted(list(self.sinkholes), key=operator.itemgetter(0), reverse=True)
+        ordered_sinks = sorted(self.sinkholes, key=operator.itemgetter(0), reverse=True)
         max_pair = None
         for addr, sz in ordered_sinks:
             if sz >= length:
@@ -143,5 +150,4 @@ class SimStateCGC(SimStatePlugin):
         self.sinkholes.add((address, length))
 
 
-from angr.sim_state import SimState
-SimState.register_default('cgc', SimStateCGC)
+SimState.register_default("cgc", SimStateCGC)

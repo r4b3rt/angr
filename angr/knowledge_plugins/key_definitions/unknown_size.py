@@ -1,8 +1,12 @@
+from __future__ import annotations
+
+
 class UnknownSize:
     """
     A value indicating an unknown size for elements of DataSets.
     Should "behave" like an integer.
     """
+
     def __add__(self, other):
         return self
 
@@ -70,12 +74,13 @@ class UnknownSize:
         return True
 
     def __hash__(self):
-        return hash('unknown size')
+        return hash("unknown size")
 
     def __str__(self):
-        return '<UnknownSize>'
+        return "<UnknownSize>"
 
     def __repr__(self):
         return "<UnknownSize>"
+
 
 UNKNOWN_SIZE = UnknownSize()

@@ -1,13 +1,13 @@
+from __future__ import annotations
 
 from .base import SimSootValue
 
 
 class SimSootValue_Local(SimSootValue):
-
-    __slots__ = [ 'id', 'type' ]
+    __slots__ = ["id", "type"]
 
     def __init__(self, name, type_):
-        super(SimSootValue_Local, self).__init__()
+        super().__init__()
         self.id = name
         self.type = type_
 

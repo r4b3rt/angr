@@ -1,24 +1,24 @@
+from __future__ import annotations
+
 import logging
 import weakref
-from typing import Union, TYPE_CHECKING
+from collections.abc import Callable
+from typing import Any
 
 from sortedcontainers import SortedDict
 
-if TYPE_CHECKING:
-    from .knowledge_plugins.key_definitions.unknown_size import UnknownSize
-
+from .knowledge_plugins.key_definitions.unknown_size import UnknownSize
 
 l = logging.getLogger(name=__name__)
 
 
 class StoredObject:
-
-    __slots__ = ('__weakref__', 'start', 'obj', 'size')
+    __slots__ = ("__weakref__", "obj", "size", "start")
 
     def __init__(self, start, obj, size):
         self.start = start
         self.obj = obj
-        self.size: Union['UnknownSize',int] = size
+        self.size: UnknownSize | int = size
 
     def __eq__(self, other):
         assert type(other) is StoredObject
@@ -29,7 +29,7 @@ class StoredObject:
         return hash((self.start, self.size, self.obj))
 
     def __repr__(self):
-        return "<SO %s@%#x, %s bytes>" % (repr(self.obj), self.start, self.size)
+        return f"<SO {self.obj!r}@{self.start:#x}, {self.size} bytes>"
 
     @property
     def obj_id(self):
@@ -41,7 +41,7 @@ class RegionObject:
     Represents one or more objects occupying one or more bytes in KeyedRegion.
     """
 
-    __slots__ = ('start', 'size', 'stored_objects', '_internal_objects')
+    __slots__ = ("_internal_objects", "size", "start", "stored_objects")
 
     def __init__(self, start, size, objects=None):
         self.start = start
@@ -54,8 +54,12 @@ class RegionObject:
                 self._internal_objects.add(obj.obj)
 
     def __eq__(self, other):
-        return type(other) is RegionObject and self.start == other.start and self.size == other.size and \
-               self.stored_objects == other.stored_objects
+        return (
+            type(other) is RegionObject
+            and self.start == other.start
+            and self.size == other.size
+            and self.stored_objects == other.stored_objects
+        )
 
     def __ne__(self, other):
         return not self == other
@@ -97,9 +101,18 @@ class RegionObject:
 
         self.add_object(obj)
 
-    def copy(self):
-        ro = RegionObject(self.start, self.size, objects=self.stored_objects.copy())
-        return ro
+    def remove_object(self, obj) -> None:
+        self.stored_objects = {so for so in self.stored_objects if so.obj is not obj}
+        self._internal_objects = {so.obj for so in self.stored_objects}
+
+    def copy(self, obj_mapper: Callable[[Any], Any] | None = None):
+        if obj_mapper is None:
+            return RegionObject(self.start, self.size, objects=self.stored_objects.copy())
+        return RegionObject(
+            self.start,
+            self.size,
+            objects={StoredObject(so.start, obj_mapper(so.obj), so.size) for so in self.stored_objects},
+        )
 
 
 class KeyedRegion:
@@ -110,7 +123,12 @@ class KeyedRegion:
     Registers and function frames can all be viewed as a keyed region.
     """
 
-    __slots__ = ('_storage', '_object_mapping', '_phi_node_contains', '_canonical_size', )
+    __slots__ = (
+        "_canonical_size",
+        "_object_mapping",
+        "_phi_node_contains",
+        "_storage",
+    )
 
     def __init__(self, tree=None, phi_node_contains=None, canonical_size=8):
         self._storage = SortedDict() if tree is None else tree
@@ -125,7 +143,7 @@ class KeyedRegion:
         self._storage, om, self._phi_node_contains = s
         self._object_mapping = weakref.WeakValueDictionary(om)
 
-    def _get_container(self, offset):
+    def _get_container(self, offset) -> tuple[int, RegionObject | None]:
         try:
             base_offset = next(self._storage.irange(maximum=offset, reverse=True))
         except StopIteration:
@@ -159,20 +177,27 @@ class KeyedRegion:
         if set(self._storage.keys()) != set(other._storage.keys()):
             return False
 
-        for k, v in self._storage.items():
-            if v != other._storage[k]:
-                return False
+        return all(v == other._storage[k] for k, v in self._storage.items())
 
-        return True
-
-    def copy(self):
-        if not self._storage:
-            return KeyedRegion(phi_node_contains=self._phi_node_contains, canonical_size=self._canonical_size)
-
+    def copy(self, obj_mapper: Callable[[Any], Any] | None = None):
+        """
+        Copy this region. With ``obj_mapper``, every stored object is replaced by ``obj_mapper(obj)``.
+        """
         kr = KeyedRegion(phi_node_contains=self._phi_node_contains, canonical_size=self._canonical_size)
+        if not self._storage:
+            return kr
+
+        if obj_mapper is None:
+            for key, ro in self._storage.items():
+                kr._storage[key] = ro.copy()
+            kr._object_mapping = self._object_mapping.copy()
+            return kr
+
         for key, ro in self._storage.items():
-            kr._storage[key] = ro.copy()
-        kr._object_mapping = self._object_mapping.copy()
+            new_ro = ro.copy(obj_mapper)
+            kr._storage[key] = new_ro
+            for so in new_ro.stored_objects:
+                kr._object_mapping[so.obj_id] = so
         return kr
 
     def merge(self, other, replacements=None):
@@ -187,8 +212,11 @@ class KeyedRegion:
             raise ValueError("The canonical sizes of two KeyedRegion objects must equal.")
 
         # TODO: is the current solution not optimal enough?
-        for _, item in other._storage.items():  # type: RegionObject
-            for so in item.stored_objects:  # type: StoredObject
+        _: RegionObject
+        item: RegionObject
+        for item in other._storage.values():
+            so: StoredObject
+            for so in item.stored_objects:
                 if replacements and so.obj in replacements:
                     so = StoredObject(so.start, replacements[so.obj], so.size)
                 self._object_mapping[so.obj_id] = so
@@ -205,8 +233,11 @@ class KeyedRegion:
         :return:        self
         """
 
-        for _, item in other._storage.items():  # type: RegionObject
-            for so in item.stored_objects:  # type: StoredObject
+        _: RegionObject
+        item: RegionObject
+        for item in other._storage.values():
+            so: StoredObject
+            for so in item.stored_objects:
                 if replacements and so.obj in replacements:
                     so = StoredObject(so.start, replacements[so.obj], so.size)
                 self._object_mapping[so.obj_id] = so
@@ -226,7 +257,7 @@ class KeyedRegion:
             old_var_id = id(old_var)
             if old_var_id in self._object_mapping:
                 # FIXME: we need to check if old_var still exists in the storage
-                old_so = self._object_mapping[old_var_id]  # type: StoredObject
+                old_so: StoredObject = self._object_mapping[old_var_id]
                 self._store(old_so.start, new_var, old_so.size, overwrite=True)
 
         return self
@@ -237,16 +268,16 @@ class KeyedRegion:
         :return: A string of debugging output.
         """
         keys = self._storage.keys()
-        offset_to_vars = { }
+        offset_to_vars = {}
 
         for key in sorted(keys):
             ro = self._storage[key]
-            variables = [ obj.obj for obj in ro.stored_objects ]
+            variables = [obj.obj for obj in ro.stored_objects]
             offset_to_vars[key] = variables
 
-        s = [ ]
+        s = []
         for offset, variables in offset_to_vars.items():
-            s.append("Offset %#x: %s" % (offset, variables))
+            s.append(f"Offset {offset:#x}: {variables}")
         return "\n".join(s)
 
     def add_variable(self, start, variable):
@@ -301,6 +332,27 @@ class KeyedRegion:
 
         self._store(start, obj, object_size, overwrite=True)
 
+    def remove_variable(self, start, variable) -> None:
+        """
+        Remove a variable that was added at the given offset. Other variables are untouched.
+        """
+
+        size = variable.size if variable.size is not None else 1
+        self.remove_object(start, variable, size)
+
+    def remove_object(self, start, obj, object_size) -> None:
+        end = start + self._canonicalize_size(object_size)
+        keys = list(self._storage.irange(start, end - 1))
+        floor_key, floor_item = self._get_container(start)
+        if floor_item is not None and floor_key not in keys:
+            keys.insert(0, floor_key)
+        for key in keys:
+            item: RegionObject = self._storage[key]
+            item.remove_object(obj)
+            if item.is_empty:
+                del self._storage[key]
+        self._object_mapping.pop(id(obj), None)
+
     def get_base_addr(self, addr):
         """
         Get the base offset (the key we are using to index objects covering the given offset) of a specific offset.
@@ -313,8 +365,7 @@ class KeyedRegion:
         base_addr, container = self._get_container(addr)
         if container is None:
             return None
-        else:
-            return base_addr
+        return base_addr
 
     def get_variables_by_offset(self, start):
         """
@@ -328,8 +379,7 @@ class KeyedRegion:
         _, container = self._get_container(start)
         if container is None:
             return set()
-        else:
-            return container.internal_objects
+        return container.internal_objects
 
     def get_objects_by_offset(self, start):
         """
@@ -342,8 +392,7 @@ class KeyedRegion:
         _, container = self._get_container(start)
         if container is None:
             return set()
-        else:
-            return container.internal_objects
+        return container.internal_objects
 
     def get_all_variables(self):
         """
@@ -361,11 +410,7 @@ class KeyedRegion:
     # Private methods
     #
 
-    def _canonicalize_size(self, size: Union[int,'UnknownSize']) -> int:
-
-        # delayed import
-        from .knowledge_plugins.key_definitions.unknown_size import UnknownSize  # pylint:disable=import-outside-toplevel
-
+    def _canonicalize_size(self, size: int | UnknownSize) -> int:
         if isinstance(size, UnknownSize):
             return self._canonical_size
         return size
@@ -400,11 +445,27 @@ class KeyedRegion:
         end: int = start + object_size
 
         # region items in the middle
-        overlapping_items = list(self._storage.irange(start, end-1))
+        overlapping_items = list(self._storage.irange(start, end - 1))
 
         # is there a region item that begins before the start and overlaps with this variable?
         floor_key, floor_item = self._get_container(start)
-        if floor_item is not None and floor_key not in overlapping_items:
+        if floor_item is None:
+            # fast path: just insert it
+            self._storage[start] = RegionObject(start, object_size, {stored_object})
+            return
+
+        # fast path: if there is a perfect overlap, just update the item
+        if len(overlapping_items) == 1 and floor_item.start == start and floor_item.end == end:
+            if overwrite:
+                floor_item.set_object(stored_object)
+            elif merge_to_top is False and top is None:
+                floor_item.add_object(stored_object)
+            else:
+                self._add_object_with_check(floor_item, stored_object, merge_to_top=merge_to_top, top=top)
+            return
+
+        # slower path: there are multiple overlapping items
+        if floor_key not in overlapping_items:
             # insert it into the beginning
             overlapping_items.insert(0, floor_key)
 
@@ -451,12 +512,11 @@ class KeyedRegion:
         self._storage.update(to_update)
 
     def _is_overlapping(self, start, variable):
-
         if variable.size is not None:
             # make sure this variable does not overlap with any other variable
             end = start + variable.size
             try:
-                prev_offset = next(self._storage.irange(maximum=end-1, reverse=True))
+                prev_offset = next(self._storage.irange(maximum=end - 1, reverse=True))
             except StopIteration:
                 prev_offset = None
 

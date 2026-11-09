@@ -1,21 +1,21 @@
 # pylint:disable=unused-argument,arguments-differ
-from typing import Set
+from __future__ import annotations
 
-import ailment
-
-from ..sequence_walker import SequenceWalker
+from angr import ailment
+from angr.analyses.decompiler.sequence_walker import SequenceWalker
 
 
 class NodeAddressFinder(SequenceWalker):
     """
     Walk the entire node and collect all addresses of nodes.
     """
+
     def __init__(self, node):
         handlers = {
             ailment.Block: self._handle_Block,
         }
         super().__init__(handlers=handlers)
-        self.addrs: Set[int] = set()
+        self.addrs: set[int] = set()
 
         self.walk(node)
 

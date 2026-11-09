@@ -1,12 +1,13 @@
-from typing import Type, Dict, Optional, List, TYPE_CHECKING
+from __future__ import annotations
+
+import logging
 
 from angr.errors import AngrNoPluginError
 
-import logging
 l = logging.getLogger(name=__name__)
 
 
-class PluginHub:
+class PluginHub[P]:
     """
     A plugin hub is an object which contains many plugins, as well as the notion of a "preset", or a
     backer that can provide default implementations of plugins which cater to a certain
@@ -21,33 +22,33 @@ class PluginHub:
     defaults.
     """
 
-    def __init__(self):
-        super(PluginHub, self).__init__()
-        self._active_plugins = {} # type: Dict[str, SimStatePlugin]
-        self._active_preset = None # type: Optional[PluginPreset]
-        self._provided_by_preset = [] # type: List[int]
+    def __init__(self) -> None:
+        super().__init__()
+        self._active_plugins: dict[str, P] = {}
+        self._active_preset: PluginPreset[P] | None = None
+        self._provided_by_preset: list[int] = []
 
     #
     #   Class methods for registration
     #
 
-    _presets = None # not a dict so different subclasses don't share instances
+    _presets: dict[str, PluginPreset[P]]
 
     @classmethod
-    def register_default(cls, name, plugin_cls, preset='default'):
-        if cls._presets is None or preset not in cls._presets:
+    def register_default(cls, name: str, plugin_cls: type, preset: str = "default") -> None:
+        if not hasattr(cls, "_presets") or preset not in cls._presets:
             l.error("Preset %s does not exist yet...", preset)
             return
         cls._presets[preset].add_default_plugin(name, plugin_cls)
 
     @classmethod
-    def register_preset(cls, name, preset):
+    def register_preset(cls, name: str, preset: PluginPreset[P]) -> None:
         """
         Register a preset instance with the class of the hub it corresponds to. This allows individual plugin objects to
         automatically register themselves with a preset by using a classmethod of their own with only the name of the
         preset to register with.
         """
-        if cls._presets is None:
+        if not hasattr(cls, "_presets"):
             cls._presets = {}
         cls._presets[name] = preset
 
@@ -55,10 +56,10 @@ class PluginHub:
     #   Python magic methods
     #
 
-    def __getstate__(self):
+    def __getstate__(self) -> tuple[dict[str, P], PluginPreset[P] | None, list[int]]:
         return self._active_plugins, self._active_preset, self._provided_by_preset
 
-    def __setstate__(self, s):
+    def __setstate__(self, s: tuple[dict[str, P], PluginPreset[P] | None, list[int]]) -> None:
         plugins, preset, provided = s
         self._active_preset = preset
         self._active_plugins = {}
@@ -68,16 +69,16 @@ class PluginHub:
             if name not in self._active_plugins:
                 self.register_plugin(name, plugin)
 
-    def __getattr__(self, name: str) -> 'SimStatePlugin':
+    def __getattr__(self, name: str) -> P:
         try:
             return self.get_plugin(name)
-        except AngrNoPluginError:
-            raise AttributeError(name)
+        except AngrNoPluginError as err:
+            raise AttributeError(name) from err
 
-    def __dir__(self):
+    def __dir__(self) -> list[str]:
         out = set(self.__dict__)
         out.update(self._active_plugins)
-        if self.has_plugin_preset:
+        if self._active_preset is not None:
             out.update(self._active_preset.list_default_plugins())
 
         q = [type(self)]
@@ -95,7 +96,7 @@ class PluginHub:
     #
 
     @property
-    def plugin_preset(self):
+    def plugin_preset(self) -> PluginPreset[P] | None:
         """
         Get the current active plugin preset
         """
@@ -108,7 +109,7 @@ class PluginHub:
         """
         return self._active_preset is not None
 
-    def use_plugin_preset(self, preset):
+    def use_plugin_preset(self, preset: str | PluginPreset[P]) -> None:
         """
         Apply a preset to the hub. If there was a previously active preset, discard it.
 
@@ -116,25 +117,24 @@ class PluginHub:
         """
         if isinstance(preset, str):
             try:
-                preset = self._presets[preset]
-            except (AttributeError, KeyError):
-                raise AngrNoPluginError("There is no preset named %s" % preset)
-
-        elif not isinstance(preset, PluginPreset):
-            raise ValueError("Argument must be an instance of PluginPreset: %s" % preset)
+                preset_obj = self._presets[preset]
+            except (AttributeError, KeyError) as err:
+                raise AngrNoPluginError(f"There is no preset named {preset}") from err
+        else:
+            preset_obj = preset
 
         if self._active_preset:
-            l.warning("Overriding active preset %s with %s", self._active_preset, preset)
+            l.warning("Overriding active preset %s with %s", self._active_preset, preset_obj)
             self.discard_plugin_preset()
 
-        preset.activate(self)
-        self._active_preset = preset
+        preset_obj.activate(self)
+        self._active_preset = preset_obj
 
-    def discard_plugin_preset(self):
+    def discard_plugin_preset(self) -> None:
         """
         Discard the current active preset. Will release any active plugins that could have come from the old preset.
         """
-        if self.has_plugin_preset:
+        if self._active_preset is not None:
             for name, plugin in list(self._active_plugins.items()):
                 if id(plugin) in self._provided_by_preset:
                     self.release_plugin(name)
@@ -145,7 +145,7 @@ class PluginHub:
     #   Methods for managing the current active plugins
     #
 
-    def get_plugin(self, name: str) -> 'SimStatePlugin':
+    def get_plugin(self, name: str) -> P:
         """
         Get the plugin named ``name``. If no such plugin is currently active, try to activate a new
         one using the current preset.
@@ -153,8 +153,8 @@ class PluginHub:
         if name in self._active_plugins:
             return self._active_plugins[name]
 
-        elif self.has_plugin_preset:
-            plugin_cls = self._active_preset.request_plugin(name)
+        if self._active_preset is not None:
+            plugin_cls: type[P] = self._active_preset.request_plugin(name)
             plugin = self._init_plugin(plugin_cls)
 
             # Remember that this plugin was provided by preset.
@@ -163,10 +163,9 @@ class PluginHub:
             self.register_plugin(name, plugin)
             return plugin
 
-        else:
-            raise AngrNoPluginError("No such plugin: %s" % name)
+        raise AngrNoPluginError(f"No such plugin: {name}")
 
-    def _init_plugin(self, plugin_cls: Type['SimStatePlugin']) -> 'SimStatePlugin':  # pylint: disable=no-self-use
+    def _init_plugin(self, plugin_cls: type[P]) -> P:  # pylint: disable=no-self-use
         """
         Perform any initialization actions on plugin before it is added to the list of active plugins.
 
@@ -174,13 +173,13 @@ class PluginHub:
         """
         return plugin_cls()
 
-    def has_plugin(self, name):
+    def has_plugin(self, name: str) -> bool:
         """
-        Return whether or not a plugin with the name ``name`` is curently active.
+        Return whether or not a plugin with the name ``name`` is currently active.
         """
         return name in self._active_plugins
 
-    def register_plugin(self, name: str, plugin):
+    def register_plugin(self, name: str, plugin: P) -> P:
         """
         Add a new plugin ``plugin`` with name ``name`` to the active plugins.
         """
@@ -190,7 +189,7 @@ class PluginHub:
         setattr(self, name, plugin)
         return plugin
 
-    def release_plugin(self, name):
+    def release_plugin(self, name: str) -> None:
         """
         Deactivate and remove the plugin with name ``name``.
         """
@@ -202,53 +201,53 @@ class PluginHub:
         delattr(self, name)
 
 
-class PluginPreset:
+class PluginPreset[P]:
     """
     A plugin preset object contains a mapping from name to a plugin class.
-    A preset can be active on a hub, which will cause it to handle requests for plugins which are not already present on the hub.
+    A preset can be active on a hub, which will cause it to handle requests for plugins which are not already present
+    on the hub.
 
     Unlike Plugins and PluginHubs, instances of PluginPresets are defined on the module level for individual presets.
-    You should register the preset instance with a hub to allow plugins to easily add themselves to the preset without an explicit reference to the preset itself.
+    You should register the preset instance with a hub to allow plugins to easily add themselves to the preset without
+    an explicit reference to the preset itself.
     """
 
-    def __init__(self):
-        self._default_plugins = {} # type: Dict[str, Type['SimStatePlugin']]
+    def __init__(self) -> None:
+        self._default_plugins: dict[str, type[P]] = {}
 
-    def activate(self, hub):  # pylint:disable=no-self-use,unused-argument
+    def activate(self, hub: PluginHub[P]) -> None:  # pylint:disable=no-self-use,unused-argument
         """
         This method is called when the preset becomes active on a hub.
         """
-        return
 
-    def deactivate(self, hub):  # pylint:disable=no-self-use,unused-argument
+    def deactivate(self, hub: PluginHub[P]) -> None:  # pylint:disable=no-self-use,unused-argument
         """
         This method is called when the preset is discarded from the hub.
         """
-        return
 
-    def add_default_plugin(self, name, plugin_cls):
+    def add_default_plugin(self, name: str, plugin_cls: type[P]) -> None:
         """
         Add a plugin to the preset.
         """
         self._default_plugins[name] = plugin_cls
 
-    def list_default_plugins(self):
+    def list_default_plugins(self) -> list[str]:
         """
         Return a list of the names of available default plugins.
         """
-        return self._default_plugins.keys()
+        return list(self._default_plugins.keys())
 
-    def request_plugin(self, name: str) -> Type['SimStatePlugin']:
+    def request_plugin(self, name: str) -> type[P]:
         """
         Return the plugin class which is registered under the name ``name``, or raise NoPlugin if
         the name isn't available.
         """
         try:
             return self._default_plugins[name]
-        except KeyError:
-            raise AngrNoPluginError("There is no plugin named %s" % name)
+        except KeyError as err:
+            raise AngrNoPluginError(f"There is no plugin named {name}") from err
 
-    def copy(self):
+    def copy(self) -> PluginPreset[P]:
         """
         Return a copy of self.
         """
@@ -258,31 +257,33 @@ class PluginPreset:
         return result
 
 
-class PluginVendor(PluginHub):
+class PluginVendor[P](PluginHub[P]):
     """
     A specialized hub which serves only as a plugin vendor, never having any "active" plugins.
-    It will directly return the plugins provided by the preset instead of instanciating them.
+    It will directly return the plugins provided by the preset instead of instantiating them.
     """
 
-    def release_plugin(self, name):
-        pass
+    def release_plugin(self, name: str) -> None:
+        """
+        This hub doesn't actually have any active plugins, so this is a no-op.
+        """
 
-    def register_plugin(self, name, plugin):
-        pass
+    def register_plugin(self, name: str, plugin: P) -> P:
+        """
+        This hub doesn't actually have any active plugins, so this is a no-op.
+        We just return the plugin that was passed in to satisfy the return type of PluginHub.register_plugin.
+        """
+        return plugin
 
-    def __dir__(self):
-        x = super(PluginVendor, self).__dir__()
-        x.remove('release_plugin')
-        x.remove('register_plugin')
-        x.remove('has_plugin')
+    def __dir__(self) -> list[str]:
+        x = super().__dir__()
+        x.remove("release_plugin")
+        x.remove("register_plugin")
+        x.remove("has_plugin")
         return x
 
 
-class VendorPreset(PluginPreset):
+class VendorPreset[P](PluginPreset[P]):
     """
     A specialized preset class for use with the PluginVendor.
     """
-    ...
-
-if TYPE_CHECKING:
-    from ..state_plugins import SimStatePlugin

@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import angr
+
 
 class tzset(angr.SimProcedure):
     # emulate as a no-op

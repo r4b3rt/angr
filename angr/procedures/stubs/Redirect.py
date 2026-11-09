@@ -1,18 +1,18 @@
-import angr
+from __future__ import annotations
 
-######################################
-# Redirect the control flow to some other places
-######################################
+import angr
+from angr import claripy
+
 
 class Redirect(angr.SimProcedure):
-    #pylint:disable=arguments-differ
+    # pylint:disable=arguments-differ
 
     NO_RET = True
 
     def run(self, redirect_to=None):
         if redirect_to is None:
-            raise Exception("Please specify where you wanna jump to.")
+            raise ValueError("Please specify where you wanna jump to.")
 
-        self._custom_name = "Redirect to 0x%08x" % redirect_to
+        self._custom_name = f"Redirect to 0x{redirect_to:08x}"
         # There is definitely no refs
-        self.add_successor(self.state, redirect_to, self.state.solver.true, 'Ijk_Boring')
+        self.add_successor(self.state, redirect_to, claripy.true(), "Ijk_Boring")

@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import logging
 
-from . import Analysis
+from angr.analyses.analysis import AnalysesHub, Analysis
 
 l = logging.getLogger(name=__name__)
 
@@ -24,9 +26,8 @@ class SootClassHierarchy(Analysis):
     """
 
     def __init__(self):
-
-        if self.project.arch.name != 'Soot':
-            raise SootClassHierarchyError('SootClassHierarchyError only supports analyzing Soot programs.')
+        if self.project.arch.name != "Soot":
+            raise SootClassHierarchyError("SootClassHierarchyError only supports analyzing Soot programs.")
 
         self.interface_implementers = {}
         self.sub_interfaces = {}
@@ -37,17 +38,16 @@ class SootClassHierarchy(Analysis):
         self.init_hierarchy()
 
     def init_hierarchy(self):
-        for class_name, cls in self.project.loader.main_object.classes.items():
-
-            if 'INTERFACE' in cls.attrs:
+        for cls in self.project.loader.main_object.classes.values():
+            if "INTERFACE" in cls.attrs:
                 self.interface_implementers[cls] = []
                 self.dir_sub_interfaces[cls] = []
             else:
                 self.dir_sub_classes[cls] = []
 
-        for class_name, cls in self.project.loader.main_object.classes.items():
+        for cls in self.project.loader.main_object.classes.values():
             if self.has_super_class(cls):
-                if 'INTERFACE' in cls.attrs:
+                if "INTERFACE" in cls.attrs:
                     # TODO
                     # super_interfaces
                     pass
@@ -64,8 +64,8 @@ class SootClassHierarchy(Analysis):
                         self.interface_implementers[i].append(cls)
 
         # fill direct implementers with subclasses
-        for class_name, cls in self.project.loader.main_object.classes.items():
-            if 'INTERFACE' in cls.attrs:
+        for cls in self.project.loader.main_object.classes.values():
+            if "INTERFACE" in cls.attrs:
                 implementers = self.interface_implementers[cls]
                 s = set()
 
@@ -85,20 +85,24 @@ class SootClassHierarchy(Analysis):
         return False
 
     def is_subclass_including(self, cls_child, cls_parent):
+        # An interface has no chain of super classes to walk, so the only class it stands in this
+        # relation to is itself. Asking is a legitimate question; get_super_classes_including cannot
+        # answer it and raises, so answer it here rather than let a predicate throw.
+        if "INTERFACE" in cls_child.attrs:
+            return cls_parent is cls_child
+
         parent_classes = self.get_super_classes_including(cls_child)
 
-        if cls_parent in parent_classes:
-            return True
-
-        return False
+        return cls_parent in parent_classes
 
     def is_subclass(self, cls_child, cls_parent):
+        # See above. An interface extends interfaces, never a class, so it is a subclass of none.
+        if "INTERFACE" in cls_child.attrs:
+            return False
+
         parent_classes = self.get_super_classes(cls_child)
 
-        if cls_parent in parent_classes:
-            return True
-
-        return False
+        return cls_parent in parent_classes
 
     def is_visible_method(self, cls, method):
         method_cls = self.project.loader.main_object.classes[method.class_name]
@@ -106,16 +110,16 @@ class SootClassHierarchy(Analysis):
         if not self.is_visible_class(cls, method_cls):
             return False
 
-        if 'PUBLIC' in method.attrs:
+        if "PUBLIC" in method.attrs:
             return True
 
-        if 'PRIVATE' in method.attrs:
+        if "PRIVATE" in method.attrs:
             return cls == method_cls
 
-        package_from = cls.name.split('.')[:-1]
-        package_to = method_cls.name.split('.')[:-1]
+        package_from = cls.name.split(".")[:-1]
+        package_to = method_cls.name.split(".")[:-1]
 
-        if 'PROTECTED' in method.attrs:
+        if "PROTECTED" in method.attrs:
             is_sub = self.is_subclass_including(cls, method_cls)
             is_same_package = package_from == package_to
             return is_sub or is_same_package
@@ -123,19 +127,19 @@ class SootClassHierarchy(Analysis):
         return package_from == package_to
 
     def is_visible_class(self, cls_from, cls_to):
-        if 'PUBLIC' in cls_to.attrs:
+        if "PUBLIC" in cls_to.attrs:
             return True
 
-        if 'PROTECTED' in cls_to.attrs or 'PRIVATE' in cls_to.attrs:
+        if "PROTECTED" in cls_to.attrs or "PRIVATE" in cls_to.attrs:
             return False
 
-        package_from = cls_from.name.split('.')[:-1]
-        package_to = cls_to.name.split('.')[:-1]
+        package_from = cls_from.name.split(".")[:-1]
+        package_to = cls_to.name.split(".")[:-1]
         return package_from == package_to
 
     def get_super_classes(self, cls):
-        if 'INTERFACE' in cls.attrs:
-            raise SootClassHierarchyError('This is an Interface')
+        if "INTERFACE" in cls.attrs:
+            raise SootClassHierarchyError("This is an Interface")
 
         super_classes = []
 
@@ -158,8 +162,8 @@ class SootClassHierarchy(Analysis):
         return res
 
     def get_implementers(self, interface):
-        if 'INTERFACE' not in interface.attrs:
-            raise SootClassHierarchyError('This is not an interface')
+        if "INTERFACE" not in interface.attrs:
+            raise SootClassHierarchyError("This is not an interface")
 
         res_set = set()
 
@@ -175,8 +179,8 @@ class SootClassHierarchy(Analysis):
         return res
 
     def get_sub_interfaces(self, interface):
-        if 'INTERFACE' not in interface.attrs:
-            raise SootClassHierarchyError('This is not an interface')
+        if "INTERFACE" not in interface.attrs:
+            raise SootClassHierarchyError("This is not an interface")
 
         if interface in self.sub_interfaces:
             return self.sub_interfaces[interface]
@@ -190,8 +194,8 @@ class SootClassHierarchy(Analysis):
         return res
 
     def get_sub_classes(self, cls):
-        if 'INTERFACE' in cls.attrs:
-            raise SootClassHierarchyError('This is an Interface. Class needed')
+        if "INTERFACE" in cls.attrs:
+            raise SootClassHierarchyError("This is an Interface. Class needed")
 
         if cls in self.sub_classes:
             return self.sub_classes[cls]
@@ -204,8 +208,8 @@ class SootClassHierarchy(Analysis):
         return res
 
     def get_sub_classes_including(self, cls):
-        if 'INTERFACE' in cls.attrs:
-            raise SootClassHierarchyError('This is an Interface. Class needed')
+        if "INTERFACE" in cls.attrs:
+            raise SootClassHierarchyError("This is an Interface. Class needed")
 
         res = []
         res.extend(self.get_sub_classes(cls))
@@ -214,7 +218,7 @@ class SootClassHierarchy(Analysis):
         return res
 
     def resolve_abstract_dispatch(self, cls, method):
-        if 'INTERFACE' in cls.attrs:
+        if "INTERFACE" in cls.attrs:
             classes_set = set()
             for i in self.get_implementers(cls):
                 classes_set |= set(self.get_sub_classes_including(i))
@@ -224,36 +228,34 @@ class SootClassHierarchy(Analysis):
 
         res_set = set()
         for c in classes:
-            if 'ABSTRACT' not in c.attrs:
+            if "ABSTRACT" not in c.attrs:
                 res_set.add(self.resolve_concrete_dispatch(c, method))
 
         return list(res_set)
 
     def resolve_concrete_dispatch(self, cls, method):
-        if 'INTERFACE' in cls.attrs:
-            raise SootClassHierarchyError('class needed!')
+        if "INTERFACE" in cls.attrs:
+            raise SootClassHierarchyError("class needed!")
 
         for c in self.get_super_classes_including(cls):
             for m in c.methods:
-                if m.name == method.name and m.params == method.params:
-                    if self.is_visible_method(c, method):
-                        return m
+                if m.name == method.name and m.params == method.params and self.is_visible_method(c, method):
+                    return m
 
-        raise NoConcreteDispatch('Could not resolve concrete dispatch!')
+        raise NoConcreteDispatch("Could not resolve concrete dispatch!")
 
     def resolve_special_dispatch(self, method, container):
         # container is the method that contains the invoke
         method_cls = self.project.loader.main_object.classes[method.class_name]
         container_cls = self.project.loader.main_object.classes[container.class_name]
 
-        if method.name == '<init>' or 'PRIVATE' in method.attrs:
+        if method.name == "<init>" or "PRIVATE" in method.attrs:
             return method
 
-        elif self.is_subclass(method_cls, container_cls):
+        if self.is_subclass(method_cls, container_cls):
             return self.resolve_concrete_dispatch(container_cls, method)
 
-        else:
-            return method
+        return method
 
     def resolve_invoke(self, invoke_expr, method, container):
         # Generic method to resolve invoke
@@ -261,24 +263,21 @@ class SootClassHierarchy(Analysis):
         invoke_type = str(type(invoke_expr))
         cls = self.project.loader.main_object.classes[method.class_name]
 
-        if 'VirtualInvokeExpr' in invoke_type:
+        if (
+            "VirtualInvokeExpr" in invoke_type
+            or "DynamicInvokeExpr" in invoke_type
+            or "InterfaceInvokeExpr" in invoke_type
+        ):
             targets = self.resolve_abstract_dispatch(cls, method)
 
-        elif 'DynamicInvokeExpr' in invoke_type:
-            targets = self.resolve_abstract_dispatch(cls, method)
-
-        elif 'InterfaceInvokeExpr' in invoke_type:
-            targets = self.resolve_abstract_dispatch(cls, method)
-
-        elif 'SpecialInvokeExpr' in invoke_type:
+        elif "SpecialInvokeExpr" in invoke_type:
             t = self.resolve_special_dispatch(method, container)
             targets = [t]
 
-        elif 'StaticInvokeExpr' in invoke_type:
+        elif "StaticInvokeExpr" in invoke_type:
             targets = [method]
 
         return targets
 
 
-from angr.analyses import AnalysesHub
-AnalysesHub.register_default('SootClassHierarchy', SootClassHierarchy)
+AnalysesHub.register_default("SootClassHierarchy", SootClassHierarchy)

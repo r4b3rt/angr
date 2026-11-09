@@ -1,14 +1,18 @@
-from typing import Optional, Tuple, TYPE_CHECKING
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from claripy.ast.bv import BV
-    from angr.state_plugins import SimActionData
+
+    from angr.state_plugins.sim_action import SimActionData
 
 
 class DepNodeTypes:
     """
     Enumeration of types of BaseDepNode supported by this analysis
     """
+
     Memory = 1
     Register = 2
     Tmp = 3
@@ -20,27 +24,27 @@ class BaseDepNode:
     Base class for all nodes in a data-dependency graph
     """
 
-    def __init__(self, type_: int, sim_act: 'SimActionData'):
+    def __init__(self, type_: int, sim_act: SimActionData):
         self._type = type_
         self._sim_act = sim_act
         self.ins_addr = sim_act.ins_addr
         self.stmt_idx = sim_act.stmt_idx
         self.action_id: int = sim_act.id
-        self.value: Optional[int] = None
-        self._value_ast: Optional['BV'] = None
+        self.value: int | None = None
+        self._value_ast: BV | None = None
 
-    def value_tuple(self) -> Tuple['BV', int]:
+    def value_tuple(self) -> tuple[BV, int]:
         """
         :return: A tuple containing the node's value as a BV and as an evaluated integer
         """
         return self.ast, self.value
 
     @property
-    def ast(self) -> 'BV':
+    def ast(self) -> BV:
         return self._value_ast
 
     @ast.setter
-    def ast(self, new_ast: 'BV'):
+    def ast(self, new_ast: BV):
         self._value_ast = new_ast
 
     @property
@@ -52,7 +56,7 @@ class BaseDepNode:
         return self._type
 
     def __repr__(self):
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def __eq__(self, other):
         return self.type == other.type and self.ins_addr == other.ins_addr and self.action_id == other.action_id
@@ -67,7 +71,7 @@ class ConstantDepNode(BaseDepNode):
     Uniquely identified by its value
     """
 
-    def __init__(self, sim_act: 'SimActionData', value: int):
+    def __init__(self, sim_act: SimActionData, value: int):
         super().__init__(DepNodeTypes.Constant, sim_act)
         self.value = value
 
@@ -89,7 +93,7 @@ class MemDepNode(BaseDepNode):
     Used to represent SimActions of type MEM
     """
 
-    def __init__(self, sim_act: 'SimActionData', addr: int):
+    def __init__(self, sim_act: SimActionData, addr: int):
         super().__init__(DepNodeTypes.Memory, sim_act)
         self.addr = addr
 
@@ -101,7 +105,7 @@ class MemDepNode(BaseDepNode):
         return hex(self.addr)
 
     def __repr__(self):
-        val_str = 'None' if self.value is None else hex(self.value)
+        val_str = "None" if self.value is None else hex(self.value)
         return f"{hex(self.addr)}\n{hex(self.ins_addr)}:{self.stmt_idx}\n{val_str}"
 
     def __eq__(self, other):
@@ -124,20 +128,20 @@ class VarDepNode(BaseDepNode):
     Abstract class for representing SimActions of TYPE reg or tmp
     """
 
-    def __init__(self, type_: int, sim_act: 'SimActionData', reg: int, arch_name: str = ''):
+    def __init__(self, type_: int, sim_act: SimActionData, reg: int, arch_name: str = ""):
         super().__init__(type_, sim_act)
         self.reg = reg
         self.arch_name = arch_name
 
     @property
     def display_name(self) -> str:
-        return self.arch_name if self.arch_name else hex(self.reg)
+        return self.arch_name or hex(self.reg)
 
     def __str__(self):
         return self.display_name
 
     def __repr__(self):
-        val_str = 'None' if self.value is None else hex(self.value)
+        val_str = "None" if self.value is None else hex(self.value)
         return f"{self.display_name}@{hex(self.ins_addr)}:{self.stmt_idx}\n{val_str}"
 
     def __eq__(self, other):
@@ -152,7 +156,7 @@ class TmpDepNode(VarDepNode):
     Used to represent SimActions of type TMP
     """
 
-    def __init__(self, sim_act: 'SimActionData', reg: int, arch_name: str = ''):
+    def __init__(self, sim_act: SimActionData, reg: int, arch_name: str = ""):
         super().__init__(DepNodeTypes.Tmp, sim_act, reg, arch_name)
 
 
@@ -161,7 +165,7 @@ class RegDepNode(VarDepNode):
     Base class for representing SimActions of TYPE reg
     """
 
-    def __init__(self, sim_act: 'SimActionData', reg: int, arch_name: str = ''):
+    def __init__(self, sim_act: SimActionData, reg: int, arch_name: str = ""):
         super().__init__(DepNodeTypes.Register, sim_act, reg, arch_name)
 
     @property

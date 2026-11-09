@@ -1,8 +1,6 @@
-import angr
+from __future__ import annotations
 
-######################################
-# Path terminator
-######################################
+import angr
 
 
 class PathTerminator(angr.SimProcedure):

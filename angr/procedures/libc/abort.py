@@ -1,8 +1,7 @@
+from __future__ import annotations
+
 import angr
 
-######################################
-# abort
-######################################
 
 class abort(angr.SimProcedure):
     NO_RET = True

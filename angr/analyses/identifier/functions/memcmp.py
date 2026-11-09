@@ -1,18 +1,13 @@
+from __future__ import annotations
 
 import random
 
-from ..func import Func, TestData
-
-
-def rand_str(length, byte_list=None):
-    if byte_list is None:
-        return "".join(chr(random.randint(0, 255)) for _ in range(length))
-    return "".join(random.choice(byte_list) for _ in range(length))
+from angr.analyses.identifier.func import Func, TestData, rand_str
 
 
 class memcmp(Func):
     def __init__(self):
-        super(memcmp, self).__init__() #pylint disable=useless-super-delegation
+        super().__init__()  # pylint disable=useless-super-delegation
 
     def get_name(self):
         return "memcmp"
@@ -20,7 +15,7 @@ class memcmp(Func):
     def num_args(self):
         return 3
 
-    def args(self): #pylint disable=no-self-use
+    def args(self):  # pylint disable=no-self-use
         return ["buf1", "buf2", "len"]
 
     def gen_input_output_pair(self):
@@ -64,8 +59,4 @@ class memcmp(Func):
 
         outval2 = s.solver.eval(s.regs.eax)
 
-        if outval1 != 0 or outval2 == 0:
-            return False
-
-
-        return True
+        return not (outval1 != 0 or outval2 == 0)

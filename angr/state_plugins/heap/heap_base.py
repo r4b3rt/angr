@@ -1,15 +1,25 @@
-from ..plugin import SimStatePlugin
+from __future__ import annotations
 
-from ...errors import SimMemoryError
-from .. import sim_options as opts
-
+import contextlib
 import logging
+from typing import Self
+
+import angr.sim_options as opts
+from angr.errors import SimMemoryError
+from angr.state_plugins.plugin import SimStatePlugin
 
 l = logging.getLogger("angr.state_plugins.heap.heap_base")
 
 # TODO: derive heap location from SimOS and binary info for something more realistic (and safe?)
-DEFAULT_HEAP_LOCATION = 0xc0000000
-DEFAULT_HEAP_SIZE = 64 * 4096
+DEFAULT_HEAP_LOCATION = 0xC0000000
+DEFAULT_HEAP_SIZE = 0x00800000
+
+# The number of bytes the heap region ``init_state`` maps up front.
+HEAP_INITIAL_MAPPED_SIZE = 0x2000
+
+# The factor by which the mapped extent of the heap grows every time an allocation runs past its end.
+HEAP_MAPPING_GROWTH_FACTOR = 2
+
 
 class SimHeapBase(SimStatePlugin):
     """
@@ -19,7 +29,8 @@ class SimHeapBase(SimStatePlugin):
     implementation, which is based on the original libc SimProcedure implementations.
 
     :ivar heap_base: the address of the base of the heap in memory
-    :ivar heap_size: the total size of the main memory region managed by the heap in memory
+    :ivar heap_size: the maximum size of the main memory region managed by the heap in memory. Only the part of it
+                     that has actually been handed out is mapped; see ``_ensure_mapped``.
     :ivar mmap_base: the address of the region from which large mmap allocations will be made
     """
 
@@ -30,12 +41,83 @@ class SimHeapBase(SimStatePlugin):
         self.heap_size = heap_size if heap_size is not None else DEFAULT_HEAP_SIZE
         self.mmap_base = self.heap_base + self.heap_size * 2
 
-    def copy(self, memo):
-        o = super().copy(memo)
+        # The exclusive end address of the part of the heap region that this plugin has mapped into the memory
+        # plugin. ``None`` means that this plugin does not manage the heap mapping.
+        self._mapped_end: int | None = None
+
+    def copy(self, memo) -> Self:
+        o: SimHeapBase = super().copy(memo)
         o.heap_base = self.heap_base
         o.heap_size = self.heap_size
         o.mmap_base = self.mmap_base
+        o._mapped_end = self._mapped_end  # pylint:disable=protected-access
         return o
+
+    def __setstate__(self, state):
+        if "_mapped_end" not in state:
+            # unpickling a state from before the heap mapping became lazy: back then init_state() mapped the
+            # entire region up front, so that is what the mapped extent has to be
+            state = dict(state)
+            state["_mapped_end"] = state["heap_base"] + state["heap_size"]
+        self.__dict__.update(state)
+
+    def _combine_mapped_end(self, others):
+        """
+        Reconcile the mapped extent of this heap with the heaps it is being merged with.
+        """
+        ends = [self._mapped_end, *(o._mapped_end for o in others)]  # pylint: disable=protected-access
+        self._mapped_end = None if any(e is None for e in ends) else min(ends)
+
+    def _map_range(self, start, end):
+        """
+        Map ``[start, end)`` as read/write, tolerating pages that happen to be mapped already.
+
+        :param start:   the first address to map (rounded down to a page boundary by the memory plugin)
+        :param end:     the exclusive end of the range to map
+        """
+        try:
+            self.state.memory.map_region(start, end - start, 3)
+        except SimMemoryError:
+            # something in this range is mapped already (an mmap, a gdb heap dump, a merge with a state that had
+            # grown further, ...). Redo it page by page and skip whatever exists.
+            page_size = getattr(self.state.memory, "page_size", 0x1000)
+            for page_addr in range(start - (start % page_size), end, page_size):
+                with contextlib.suppress(SimMemoryError):
+                    self.state.memory.map_region(page_addr, page_size, 3)
+
+    def _init_mapping(self):
+        """
+        Map the initial slice of the heap region. Called by ``init_state`` once it has determined that this plugin
+        owns the mapping of the region.
+        """
+        self._mapped_end = self.heap_base
+        self._ensure_mapped(self.heap_base + min(HEAP_INITIAL_MAPPED_SIZE, self.heap_size))
+
+    def _ensure_mapped(self, addr):
+        """
+        Make sure every byte of the heap region below ``addr`` is backed by a mapped page, growing the mapped
+        extent geometrically.
+
+        :param addr:    the exclusive end of the heap range that is about to be used
+        """
+        mapped_end = self._mapped_end
+        if mapped_end is None:
+            # this plugin does not manage the mapping of the heap region
+            return
+
+        region_end = self.heap_base + self.heap_size
+        addr = min(addr, region_end)
+        if addr <= mapped_end:
+            return
+
+        size = max(mapped_end - self.heap_base, HEAP_INITIAL_MAPPED_SIZE)
+        while self.heap_base + size < addr:
+            size *= HEAP_MAPPING_GROWTH_FACTOR
+        new_end = min(self.heap_base + size, region_end)
+
+        l.debug("Growing the mapped heap region to %#x (%d bytes)", new_end, new_end - self.heap_base)
+        self._map_range(mapped_end, new_end)
+        self._mapped_end = new_end
 
     def _conc_alloc_size(self, sim_size):
         """
@@ -65,8 +147,12 @@ class SimHeapBase(SimStatePlugin):
         if self.state.solver.symbolic(sim_size):
             size = self.state.solver.max_int(sim_size)
             if size > self.state.libc.max_variable_size:
-                l.warning("Allocation request of %d bytes exceeded maximum of %d bytes; allocating %d bytes",
-                          size, self.state.libc.max_variable_size, self.state.libc.max_variable_size)
+                l.warning(
+                    "Allocation request of %d bytes exceeded maximum of %d bytes; allocating %d bytes",
+                    size,
+                    self.state.libc.max_variable_size,
+                    self.state.libc.max_variable_size,
+                )
                 size = self.state.libc.max_variable_size
         else:
             size = self.state.solver.eval(sim_size)
@@ -79,8 +165,7 @@ class SimHeapBase(SimStatePlugin):
 
         :param sim_size: the amount of memory (in bytes) to be allocated
         """
-        raise NotImplementedError("%s not implemented for %s" % (self._malloc.__func__.__name__,
-                                                                 self.__class__.__name__))
+        raise NotImplementedError(f"{self._malloc.__func__.__name__} not implemented for {self.__class__.__name__}")
 
     def _free(self, ptr):
         """
@@ -89,8 +174,7 @@ class SimHeapBase(SimStatePlugin):
 
         :param ptr: the location in memory to be freed
         """
-        raise NotImplementedError("%s not implemented for %s" % (self._free.__func__.__name__,
-                                                                 self.__class__.__name__))
+        raise NotImplementedError(f"{self._free.__func__.__name__} not implemented for {self.__class__.__name__}")
 
     def _calloc(self, sim_nmemb, sim_size):
         """
@@ -100,8 +184,7 @@ class SimHeapBase(SimStatePlugin):
         :param sim_nmemb: the number of elements to allocated
         :param sim_size: the size of each element (in bytes)
         """
-        raise NotImplementedError("%s not implemented for %s" % (self._calloc.__func__.__name__,
-                                                                 self.__class__.__name__))
+        raise NotImplementedError(f"{self._calloc.__func__.__name__} not implemented for {self.__class__.__name__}")
 
     def _realloc(self, ptr, size):
         """
@@ -111,8 +194,7 @@ class SimHeapBase(SimStatePlugin):
         :param ptr: the location in memory to be reallocated
         :param size: the new size desired for the allocation
         """
-        raise NotImplementedError("%s not implemented for %s" % (self._realloc.__func__.__name__,
-                                                                 self.__class__.__name__))
+        raise NotImplementedError(f"{self._realloc.__func__.__name__} not implemented for {self.__class__.__name__}")
 
     def init_state(self):
         if opts.ABSTRACT_MEMORY in self.state.options:
@@ -122,4 +204,4 @@ class SimHeapBase(SimStatePlugin):
             self.state.memory.permissions(self.heap_base)
         except SimMemoryError:
             l.debug("Mapping base heap region")
-            self.state.memory.map_region(self.heap_base, self.heap_size, 3)
+            self._init_mapping()

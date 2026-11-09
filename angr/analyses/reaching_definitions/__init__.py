@@ -1,31 +1,64 @@
-from typing import Set, Optional, Union, TYPE_CHECKING
+from __future__ import annotations
 
-from ...knowledge_plugins.key_definitions import LiveDefinitions
-from .. import register_analysis
-from .reaching_definitions import ReachingDefinitionsAnalysis
+from typing import TYPE_CHECKING
 
+from angr.analyses.analysis import register_analysis
+from angr.knowledge_plugins.key_definitions import LiveDefinitions
+from angr.knowledge_plugins.key_definitions.atoms import (
+    Atom,
+    AtomKind,
+    ConstantSrc,
+    GuardUse,
+    MemoryLocation,
+    Register,
+    Tmp,
+)
+from angr.knowledge_plugins.key_definitions.constants import ObservationPointType
+from angr.knowledge_plugins.key_definitions.definition import Definition
+
+from .function_handler import FunctionCallData, FunctionCallRelationships, FunctionHandler
+from .rd_state import ReachingDefinitionsState
+from .reaching_definitions import ReachingDefinitionsAnalysis, ReachingDefinitionsModel
 
 if TYPE_CHECKING:
-    from angr.knowledge_plugins.key_definitions.definition import Definition
-    from angr.storage.memory_object import SimMemoryObject
     from angr.storage.memory_mixins import MultiValuedMemory
     from angr.storage.memory_mixins.paged_memory.pages import MVListPage
+    from angr.storage.memory_object import SimMemoryObject
+
+__all__ = (
+    "Atom",
+    "AtomKind",
+    "ConstantSrc",
+    "Definition",
+    "FunctionCallData",
+    "FunctionCallRelationships",
+    "FunctionHandler",
+    "GuardUse",
+    "LiveDefinitions",
+    "MemoryLocation",
+    "ObservationPointType",
+    "ReachingDefinitionsAnalysis",
+    "ReachingDefinitionsModel",
+    "ReachingDefinitionsState",
+    "Register",
+    "Tmp",
+    "get_all_definitions",
+)
 
 
-def get_all_definitions(region: 'MultiValuedMemory') -> Set['Definition']:
-
-    all_defs: Set['Definition'] = set()
+def get_all_definitions(region: MultiValuedMemory) -> set[Definition]:
+    all_defs: set[Definition] = set()
 
     # MultiValuedMemory only uses ListPage internally
     for page in region._pages.values():
-        page: 'MVListPage'
+        page: MVListPage
 
         for idx in page.stored_offset:
-            cnt_set: Optional[Union['SimMemoryObject', Set['SimMemoryObject']]] = page.content[idx]
+            cnt_set: SimMemoryObject | set[SimMemoryObject] | None = page.content[idx]
             if cnt_set is None:
                 continue
-            elif not type(cnt_set) is set:
-                cnt_set = { cnt_set }
+            if type(cnt_set) is not set:
+                cnt_set = {cnt_set}
             for cnt in cnt_set:
                 for def_ in LiveDefinitions.extract_defs(cnt.object):
                     all_defs.add(def_)
@@ -33,4 +66,4 @@ def get_all_definitions(region: 'MultiValuedMemory') -> Set['Definition']:
     return all_defs
 
 
-register_analysis(ReachingDefinitionsAnalysis, 'ReachingDefinitions')
+register_analysis(ReachingDefinitionsAnalysis, "ReachingDefinitions")

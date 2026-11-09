@@ -1,15 +1,24 @@
-from typing import List, Dict
-import logging
-import cle
+from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING
+
+import cle
 from capstone import CS_GRP_CALL, CS_GRP_IRET, CS_GRP_JUMP, CS_GRP_RET
 
-from . import ExplorationTechnique
-from .. import BP_BEFORE, BP_AFTER, sim_options
-from ..errors import AngrTracerError, SimIRSBNoDecodeError
+import angr
+from angr import claripy, sim_options
+from angr.errors import AngrTracerError, SimIRSBNoDecodeError
+from angr.state_plugins.inspect import BP_AFTER, BP_BEFORE
+
+from .base import ExplorationTechnique
+
+if TYPE_CHECKING:
+    from angr.sim_state import SimState
 
 
 l = logging.getLogger(name=__name__)
+
 
 class TracingMode:
     """
@@ -21,12 +30,17 @@ class TracingMode:
     :ivar CatchDesync:  CatchDesync mode, catch desync because of sim_procedures. It might be a sign of something
                         interesting.
     """
-    Strict = 'strict'
-    Permissive = 'permissive'
-    CatchDesync = 'catch_desync'
+
+    Strict = "strict"
+    Permissive = "permissive"
+    CatchDesync = "catch_desync"
 
 
 class TracerDesyncError(AngrTracerError):
+    """
+    An error class to report tracing Tracing desyncronization error
+    """
+
     def __init__(self, msg, deviating_addr=None, deviating_trace_idx=None):
         super().__init__(msg)
         self.deviating_addr = deviating_addr
@@ -34,19 +48,21 @@ class TracerDesyncError(AngrTracerError):
 
 
 class RepHook:
+    """
+    Hook rep movs/stos to speed up constraint solving
+    TODO: This should be made an exploration technique later
+    """
+
     def __init__(self, mnemonic):
         self.mnemonic = mnemonic
 
     @staticmethod
     def _inline_call(state, procedure, *arguments, **kwargs):
-        e_args = [state.solver.BVV(a, state.arch.bits) if isinstance(a, int) else a for a in arguments]
+        e_args = [claripy.BVV(a, state.arch.bits) if isinstance(a, int) else a for a in arguments]
         p = procedure(project=state.project, **kwargs)
         return p.execute(state, None, arguments=e_args)
 
     def run(self, state):
-
-        from .. import SIM_PROCEDURES # pylint: disable=import-outside-toplevel
-
         dst = state.regs.edi if state.arch.name == "X86" else state.regs.rdi
 
         if self.mnemonic.startswith("stos"):
@@ -64,11 +80,11 @@ class RepHook:
                 val = state.regs.rax
                 multiplier = 8
             else:
-                raise NotImplementedError("Unsupported mnemonic %s" % self.mnemonic)
+                raise NotImplementedError(f"Unsupported mnemonic {self.mnemonic}")
 
             size = (state.regs.ecx if state.arch.name == "X86" else state.regs.rcx) * multiplier
 
-            memset = SIM_PROCEDURES['libc']["memset"]
+            memset = angr.SIM_PROCEDURES["libc"]["memset"]
             memset().execute(state, arguments=[dst, val, size])
 
             if state.arch.name == "X86":
@@ -79,7 +95,6 @@ class RepHook:
                 state.regs.rcx = 0
 
         elif self.mnemonic.startswith("movs"):
-
             src = state.regs.esi if state.arch.name == "X86" else state.regs.rsi
 
             # copy a string
@@ -92,11 +107,11 @@ class RepHook:
             elif self.mnemonic == "movsq":
                 multiplier = 8
             else:
-                raise NotImplementedError("Unsupported mnemonic %s" % self.mnemonic)
+                raise NotImplementedError(f"Unsupported mnemonic {self.mnemonic}")
 
             size = (state.regs.ecx if state.arch.name == "X86" else state.regs.rcx) * multiplier
 
-            memcpy = SIM_PROCEDURES['libc']["memcpy"]
+            memcpy = angr.SIM_PROCEDURES["libc"]["memcpy"]
             memcpy().execute(state, arguments=[dst, src, size])
 
             if state.arch.name == "X86":
@@ -109,7 +124,7 @@ class RepHook:
                 state.regs.rcx = 0
 
         else:
-            raise NotImplementedError("Unsupported mnemonic %s" % self.mnemonic)
+            raise NotImplementedError(f"Unsupported mnemonic {self.mnemonic}")
 
 
 class Tracer(ExplorationTechnique):
@@ -127,6 +142,7 @@ class Tracer(ExplorationTechnique):
     :param crash_addr:          If the trace resulted in a crash, provide the crashing instruction
                                 pointer here, and the 'crashed' stash will be populated with the
                                 crashing state.
+    :param syscall_data:        Data related to various syscalls recorded by tracer for replaying
     :param copy_states:         Whether COPY_STATES should be enabled for the tracing state. It is
                                 off by default because most tracing workloads benefit greatly from
                                 not performing copying. You want to enable it if you want to see
@@ -142,31 +158,37 @@ class Tracer(ExplorationTechnique):
     :ivar predecessors:         A list of states in the history before the final state.
     """
 
-    def __init__(self,
-            trace=None,
-            resiliency=False,
-            keep_predecessors=1,
-            crash_addr=None,
-            copy_states=False,
-            fast_forward_to_entry=True,
-            mode=TracingMode.Strict,
-            aslr=True,
-            follow_unsat=False):
+    def __init__(
+        self,
+        trace: list[int],
+        resiliency=False,
+        keep_predecessors=1,
+        crash_addr=None,
+        syscall_data=None,
+        copy_states=False,
+        fast_forward_to_entry=True,
+        mode=TracingMode.Strict,
+        aslr=True,
+        follow_unsat=False,
+    ):
         super().__init__()
         self._trace = trace
         self._resiliency = resiliency
         self._crash_addr = crash_addr
+        self._syscall_data = syscall_data
         self._copy_states = copy_states
         self._mode = mode
         self._aslr = aslr
         self._follow_unsat = follow_unsat
         self._fast_forward_to_entry = fast_forward_to_entry
 
-        self._aslr_slides = {}  # type: Dict[cle.Backend, int]
+        self._aslr_slides: dict[cle.Backend, int] = {}
         self._current_slide = None
 
+        self._fd_bytes = None
+
         # keep track of the last basic block we hit
-        self.predecessors = [None] * keep_predecessors # type: List[angr.SimState]
+        self.predecessors: list[SimState] = [None] * keep_predecessors
         self.last_state = None
 
         # whether we should follow the trace
@@ -187,10 +209,10 @@ class Tracer(ExplorationTechnique):
         threshold = 0x40000
         while not indices and threshold > 0x2000:
             for idx, addr in enumerate(self._trace):
-                if ((addr - angr_addr) & 0xfff) == 0 and (idx == 0 or abs(self._trace[idx-1] - addr) > threshold):
+                if ((addr - angr_addr) & 0xFFF) == 0 and (idx == 0 or abs(self._trace[idx - 1] - addr) > threshold):
                     indices.add(idx)
 
-            indices = set(i for i in indices if self._filter_idx(angr_addr, i))
+            indices = {i for i in indices if self._filter_idx(angr_addr, i)}
             threshold //= 2
 
         return indices
@@ -205,7 +227,7 @@ class Tracer(ExplorationTechnique):
             # if we don't know whether there is any slide, we need to identify the slides via heuristics
             for obj in self.project.loader.all_objects:
                 # do not analyze pseudo-objects
-                if obj.binary_basename.startswith('cle##'):
+                if obj.binary_basename.startswith("cle##"):
                     continue
 
                 # heuristic 1: non-PIC  objects are loaded without aslr slides
@@ -233,16 +255,22 @@ class Tracer(ExplorationTechnique):
                     continue
 
                 if len(possibilities) == 0:
-                    raise AngrTracerError("Trace does not seem to contain object initializers for %s. Do you want to have a Tracer(aslr=False)?" % obj)
+                    raise AngrTracerError(
+                        f"Trace does not seem to contain object initializers for {obj}. "
+                        "Do you want to have a Tracer(aslr=False)?"
+                    )
                 if len(possibilities) == 1:
                     self._aslr_slides[obj] = next(iter(possibilities))
                 else:
-                    raise AngrTracerError("Trace seems ambiguous with respect to what the ASLR slides are for %s. This is surmountable, please open an issue." % obj)
+                    raise AngrTracerError(
+                        f"Trace seems ambiguous with respect to what the ASLR slides are for {obj}. "
+                        "This is surmountable, please open an issue."
+                    )
         else:
             # if we know there is no slides, just trust the address in the loader
             for obj in self.project.loader.all_objects:
                 # do not analyze pseudo-objects
-                if obj.binary_basename.startswith('cle##'):
+                if obj.binary_basename.startswith("cle##"):
                     continue
                 self._aslr_slides[obj] = 0
             self._current_slide = 0
@@ -253,17 +281,23 @@ class Tracer(ExplorationTechnique):
         legal_next = block.vex.constant_jump_targets
         if legal_next:
             return any(a + slide == self._trace[idx + 1] for a in legal_next)
-        else:
-            # the intuition is that if the first block of an initializer does an indirect jump,
-            # it's probably a call out to another binary (notably __libc_start_main)
-            # this is an awful fucking heuristic but it's as good as we've got
-            return abs(self._trace[idx] - self._trace[idx + 1]) > 0x1000
+        # the intuition is that if the first block of an initializer does an indirect jump,
+        # it's probably a call out to another binary (notably __libc_start_main)
+        # this is an awful fucking heuristic but it's as good as we've got
+        return abs(self._trace[idx] - self._trace[idx + 1]) > 0x1000
+
+    def set_fd_data(self, fd_data: dict[int, bytes]):
+        """
+        Set concrete bytes of various fds read by the program
+        """
+
+        self._fd_bytes = fd_data
 
     def setup(self, simgr):
-        simgr.populate('missed', [])
-        simgr.populate('traced', [])
-        simgr.populate('crashed', [])
-        simgr.populate('desync', [])
+        simgr.populate("missed", [])
+        simgr.populate("traced", [])
+        simgr.populate("crashed", [])
+        simgr.populate("desync", [])
 
         if len(simgr.active) != 1:
             raise AngrTracerError("Tracer is being invoked on a SimulationManager without exactly one active state")
@@ -278,16 +312,19 @@ class Tracer(ExplorationTechnique):
                 if len(simgr.active) == 0:
                     raise AngrTracerError("Could not step to the first address of the trace - simgr is empty")
                 if len(simgr.active) > 1:
-                    raise AngrTracerError("Could not step to the first address of the trace - state split. Do you want to have a Tracer(fast_forward_to_entry=False)?")
-                simgr.drop(stash='unsat')
+                    raise AngrTracerError(
+                        "Could not step to the first address of the trace - state split. "
+                        "Do you want to have a Tracer(fast_forward_to_entry=False)?"
+                    )
+                simgr.drop(stash="unsat")
         else:
             idx = 0
 
         # initialize the state info
-        simgr.one_active.globals['trace_idx'] = idx
-        simgr.one_active.globals['sync_idx'] = None
-        simgr.one_active.globals['sync_timer'] = 0
-        simgr.one_active.globals['is_desync'] = False
+        simgr.one_active.globals["trace_idx"] = idx
+        simgr.one_active.globals["sync_idx"] = None
+        simgr.one_active.globals["sync_timer"] = 0
+        simgr.one_active.globals["is_desync"] = False
 
         # disable state copying!
         if not self._copy_states:
@@ -300,35 +337,35 @@ class Tracer(ExplorationTechnique):
 
     def filter(self, simgr, state, **kwargs):
         # check completion
-        if state.globals['trace_idx'] >= len(self._trace) - 1:
+        if state.globals["trace_idx"] >= len(self._trace) - 1:
             # if the the state is a desync state and the user wants to keep it,
             # then do what the user wants
             if self._mode == TracingMode.CatchDesync and self.project.is_hooked(state.addr):
-                return 'desync'
+                return "desync"
             # do crash windup if necessary
             if self._crash_addr is not None:
                 self.last_state, crash_state = self.crash_windup(state, self._crash_addr)
-                simgr.populate('crashed', [crash_state])
+                simgr.populate("crashed", [crash_state])
                 self.predecessors.append(state)
                 self.predecessors.pop(0)
 
-            return 'traced'
+            return "traced"
 
         return simgr.filter(state, **kwargs)
 
-    def step(self, simgr, stash='active', **kwargs):
-        simgr.drop(stash='missed')
-        return simgr.step(stash=stash, **kwargs)
+    def step(self, simgr, stash="active", **kwargs):
+        simgr.drop(stash="missed")
+        return simgr.step(stash=stash, syscall_data=self._syscall_data, fd_bytes=self._fd_bytes, **kwargs)
 
     def step_state(self, simgr, state, **kwargs):
-        if state.history.jumpkind == 'Ijk_Exit':
-            return {'traced': [state]}
+        if state.history.jumpkind == "Ijk_Exit":
+            return {"traced": [state]}
 
         # maintain the predecessors list
         self.predecessors.append(state)
         self.predecessors.pop(0)
 
-        if state.globals['trace_idx'] > len(self._trace) * 0.98:
+        if state.globals["trace_idx"] > len(self._trace) * 0.98:
             state.options.add(sim_options.COPY_STATES)
             state.options.add(sim_options.LAZY_SOLVES)
 
@@ -339,8 +376,8 @@ class Tracer(ExplorationTechnique):
             block = self.project.factory.block(state.addr)
 
             if len(block.capstone.insns) == 1 and (
-                    block.capstone.insns[0].mnemonic.startswith("rep m") or
-                    block.capstone.insns[0].mnemonic.startswith("rep s")
+                block.capstone.insns[0].mnemonic.startswith("rep m")
+                or block.capstone.insns[0].mnemonic.startswith("rep s")
             ):
                 insn = block.capstone.insns[0]
                 self.project.hook(state.addr, RepHook(insn.mnemonic.split(" ")[1]).run, length=insn.size)
@@ -349,18 +386,21 @@ class Tracer(ExplorationTechnique):
         # if termination point occurs multiple times in trace, pass details to SimEngineUnicorn's native interface so
         # that it can stop at last block
         if self._last_block_total_count > 1:
-            stops = set(kwargs.pop('extra_stop_points', ()))
-            last_block_details = {"addr": self._trace[-1], "tot_count": self._last_block_total_count,
-                                  "curr_count": self._last_block_seen_count}
+            stops = set(kwargs.pop("extra_stop_points", ()))
+            last_block_details = {
+                "addr": self._trace[-1],
+                "tot_count": self._last_block_total_count,
+                "curr_count": self._last_block_seen_count,
+            }
         else:
-            stops = set(kwargs.pop('extra_stop_points', ())) | {self._trace[-1]}
+            stops = set(kwargs.pop("extra_stop_points", ())) | {self._trace[-1]}
             last_block_details = None
 
         succs_dict = simgr.step_state(state, extra_stop_points=stops, last_block_details=last_block_details, **kwargs)
         if None not in succs_dict and simgr.errored:
             raise simgr.errored[-1].error
         sat_succs = succs_dict[None]  # satisfiable states
-        succs = sat_succs + succs_dict['unsat']  # both satisfiable and unsatisfiable states
+        succs = sat_succs + succs_dict["unsat"]  # both satisfiable and unsatisfiable states
 
         if not self._follow_unsat:
             # Only satisfiable states need to be checked for correct successor
@@ -377,7 +417,7 @@ class Tracer(ExplorationTechnique):
             else:
                 succ = self._pick_correct_successor(sat_succs)
                 succs_dict[None] = [succ]
-                succs_dict['missed'] = [s for s in sat_succs if s is not succ]
+                succs_dict["missed"] = [s for s in sat_succs if s is not succ]
         else:
             # Check all states for correct successor
             if len(succs) == 1:
@@ -387,12 +427,12 @@ class Tracer(ExplorationTechnique):
             else:
                 succ = self._pick_correct_successor(succs)
                 succs_dict[None] = [succ]
-                succs_dict['missed'] = [s for s in succs if s is not succ]
+                succs_dict["missed"] = [s for s in succs if s is not succ]
         assert len(succs_dict[None]) == 1
 
         # if there is a catchable desync, we should return the last sync state
-        if succs_dict[None][0].globals['is_desync']:
-            simgr.active[0].globals['trace_idx'] = len(self._trace)
+        if succs_dict[None][0].globals["is_desync"]:
+            simgr.active[0].globals["trace_idx"] = len(self._trace)
             succs_dict[None][0] = state
         return succs_dict
 
@@ -418,7 +458,7 @@ class Tracer(ExplorationTechnique):
             unicorn_option_removed = True
 
         # single step until right before the deviating state
-        trace_idx = state.globals['trace_idx']
+        trace_idx = state.globals["trace_idx"]
         while trace_idx != deviating_trace_idx - 1:
             succs_dict = simgr.step_state(state, **kwargs)
             succs = succs_dict[None]
@@ -437,11 +477,15 @@ class Tracer(ExplorationTechnique):
         current_obj = self.project.loader.find_object_containing(state.addr)
         assert current_obj is not None
         translated_addr = self._translate_trace_addr(expected_addr, current_obj)
-        l.info("Attempt to fix a deviation: Forcing execution from %#x to %#x (instead of %#x).",
-               state.addr, succ.addr, translated_addr)
+        l.info(
+            "Attempt to fix a deviation: Forcing execution from %#x to %#x (instead of %#x).",
+            state.addr,
+            succ.addr,
+            translated_addr,
+        )
         succ._ip = translated_addr
 
-        succ.globals['trace_idx'] = trace_idx + 1
+        succ.globals["trace_idx"] = trace_idx + 1
         succs_dict = {None: [succ]}
 
         if unicorn_option_removed:
@@ -452,11 +496,11 @@ class Tracer(ExplorationTechnique):
     def _pick_correct_successor(self, succs):
         # there's been a branch of some sort. Try to identify which state stayed on the trace.
         assert len(succs) > 0
-        idx = succs[0].globals['trace_idx']
+        idx = succs[0].globals["trace_idx"]
 
         res = []
         last_description = succs[0].history.descriptions[-1]
-        if 'Unicorn' in last_description:
+        if "Unicorn" in last_description:
             # Multiple new states were created in SimEngineUnicorn. State which has non-zero recent block count is a
             # valid successor since only correct successor is sync'd with native state
             for succ in succs:
@@ -479,10 +523,10 @@ class Tracer(ExplorationTechnique):
         self._update_state_tracking(res[0])
         return res[0]
 
-    def _update_state_tracking(self, state: 'angr.SimState'):
-        idx = state.globals['trace_idx']
-        sync = state.globals['sync_idx']
-        timer = state.globals['sync_timer']
+    def _update_state_tracking(self, state: SimState):
+        idx = state.globals["trace_idx"]
+        sync = state.globals["sync_idx"]
+        timer = state.globals["sync_timer"]
 
         self._last_block_seen_count += state.history.recent_bbl_addrs.count(self._trace[-1])
 
@@ -495,19 +539,25 @@ class Tracer(ExplorationTechnique):
             assert state.history.recent_block_count == len(state.history.recent_bbl_addrs)
 
             for addr_idx, addr in enumerate(state.history.recent_bbl_addrs):
-                if addr in [state.unicorn.cgc_transmit_addr, state.unicorn.cgc_receive_addr]:
+                if addr in [
+                    state.unicorn.cgc_transmit_addr,
+                    state.unicorn.cgc_receive_addr,
+                    state.unicorn.cgc_random_addr,
+                ]:
                     continue
 
-                if sync is not None and sync != 'entry':
+                if sync is not None and sync != "entry":
                     if self._compare_addr(self._trace[sync], addr):
                         # Found the address in trace. Start normal trace checks from next address
                         idx = sync + 1
-                        state.globals['sync_idx'] = None
+                        state.globals["sync_idx"] = None
                         sync = None
 
                     continue
 
-                if self._compare_addr(self._trace[idx], addr) or self._check_qemu_unicorn_large_block_split(state, idx, addr_idx):
+                if self._compare_addr(self._trace[idx], addr) or self._check_qemu_unicorn_large_block_split(
+                    state, idx, addr_idx
+                ):
                     idx += 1
                 else:
                     is_contained, increment = self._check_qemu_block_in_unicorn_block(state, idx, addr_idx)
@@ -518,30 +568,33 @@ class Tracer(ExplorationTechnique):
                             idx += 1
                             continue
 
-                    raise TracerDesyncError('Oops! angr did not follow the trace',
-                                            deviating_addr=addr,
-                                            deviating_trace_idx=idx)
+                    raise TracerDesyncError(
+                        "Oops! angr did not follow the trace", deviating_addr=addr, deviating_trace_idx=idx
+                    )
 
-            idx -= 1 # use normal code to do the last synchronization
+            idx -= 1  # use normal code to do the last synchronization
 
-        if sync == 'entry':
+        if sync == "entry":
             trace_addr = self._translate_state_addr(state.addr)
             # this address should only ever appear once in the trace. we verified this during setup.
             idx = self._trace.index(trace_addr)
-            state.globals['trace_idx'] = idx
-            state.globals['sync_idx'] = None
+            state.globals["trace_idx"] = idx
+            state.globals["sync_idx"] = None
         elif sync is not None:
             timer -= 1
             if self._compare_addr(self._trace[sync], state.addr):
-                state.globals['trace_idx'] = sync
-                state.globals['sync_idx'] = None
-                state.globals['sync_timer'] = 0
+                state.globals["trace_idx"] = sync
+                state.globals["sync_idx"] = None
+                state.globals["sync_timer"] = 0
             elif timer > 0:
-                state.globals['sync_timer'] = timer
+                state.globals["sync_timer"] = timer
             else:
-                raise Exception("Trace failed to synchronize! We expected it to hit %#x (trace addr), but it failed to do this within a timeout" % self._trace[sync])
+                raise Exception(
+                    f"Trace failed to synchronize! We expected it to hit {self._trace[sync]:#x} (trace addr), "
+                    "but it failed to do this within a timeout"
+                )
 
-        elif state.history.jumpkind.startswith('Ijk_Exit'):
+        elif state.history.jumpkind.startswith("Ijk_Exit"):
             # termination! will be handled by filter
             pass
         elif self.project.is_hooked(state.addr) and not self.project.loader.extern_object.contains_addr(state.addr):
@@ -549,61 +602,72 @@ class Tracer(ExplorationTechnique):
             self._sync_return(state, idx)
         elif self._compare_addr(self._trace[idx + 1], state.addr):
             # normal case
-            state.globals['trace_idx'] = idx + 1
-        elif self.project.loader._extern_object is not None and self.project.loader.extern_object.contains_addr(state.addr):
+            state.globals["trace_idx"] = idx + 1
+        elif self.project.loader._extern_object is not None and self.project.loader.extern_object.contains_addr(
+            state.addr
+        ):
             # externs
             proc = self.project.hooked_by(state.addr)
             if proc is None:
                 raise Exception("Extremely bad news: we're executing an unhooked address in the externs space")
-            if proc.display_name == 'LinuxLoader':
-                state.globals['sync_idx'] = 'entry'
+            if proc.display_name == "LinuxLoader":
+                state.globals["sync_idx"] = "entry"
             elif proc.is_continuation:
                 orig_addr = self.project.loader.find_symbol(proc.display_name).rebased_addr
                 obj = self.project.loader.find_object_containing(orig_addr)
                 orig_trace_addr = self._translate_state_addr(orig_addr, obj)
                 if 0 <= self._trace[idx + 1] - orig_trace_addr <= 0x10000:
-                    # this is fine. we do nothing and then next round it'll get handled by the is_hooked(state.history.addr) case
+                    # this is fine. we do nothing and then next round
+                    # it'll get handled by the is_hooked(state.history.addr) case
                     pass
                 else:
                     # this may also be triggered as a consequence of the unicorn issue linked above
                     raise Exception("BUG: State is returning to a continuation that isn't its own???")
-            elif state.addr == getattr(self.project.simos, 'vsyscall_addr', None):
+            elif state.addr == getattr(self.project.simos, "vsyscall_addr", None):
                 if not self._sync_callsite(state, idx, state.history.addr):
                     raise AngrTracerError("Could not synchronize following vsyscall")
-            elif self.project.hooked_by(state.addr).display_name.startswith('IFuncResolver'):
+            elif self.project.hooked_by(state.addr).display_name.startswith("IFuncResolver"):
                 if not self._sync_return(state, idx):
                     raise AngrTracerError("Could not synchronize at ifunc return address")
             else:
                 # see above
                 pass
-        elif state.history.jumpkind.startswith('Ijk_Sys'):
+        elif state.history.jumpkind.startswith("Ijk_Sys"):
             # syscalls
-            state.globals['sync_idx'] = idx + 1
-            state.globals['sync_timer'] = 1
+            state.globals["sync_idx"] = idx + 1
+            state.globals["sync_timer"] = 1
         elif self.project.is_hooked(state.history.addr):
             # simprocedures - is this safe..?
             self._fast_forward(state)
         elif state.addr == self._trace[-1]:
             # we may have prematurely stopped because of setting stop points. try to resync.
-            state.globals['sync_idx'] = idx + 1
-            state.globals['sync_timer'] = 1
-        elif self.project.is_hooked(state.addr) and \
-                self.project.loader.find_symbol(self.project.hooked_by(state.addr).display_name) is not None and \
-                self.project.loader.find_symbol(self.project.hooked_by(state.addr).display_name).subtype.value[0] == 10:  # STT_GNU_IFUNC
+            state.globals["sync_idx"] = idx + 1
+            state.globals["sync_timer"] = 1
+        elif (
+            self.project.is_hooked(state.addr)
+            and self.project.loader.find_symbol(self.project.hooked_by(state.addr).display_name) is not None
+            and self.project.loader.find_symbol(self.project.hooked_by(state.addr).display_name).subtype.value[0] == 10
+        ):  # STT_GNU_IFUNC #pylint:disable=line-too-long
             if not self._sync_return(state, idx):
                 raise AngrTracerError("Could not synchronize at ifunc return address")
         elif self._analyze_misfollow(state, idx):
             # misfollow analysis will set a sync point somewhere if it succeeds
             pass
         else:
-            raise TracerDesyncError("Oops! angr did not follow the trace",
-                                    deviating_addr=state.addr,
-                                    deviating_trace_idx=idx+1)
+            raise TracerDesyncError(
+                "Oops! angr did not follow the trace", deviating_addr=state.addr, deviating_trace_idx=idx + 1
+            )
 
-        if state.globals['sync_idx'] is not None:
-            l.debug("Trace: %s-%s/%s synchronizing %s", state.globals['trace_idx'], state.globals['sync_idx'], len(self._trace), state.globals['sync_timer'])
+        if state.globals["sync_idx"] is not None:
+            l.debug(
+                "Trace: %s-%s/%s synchronizing %s",
+                state.globals["trace_idx"],
+                state.globals["sync_idx"],
+                len(self._trace),
+                state.globals["sync_timer"],
+            )
         else:
-            l.debug("Trace: %s/%s", state.globals['trace_idx'], len(self._trace))
+            l.debug("Trace: %s/%s", state.globals["trace_idx"], len(self._trace))
 
     def _translate_state_addr(self, state_addr, obj=None):
         if obj is None:
@@ -614,8 +678,8 @@ class Tracer(ExplorationTechnique):
 
     def _translate_trace_addr(self, trace_addr, obj=None):
         if obj is None:
-            for obj in self._aslr_slides:  # pylint: disable=redefined-argument-from-local
-                if obj.contains_addr(trace_addr - self._aslr_slides[obj]):
+            for obj, slide in self._aslr_slides.items():  # noqa: PLR1704  # pylint: disable=redefined-argument-from-local
+                if obj.contains_addr(trace_addr - slide):
                     break
             else:
                 raise Exception("Can't figure out which object this address belongs to")
@@ -630,19 +694,21 @@ class Tracer(ExplorationTechnique):
         current_bin = self.project.loader.find_object_containing(state_addr)
         if current_bin is self.project.loader._extern_object or current_bin is self.project.loader._kernel_object:
             return False
-        elif current_bin in self._aslr_slides:
+        if current_bin in self._aslr_slides:
             self._current_slide = self._aslr_slides[current_bin]
             return trace_addr == state_addr + self._current_slide
-        elif ((trace_addr - state_addr) & 0xfff) == 0:
+        if ((trace_addr - state_addr) & 0xFFF) == 0:
             self._aslr_slides[current_bin] = self._current_slide = trace_addr - state_addr
             return True
         # error handling
-        elif current_bin:
-            raise AngrTracerError("Trace desynced on jumping into %s. Did you load the right version of this library?" % current_bin.provides)
-        else:
-            raise AngrTracerError("Trace desynced on jumping into %#x, where no library is mapped!" % state_addr)
+        if current_bin:
+            raise AngrTracerError(
+                f"Trace desynced on jumping into {current_bin.provides}. "
+                "Did you load the right version of this library?"
+            )
+        raise AngrTracerError(f"Trace desynced on jumping into {state_addr:#x}, where no library is mapped!")
 
-    def _check_qemu_block_in_unicorn_block(self, state: 'angr.SimState', trace_curr_idx, state_desync_block_idx):
+    def _check_qemu_block_in_unicorn_block(self, state: SimState, trace_curr_idx, state_desync_block_idx):
         """
         Check if desync occurred because unicorn block was split into multiple blocks in qemu tracer. If yes, find the
         correct increment for trace index
@@ -663,7 +729,7 @@ class Tracer(ExplorationTechnique):
         while True:
             curr_block = state.project.factory.block(self._translate_trace_addr(curr_block_addr))
             curr_block_last_insn = curr_block.capstone.insns[-1]
-            if any((curr_block_last_insn.group(insn_type) for insn_type in control_flow_insn_types)):
+            if any(curr_block_last_insn.group(insn_type) for insn_type in control_flow_insn_types):
                 # Found last block
                 big_block_end = curr_block.addr + curr_block.size - 1
                 break
@@ -683,7 +749,7 @@ class Tracer(ExplorationTechnique):
 
         return (True, next_contain_index - trace_curr_idx)
 
-    def _check_qemu_unicorn_large_block_split(self, state: 'angr.SimState', trace_curr_idx, state_desync_block_idx):
+    def _check_qemu_unicorn_large_block_split(self, state: SimState, trace_curr_idx, state_desync_block_idx):
         """
         Check if desync occurred because large blocks are split up at different instructions by qemu and unicorn. This
         is done by reconstructing part of block executed so far from the trace and state history and checking if they
@@ -729,7 +795,7 @@ class Tracer(ExplorationTechnique):
 
             if state_history_block_addr == big_block_start_addr:
                 # We found start of the big block and no control flow statements in between that and the block where
-                # desync happend.
+                # desync happened.
                 break
 
         # Let's find the address of the last byte of the big basic block using VEX lifter
@@ -738,7 +804,7 @@ class Tracer(ExplorationTechnique):
         while True:
             curr_block = state.project.factory.block(self._translate_trace_addr(curr_block_addr))
             curr_block_last_insn = curr_block.capstone.insns[-1]
-            if any((curr_block_last_insn.group(insn_type) for insn_type in control_flow_insn_types)):
+            if any(curr_block_last_insn.group(insn_type) for insn_type in control_flow_insn_types):
                 # Found last block
                 angr_big_block_end_addr = curr_block.addr + curr_block.size - 1
                 break
@@ -758,8 +824,7 @@ class Tracer(ExplorationTechnique):
                     if angr_big_block_end_addr != big_block_end_addr:
                         # End does not match. Treat as trace desync.
                         return False
-                    else:
-                        break
+                    break
 
             if big_block_end_addr is not None:
                 break
@@ -778,7 +843,7 @@ class Tracer(ExplorationTechnique):
     def _analyze_misfollow(self, state, idx):
         angr_addr = state.addr
         obj = self.project.loader.find_object_containing(angr_addr)
-        if obj not in self._aslr_slides: # this SHOULD be an invariant given the way _compare_addrs works
+        if obj not in self._aslr_slides:  # this SHOULD be an invariant given the way _compare_addrs works
             raise Exception("BUG: misfollow analysis initiated when jumping into a new object")
 
         slide = self._aslr_slides[obj]
@@ -790,7 +855,7 @@ class Tracer(ExplorationTechnique):
 
         # TODO: add rep handling
 
-        if 'IRSB' in state.history.recent_description:
+        if "IRSB" in state.history.recent_description:
             VEXMaxInsnsPerBlock = 99
             last_block = state.block(state.history.bbl_addrs[-1])
 
@@ -803,45 +868,45 @@ class Tracer(ExplorationTechnique):
                 while self._trace[idx + 1] - slide in last_block.instruction_addrs:
                     idx += 1
 
-                l.info('...resolved: disparate block sizes')
+                l.info("...resolved: disparate block sizes")
 
                 if self._trace[idx + 1] - slide == state.addr:
-                    state.globals['trace_idx'] = idx + 1
+                    state.globals["trace_idx"] = idx + 1
                     return True
-                else:
-                    state.globals['trace_idx'] = idx
-                    #state.globals['trace_desync'] = True
-                    return True
+                state.globals["trace_idx"] = idx
+                # state.globals['trace_desync'] = True
+                return True
 
             # Case 2: trace block contains more instructions than angr
             # block.  Caused by VEX's maximum instruction limit of 99
             # instructions
-            elif state.project.factory.block(state.history.addr).instructions == VEXMaxInsnsPerBlock and \
-                 state.history.jumpkind == 'Ijk_Boring':
-                l.info('...resolved: vex block limit')
+            if (
+                state.project.factory.block(state.history.addr).instructions == VEXMaxInsnsPerBlock
+                and state.history.jumpkind == "Ijk_Boring"
+            ):
+                l.info("...resolved: vex block limit")
                 return True
 
         prev_addr = state.history.bbl_addrs[-1]
         prev_obj = self.project.loader.find_object_containing(prev_addr)
 
-        if state.block(prev_addr).vex.jumpkind == 'Ijk_Call':
-            l.info('...syncing at callsite')
+        if state.block(prev_addr).vex.jumpkind == "Ijk_Call":
+            l.info("...syncing at callsite")
             return self._sync_callsite(state, idx, prev_addr)
 
-        if prev_addr in getattr(prev_obj, 'reverse_plt', ()):
+        if prev_addr in getattr(prev_obj, "reverse_plt", ()):
             prev_name = prev_obj.reverse_plt[prev_addr]
-            l.info('...syncing at PLT callsite for %s', prev_name)
+            l.info("...syncing at PLT callsite for %s", prev_name)
             # TODO: this method is newer than sync_callsite. should it be used always?
             return self._sync_return(state, idx, assert_obj=prev_obj)
 
         if prev_obj is not None:
             prev_section = prev_obj.find_section_containing(prev_addr)
-            if prev_section is not None:
-                if prev_section.name in (".plt",):
-                    l.info("...syncing at PLT callsite (type 2)")
-                    return self._sync_return(state, idx, assert_obj=prev_obj)
+            if prev_section is not None and prev_section.name == ".plt":
+                l.info("...syncing at PLT callsite (type 2)")
+                return self._sync_return(state, idx, assert_obj=prev_obj)
 
-        l.info('...all analyses failed.')
+        l.info("...all analyses failed.")
         return False
 
     def _sync_callsite(self, state, idx, callsite_addr):
@@ -851,12 +916,12 @@ class Tracer(ExplorationTechnique):
     def _sync_return(self, state, idx, assert_obj=None):
         ret_addr_bv = self.project.factory.cc().return_addr.get_value(state)
         if state.solver.symbolic(ret_addr_bv):
-            l.info('...symbolic return address. I refuse to deal with this.')
+            l.info("...symbolic return address. I refuse to deal with this.")
             return False
 
         ret_addr = state.solver.eval(ret_addr_bv)
         if assert_obj is not None and not assert_obj.contains_addr(ret_addr):
-            l.info('...address is not in the correct object, aborting analysis')
+            l.info("...address is not in the correct object, aborting analysis")
             return False
         return self._sync(state, idx, ret_addr)
 
@@ -868,9 +933,9 @@ class Tracer(ExplorationTechnique):
             l.error("Trying to synchronize at %#x (%#x) but it does not appear in the trace?", addr_translated, addr)
             return False
 
-        state.globals['sync_idx'] = sync_idx
-        state.globals['trace_idx'] = idx
-        state.globals['sync_timer'] = 10000  # TODO: ???
+        state.globals["sync_idx"] = sync_idx
+        state.globals["trace_idx"] = idx
+        state.globals["sync_timer"] = 10000  # TODO: ???
         return True
 
     def _fast_forward(self, state):
@@ -884,22 +949,28 @@ class Tracer(ExplorationTechnique):
         self._current_slide = self._aslr_slides[target_obj]
         target_addr += self._current_slide
         try:
-            target_idx = self._trace.index(target_addr, state.globals['trace_idx'])
+            target_idx = self._trace.index(target_addr, state.globals["trace_idx"])
         except ValueError as e:
             # if the user wants to catch desync caused by sim_procedure,
             # mark this state as a desync state and then end the tracing prematurely
             if self._mode == TracingMode.CatchDesync:
-                state.globals['is_desync'] = True
+                state.globals["is_desync"] = True
                 return
-            raise AngrTracerError("Trace failed to synchronize during fast forward? You might want to unhook %s." % (self.project.hooked_by(state.history.addr).display_name)) from e
+            raise AngrTracerError(
+                f"Trace failed to synchronize during fast forward? You might want to unhook {self.project.hooked_by(state.history.addr).display_name}."
+            ) from e
         else:
-            state.globals['trace_idx'] = target_idx
+            state.globals["trace_idx"] = target_idx
 
     @classmethod
     def crash_windup(cls, state, crash_addr):
         # first check: are we just executing user-controlled code?
         if not state.ip.symbolic and state.mem[state.ip].char.resolved.symbolic:
             l.debug("executing input-related code")
+            return state, state
+        # second check: is this code mapped and executable?
+        section = state.project.loader.find_section_containing(state.addr)
+        if not section or not (section.flags & 0x4):  # pylint:disable=superfluous-parens
             return state, state
         # in case we can't unwind, we return the state itself
         if state.addr == crash_addr:
@@ -912,15 +983,9 @@ class Tracer(ExplorationTechnique):
         # before we step through and collect the actions we have to set
         # up a special case for address concretization in the case of a
         # controlled read or write vulnerability.
-        bp1 = state.inspect.b(
-            'address_concretization',
-            BP_BEFORE,
-            action=cls._check_add_constraints)
+        bp1 = state.inspect.b("address_concretization", BP_BEFORE, action=cls._check_add_constraints)
 
-        bp2 = state.inspect.b(
-            'address_concretization',
-            BP_AFTER,
-            action=cls._grab_concretization_results)
+        bp2 = state.inspect.b("address_concretization", BP_AFTER, action=cls._grab_concretization_results)
 
         # step to the end of the crashing basic block,
         # to capture its actions with those breakpoints
@@ -973,6 +1038,8 @@ class Tracer(ExplorationTechnique):
 
         # now remove our breakpoints since other people might not want them
         for s in [last_state, crash_state]:
+            if s is None:
+                continue
             s.inspect.remove_breakpoint("address_concretization", bp1)
             s.inspect.remove_breakpoint("address_concretization", bp2)
 
@@ -987,8 +1054,8 @@ class Tracer(ExplorationTechnique):
         """
         # only grab ones that match the constrained addrs
         if cls._should_add_constraints(state):
-            addr = state.inspect.address_concretization_expr
-            result = state.inspect.address_concretization_result
+            addr = state.inspect.attrs.address_concretization_expr
+            result = state.inspect.attrs.address_concretization_result
             if result is None:
                 l.warning("addr concretization result is None")
                 return
@@ -1001,7 +1068,7 @@ class Tracer(ExplorationTechnique):
         """
         # for each constrained addrs check to see if the variables match,
         # if so keep the constraints
-        state.inspect.address_concretization_add_constraints = cls._should_add_constraints(state)
+        state.inspect.attrs.address_concretization_add_constraints = cls._should_add_constraints(state)
 
     @classmethod
     def _should_add_constraints(cls, state):
@@ -1009,7 +1076,7 @@ class Tracer(ExplorationTechnique):
         Check to see if the current address concretization variable is any of the registered
         constrained_addrs we want to allow concretization for
         """
-        expr = state.inspect.address_concretization_expr
+        expr = state.inspect.attrs.address_concretization_expr
         hit_indices = cls._to_indices(state, expr)
 
         for action in state.preconstrainer._constrained_addrs:
@@ -1022,8 +1089,8 @@ class Tracer(ExplorationTechnique):
     def _to_indices(state, expr):
         indices = []
         for descr in state.solver.describe_variables(expr):
-            if descr[0] == 'file' and descr[1] == state.posix.stdin.ident:
-                if descr[2] == 'packet':
+            if descr[0] == "file" and descr[1] == state.posix.stdin.ident:
+                if descr[2] == "packet":
                     indices.append(descr[3])
                 elif type(descr[2]) is int:
                     indices.append(descr[2])

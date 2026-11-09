@@ -1,20 +1,24 @@
-from collections import defaultdict
-from typing import Dict, List, Union
+from __future__ import annotations
+
 import logging
+from collections import defaultdict
+from typing import Literal
 
 import networkx
 
-from .utils.constants import DEFAULT_STATEMENT
 from .errors import AngrAnnotatedCFGError, AngrExitError
 from .knowledge_plugins.cfg import CFGNode
+from .utils.constants import DEFAULT_STATEMENT
 
 l = logging.getLogger(name=__name__)
+
 
 class AnnotatedCFG:
     """
     AnnotatedCFG is a control flow graph with statement whitelists and exit whitelists to describe a slice of the
     program.
     """
+
     def __init__(self, project, cfg=None, detect_loops=False):
         """
         Constructor.
@@ -28,12 +32,12 @@ class AnnotatedCFG:
         self._cfg = None
         self._target = None
 
-        self._run_statement_whitelist: Dict[int,Union[List[int],bool]] = defaultdict(list)
+        self._run_statement_whitelist: dict[int, list[int] | Literal[True]] = defaultdict(list)
         self._exit_taken = defaultdict(list)
         self._addr_to_run = {}
         self._addr_to_last_stmt_id = {}
         self._loops = []
-        self._path_merge_points = [ ]
+        self._path_merge_points = []
 
         if cfg is not None:
             self._cfg = cfg
@@ -74,11 +78,11 @@ class AnnotatedCFG:
 
     def get_addr(self, run):
         if isinstance(run, CFGNode):
+            assert isinstance(run.addr, int)
             return run.addr
-        elif type(run) is int:
+        if type(run) is int:
             return run
-        else:
-            raise AngrAnnotatedCFGError("Unknown type '%s' of the 'run' argument" % type(run))
+        raise AngrAnnotatedCFGError(f"Unknown type '{type(run)}' of the 'run' argument")
 
     def add_block_to_whitelist(self, block):
         addr = self.get_addr(block)
@@ -86,16 +90,18 @@ class AnnotatedCFG:
 
     def add_statements_to_whitelist(self, block, stmt_ids):
         addr = self.get_addr(block)
-        if type(stmt_ids) is bool:
+        if stmt_ids is True:
             if type(self._run_statement_whitelist[addr]) is list and self._run_statement_whitelist[addr]:
                 raise Exception("WTF")
             self._run_statement_whitelist[addr] = stmt_ids
         elif -1 in stmt_ids:
             self._run_statement_whitelist[addr] = True
         else:
-            self._run_statement_whitelist[addr].extend(stmt_ids)
-            self._run_statement_whitelist[addr] = \
-                sorted(set(self._run_statement_whitelist[addr]), key=lambda v: v if type(v) is int else float('inf'))
+            whitelist_lst = self._run_statement_whitelist[addr]
+            assert whitelist_lst is not True
+            whitelist = set(whitelist_lst)
+            whitelist.update(stmt_ids)
+            self._run_statement_whitelist[addr] = sorted(whitelist)
 
     def add_exit_to_whitelist(self, run_from, run_to):
         addr_from = self.get_addr(run_from)
@@ -121,12 +127,11 @@ class AnnotatedCFG:
     def should_execute_statement(self, addr, stmt_id):
         if self._run_statement_whitelist is None:
             return True
-        elif addr in self._run_statement_whitelist:
+        if addr in self._run_statement_whitelist:
             r = self._run_statement_whitelist[addr]
             if isinstance(r, bool):
                 return r
-            else:
-                return stmt_id in self._run_statement_whitelist[addr]
+            return stmt_id in self._run_statement_whitelist[addr]
         return False
 
     def get_run(self, addr):
@@ -134,21 +139,20 @@ class AnnotatedCFG:
             return self._addr_to_run[addr]
         return None
 
-    def get_whitelisted_statements(self, addr):
+    def get_whitelisted_statements(self, addr) -> list[int] | None:
         """
         :returns: True if all statements are whitelisted
         """
         if addr in self._run_statement_whitelist:
-            if self._run_statement_whitelist[addr] is True:
-                return None # This is the default value used to say
-                            # we execute all statements in this basic block. A
-                            # little weird...
+            whitelist = self._run_statement_whitelist[addr]
+            if whitelist is True:
+                return None  # This is the default value used to say
+                # we execute all statements in this basic block. A
+                # little weird...
 
-            else:
-                return self._run_statement_whitelist[addr]
+            return whitelist
 
-        else:
-            return []
+        return []
 
     def get_last_statement_index(self, addr):
         """
@@ -165,14 +169,14 @@ class AnnotatedCFG:
             return None
         if addr in self._addr_to_last_stmt_id:
             return self._addr_to_last_stmt_id[addr]
-        elif addr in self._run_statement_whitelist:
+        if addr in self._run_statement_whitelist:
             # is the default exit there? it equals to a negative number (-2 by default) so `max()` won't work.
-            if self._run_statement_whitelist[addr] is True or \
-                    (isinstance(self._run_statement_whitelist[addr], list)
-                     and DEFAULT_STATEMENT in self._run_statement_whitelist[addr]
-                    ):
+            whitelist = self._run_statement_whitelist[addr]
+            if whitelist is True or (
+                isinstance(self._run_statement_whitelist[addr], list) and DEFAULT_STATEMENT in whitelist
+            ):
                 return DEFAULT_STATEMENT
-            return max(self._run_statement_whitelist[addr], key=lambda v: v if type(v) is int else float('inf'))
+            return max(whitelist, key=lambda v: v if type(v) is int else float("inf"))
         return None
 
     def get_loops(self):
@@ -194,18 +198,18 @@ class AnnotatedCFG:
         for addr, run in self._addr_to_run.items():
             if addr is None:
                 continue
-            ret_str += "%#x => %s\n" % (addr, run)
+            ret_str += f"{addr:#x} => {run}\n"
         l.debug("statements: ")
         for addr, stmts in self._run_statement_whitelist.items():
             if addr is None:
                 continue
-            ret_str += "Address 0x%08x:\n" % addr
+            ret_str += f"Address 0x{addr:08x}:\n"
             l.debug(stmts)
         l.debug("Loops: ")
         for loop in self._loops:
             s = ""
             for addr in loop:
-                s += "0x%08x -> " % addr
+                s += f"0x{addr:08x} -> "
             ret_str += s + "\n"
 
         return ret_str
@@ -219,20 +223,16 @@ class AnnotatedCFG:
             project = self._project
 
         if project is None:
-            raise Exception("Dict addr_to_run is empty. " + \
-                            "Give me a project, and I'll recreate the IRSBs for you.")
+            raise Exception("Dict addr_to_run is empty. " + "Give me a project, and I'll recreate the IRSBs for you.")
 
         vex_block = project.factory.block(irsb_addr).vex
         statements = vex_block.statements
         whitelist = self.get_whitelisted_statements(irsb_addr)
-        for i in range(0, len(statements)):
-            if whitelist is True or i in whitelist:
-                line = "+"
-            else:
-                line = "-"
-            line += "[% 3d] " % i
+        for i in range(len(statements)):
+            line = "+" if whitelist is None or i in whitelist else "-"
+            line += f"[{i: 3d}] "
             # We cannot get data returned by pp(). WTF?
-            print(line, end='')
+            print(line, end="")
             statements[i].pp()
 
     #
@@ -252,8 +252,7 @@ class AnnotatedCFG:
         addr = path.addr
         if addr in self._path_merge_points:
             return {self._path_merge_points[addr]}
-        else:
-            return set()
+        return set()
 
     def successor_func(self, path):
         """
@@ -265,16 +264,13 @@ class AnnotatedCFG:
         """
 
         whitelist = self.get_whitelisted_statements(path.addr)
-        last_stmt = self.get_last_statement_index(path.addr)
+        self.get_last_statement_index(path.addr)
 
         # pass in those arguments
-        successors = path.step(
-            stmt_whitelist=whitelist,
-            last_stmt=None
-        )
+        successors = path.step(stmt_whitelist=whitelist, last_stmt=None)
 
         # further filter successors based on the annotated CFG
-        taken_successors = [ ]
+        taken_successors = []
         for suc in successors:
             try:
                 taken = self.should_take_exit(path.addr, suc.addr)
@@ -293,15 +289,15 @@ class AnnotatedCFG:
 
     def __getstate__(self):
         state = {}
-        state['_run_statement_whitelist'] = self._run_statement_whitelist
-        state['_exit_taken'] = self._exit_taken
+        state["_run_statement_whitelist"] = self._run_statement_whitelist
+        state["_exit_taken"] = self._exit_taken
         # state['_addr_to_run'] = self._addr_to_run
-        state['_addr_to_last_stmt_id'] = self._addr_to_last_stmt_id
-        state['_loops'] = self._loops
-        state['_path_merge_points'] = self._path_merge_points
-        state['_cfg'] = None
-        state['_project'] = None
-        state['_addr_to_run'] = None
+        state["_addr_to_last_stmt_id"] = self._addr_to_last_stmt_id
+        state["_loops"] = self._loops
+        state["_path_merge_points"] = self._path_merge_points
+        state["_cfg"] = None
+        state["_project"] = None
+        state["_addr_to_run"] = None
         return state
 
     #
@@ -310,13 +306,13 @@ class AnnotatedCFG:
 
     def _detect_loops(self):
         temp_graph = networkx.DiGraph()
+        assert self._cfg is not None
         for source, target_list in self._cfg._edge_map.items():
             for target in target_list:
                 temp_graph.add_edge(source, target)
-        ctr = 0
-        for loop_lst in networkx.simple_cycles(temp_graph):
-            l.debug("A loop is found. %d", ctr)
-            ctr += 1
-            loop = (tuple([x[-1] for x in loop_lst]))
-            print(" => ".join(["0x%08x" % x for x in loop]))
+
+        for i, loop_lst in enumerate(networkx.simple_cycles(temp_graph)):
+            l.debug("A loop is found. %d", i)
+            loop = tuple(x[-1] for x in loop_lst)
+            print(" => ".join([f"0x{x:08x}" for x in loop]))
             self.add_loop(loop)

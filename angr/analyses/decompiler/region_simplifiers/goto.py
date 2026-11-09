@@ -1,18 +1,38 @@
 # pylint:disable=unused-argument,arguments-differ
-from typing import Set
+from __future__ import annotations
 
-import ailment
+import logging
 
-from ..sequence_walker import SequenceWalker
-from ..structurer_nodes import SequenceNode, CodeNode, MultiNode, LoopNode, ConditionNode, CascadingConditionNode
+from angr import ailment
+from angr.analyses.decompiler.goto_manager import Goto
+from angr.analyses.decompiler.sequence_walker import SequenceWalker
+from angr.analyses.decompiler.structurer_nodes import (
+    CascadingConditionNode,
+    CodeNode,
+    ConditionNode,
+    LoopNode,
+    MultiNode,
+    SequenceNode,
+)
+
 from .node_address_finder import NodeAddressFinder
+
+l = logging.getLogger(name=__name__)
 
 
 class GotoSimplifier(SequenceWalker):
     """
     Remove unnecessary Jump statements.
+    This simplifier also has the side effect of detecting Gotos that can't be reduced in the
+    structuring and eventual decompilation output. Because of this, when this analysis is run,
+    gotos in decompilation will be detected and stored in the kb.gotos. See the
+    _handle_irreducible_goto function below.
+
+    TODO:
+    Move the recording of Gotos outside this function
     """
-    def __init__(self, node):
+
+    def __init__(self, node, function=None, kb=None):
         handlers = {
             SequenceNode: self._handle_sequencenode,
             CodeNode: self._handle_codenode,
@@ -22,9 +42,12 @@ class GotoSimplifier(SequenceWalker):
             CascadingConditionNode: self._handle_cascadingconditionnode,
             ailment.Block: self._handle_block,
         }
+        self._function = function
+        self._kb = kb
+        self.irreducible_gotos = set()
 
         super().__init__(handlers)
-        self._node_addrs: Set[int] = NodeAddressFinder(node).addrs
+        self._node_addrs: set[int] = NodeAddressFinder(node).addrs
 
         self.walk(node)
 
@@ -35,7 +58,7 @@ class GotoSimplifier(SequenceWalker):
         :return:
         """
 
-        for n0, n1 in zip(node.nodes, node.nodes[1:] + [successor]):
+        for n0, n1 in zip(node.nodes, [*node.nodes[1:], successor]):
             self._handle(n0, successor=n1)
 
     def _handle_codenode(self, node, successor=None, **kwargs):
@@ -61,11 +84,10 @@ class GotoSimplifier(SequenceWalker):
             self._handle(node.false_node, successor=successor)
 
     def _handle_cascadingconditionnode(self, node: CascadingConditionNode, successor=None, **kwargs):
-
         for _, child_node in node.condition_and_nodes:
             self._handle(child_node, successor=successor)
         if node.else_node is not None:
-            self._handle(node.else_node)
+            self._handle(node.else_node, successor=successor)
 
     def _handle_loopnode(self, node, successor=None, **kwargs):
         """
@@ -75,9 +97,10 @@ class GotoSimplifier(SequenceWalker):
         :return:
         """
 
-        self._handle(node.sequence_node,
-                     successor=node,  # the end of a loop always jumps to the beginning of its body
-                     )
+        self._handle(
+            node.sequence_node,
+            successor=node,  # the end of a loop always jumps to the beginning of its body
+        )
 
     def _handle_multinode(self, node, successor=None, **kwargs):
         """
@@ -86,20 +109,24 @@ class GotoSimplifier(SequenceWalker):
         :return:
         """
 
-        for n0, n1 in zip(node.nodes, node.nodes[1:] + [successor]):
+        for n0, n1 in zip(node.nodes, [*node.nodes[1:], successor]):
             self._handle(n0, successor=n1)
 
     def _handle_block(self, block, successor=None, **kwargs):  # pylint:disable=no-self-use
         """
+        This will also record irreducible gotos into the kb if found.
 
         :param ailment.Block block:
         :return:
         """
+        if not block.statements:
+            return
 
-        if block.statements and isinstance(block.statements[-1], ailment.Stmt.Jump):
-            goto_stmt = block.statements[-1]  # ailment.Stmt.Jump
-            if isinstance(goto_stmt.target, ailment.Expr.Const):
-                goto_target = goto_stmt.target.value
+        last_stmt = block.statements[-1]
+        # goto label;
+        if isinstance(last_stmt, ailment.Stmt.Jump):
+            if isinstance(last_stmt.target, ailment.Expr.Const):
+                goto_target = last_stmt.target.value
                 if successor and goto_target == successor.addr:
                     can_remove = True
                 elif goto_target not in self._node_addrs:
@@ -107,7 +134,45 @@ class GotoSimplifier(SequenceWalker):
                     can_remove = True
                 else:
                     can_remove = False
+                    self._handle_irreducible_goto(block, last_stmt)
 
                 if can_remove:
                     # we can remove this statement
                     block.statements = block.statements[:-1]
+        # if {goto label_1;} else {goto label_2;}
+        elif isinstance(last_stmt, ailment.Stmt.ConditionalJump):
+            if (
+                last_stmt.true_target
+                and isinstance(last_stmt.true_target, ailment.Expr.Const)
+                and isinstance(last_stmt.true_target.value, int)
+            ):
+                self._handle_irreducible_goto(block, last_stmt, branch_target=True)
+
+            if (
+                last_stmt.false_target
+                and isinstance(last_stmt.false_target, ailment.Expr.Const)
+                and isinstance(last_stmt.false_target.value, int)
+            ):
+                self._handle_irreducible_goto(block, last_stmt, branch_target=False)
+
+    def _handle_irreducible_goto(
+        self, block, goto_stmt: ailment.Stmt.Jump | ailment.Stmt.ConditionalJump, branch_target=None
+    ):
+        if not self._function:
+            l.debug("Unable to store a goto at %#x because simplifier is kb or functionless", block.addr)
+            return
+
+        # normal Goto Label
+        if branch_target is None:
+            dst_target = goto_stmt.target
+        # true branch of a conditional jump
+        elif branch_target:
+            dst_target = goto_stmt.true_target
+        # false branch of a conditional jump
+        else:
+            dst_target = goto_stmt.false_target
+
+        src_ins_addr = goto_stmt.tags.get("ins_addr", block.addr)
+        goto = Goto(block.addr, dst_target.value, src_idx=block.idx, dst_idx=0, src_ins_addr=src_ins_addr)
+        l.debug("Storing %r goto", goto)
+        self.irreducible_gotos.add(goto)

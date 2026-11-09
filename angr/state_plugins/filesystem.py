@@ -1,20 +1,41 @@
-import os
-import logging
-from collections import namedtuple
+from __future__ import annotations
 
-from .plugin import SimStatePlugin
-from ..storage.file import SimFile
-from ..errors import SimMergeError
-from ..misc.ux import once
+import logging
+import os
+from collections import namedtuple
+from typing import cast
+
+from angr.errors import SimMergeError
+from angr.storage.file import SimFile
+
+from .plugin import SimStatePlugin, SupportsMerge
 
 l = logging.getLogger(name=__name__)
 
-Stat = namedtuple('Stat', ('st_dev', 'st_ino', 'st_nlink', 'st_mode', 'st_uid',
-                           'st_gid', 'st_rdev', 'st_size', 'st_blksize',
-                           'st_blocks', 'st_atime', 'st_atimensec', 'st_mtime',
-                           'st_mtimensec', 'st_ctime', 'st_ctimensec'))
+Stat = namedtuple(
+    "Stat",
+    (
+        "st_dev",
+        "st_ino",
+        "st_nlink",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_rdev",
+        "st_size",
+        "st_blksize",
+        "st_blocks",
+        "st_atime",
+        "st_atimensec",
+        "st_mtime",
+        "st_mtimensec",
+        "st_ctime",
+        "st_ctimensec",
+    ),
+)
 
-class SimFilesystem(SimStatePlugin): # pretends links don't exist
+
+class SimFilesystem(SimStatePlugin, SupportsMerge):  # pretends links don't exist
     """
     angr's emulated filesystem. Available as state.fs.
     When constructing, all parameters are optional.
@@ -25,20 +46,26 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
     :param mountpoints: A mapping from filepath to SimMountpoint
 
     :ivar pathsep:      The current pathsep
-    :ivar cwd:          The current working directory
+    :ivar cwd:          The current working directory, relative to the current root
     :ivar unlinks:      A list of unlink operations, tuples of filename and simfile. Be careful, this list is
                         shallow-copied from successor to successor, so don't mutate anything in it without copying.
     """
+
     def __init__(self, files=None, pathsep=None, cwd=None, mountpoints=None):
         super().__init__()
 
-        if files is None: files = {}
-        if pathsep is None: pathsep = b'/'
-        if cwd is None: cwd = pathsep
-        if mountpoints is None: mountpoints = {}
+        if files is None:
+            files = {}
+        if pathsep is None:
+            pathsep = b"/"
+        if cwd is None:
+            cwd = pathsep
+        if mountpoints is None:
+            mountpoints = {}
 
         self.pathsep = pathsep
         self.cwd = cwd
+        self._root = []
         self._unlinks = []
         self._files = {}
         self._mountpoints = {}
@@ -50,13 +77,14 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
 
     @SimStatePlugin.memo
     def copy(self, memo):
-        o = super().copy(memo)
+        o = cast("SimFilesystem", super().copy(memo))
 
-        o.pathsep=self.pathsep
-        o.cwd=self.cwd
+        o.pathsep = self.pathsep
+        o.cwd = self.cwd
+        o._root = list(self._root)
         o._unlinks = list(self._unlinks)
-        o._files={k: v.copy(memo) for k, v in self._files.items()}
-        o._mountpoints={k: v.copy(memo) for k, v in self._mountpoints.items()}
+        o._files = {k: v.copy(memo) for k, v in self._files.items()}
+        o._mountpoints = {k: v.copy(memo) for k, v in self._mountpoints.items()}
 
         return o
 
@@ -77,6 +105,8 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
         for o in others:
             if o.cwd != self.cwd:
                 raise SimMergeError("Can't merge filesystems with disparate cwds")
+            if o.root != self.root:
+                raise SimMergeError("Can't merge filesystems with disparate root directories")
             if len(o._mountpoints) != len(self._mountpoints):
                 raise SimMergeError("Can't merge filesystems with disparate mountpoints")
             if list(map(id, o.unlinks)) != list(map(id, self.unlinks)):
@@ -85,8 +115,8 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
         for fname in self._mountpoints:
             try:
                 subdeck = [o._mountpoints[fname] for o in others]
-            except KeyError:
-                raise SimMergeError("Can't merge filesystems with disparate file sets") # pylint: disable=raise-missing-from
+            except KeyError as err:
+                raise SimMergeError("Can't merge filesystems with disparate file sets") from err
 
             if common_ancestor is not None and fname in common_ancestor._mountpoints:
                 common_mp = common_ancestor._mountpoints[fname]
@@ -96,10 +126,10 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
             self._mountpoints[fname].merge(subdeck, merge_conditions, common_ancestor=common_mp)
 
         # this is a little messy
-        deck = [self] + others
+        deck = [self, *others]
         all_files = set.union(*(set(o._files.keys()) for o in deck))
         for fname in all_files:
-            subdeck = [o._files[fname] if fname in o._files else None for o in deck]
+            subdeck = [o._files.get(fname, None) for o in deck]
             representative = next(x for x in subdeck if x is not None)
             for i, v in enumerate(subdeck):
                 if v is None:
@@ -116,35 +146,38 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
 
         return True
 
-    def widen(self, others): # pylint: disable=unused-argument
-        if once('fs_widen_warning'):
-            l.warning("Filesystems can't be widened yet - beware unsoundness")
-
     def _normalize_path(self, path):
         """
-        Takes a path and returns a simple absolute path as a list of directories from the root
+        Takes a path and returns a simple absolute path as a list of directories from the current root.
+
+        Note that ".." is resolved lexically and cannot climb above the current root.
         """
         if type(path) is str:
             path = path.encode()
-        path = path.split(b'\0')[0]
+        path = path.split(b"\0")[0]
 
         if path[0:1] != self.pathsep:
             path = self.cwd + self.pathsep + path
         keys = path.split(self.pathsep)
         i = 0
         while i < len(keys):
-            if keys[i] == b'':
+            if keys[i] == b"" or keys[i] == b".":
                 keys.pop(i)
-            elif keys[i] == b'.':
-                keys.pop(i)
-            elif keys[i] == b'..':
+            elif keys[i] == b"..":
                 keys.pop(i)
                 if i != 0:
-                    keys.pop(i-1)
+                    keys.pop(i - 1)
                     i -= 1
             else:
                 i += 1
         return keys
+
+    def _resolve_path(self, path):
+        """
+        Takes a path and returns it as a list of directories from the filesystem's real root, i.e. with the current
+        root (see ``chroot``) prepended. This is what actually keys ``_files`` and ``_mountpoints``.
+        """
+        return self._root + self._normalize_path(path)
 
     def _join_chunks(self, keys):
         """
@@ -152,11 +185,37 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
         """
         return self.pathsep + self.pathsep.join(keys)
 
+    @property
+    def root(self):
+        """
+        The current root directory, as an absolute path in the filesystem's original namespace, i.e. the one paths
+        were resolved in before any chroot.
+        """
+        return self._join_chunks(self._root)
+
     def chdir(self, path):
         """
         Changes the current directory to the given path
         """
         self.cwd = self._join_chunks(self._normalize_path(path))
+
+    def chroot(self, path):
+        """
+        Changes the root directory to the given path, which is interpreted relative to the current root.
+
+        This only ever narrows what is reachable: the new root is resolved inside this filesystem, and paths
+        (including "..") are resolved under it from then on. Contrary to Linux, where the current directory is
+        left where it was and can therefore point outside the new root, the current directory is re-anchored
+        inside the new root, since keeping it outside would defeat the point.
+        """
+        cwd_chunks = self._resolve_path(self.cwd)
+        self._root = self._resolve_path(path)
+
+        if cwd_chunks[: len(self._root)] == self._root:
+            self.cwd = self._join_chunks(cwd_chunks[len(self._root) :])
+        else:
+            l.info("chroot: the current directory is outside of the new root %r; resetting it to the root", self.root)
+            self.cwd = self.pathsep
 
     def get(self, path):
         """
@@ -166,8 +225,7 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
 
         if mountpoint is None:
             return self._files.get(self._join_chunks(chunks))
-        else:
-            return mountpoint.get(chunks)
+        return mountpoint.get(chunks)
 
     def insert(self, path, simfile):
         """
@@ -180,8 +238,7 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
         if mountpoint is None:
             self._files[self._join_chunks(chunks)] = simfile
             return True
-        else:
-            return mountpoint.insert(chunks, simfile)
+        return mountpoint.insert(chunks, simfile)
 
     def delete(self, path):
         """
@@ -198,7 +255,7 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
             except KeyError:
                 return False
             else:
-                self.state.history.add_event('fs_unlink', path=apath, unlink_idx=len(self.unlinks))
+                self.state.history.add_event("fs_unlink", path=apath, unlink_idx=len(self.unlinks))
                 self.unlinks.append((apath, simfile))
                 return True
         else:
@@ -208,21 +265,25 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
         """
         Add a mountpoint to the filesystem.
         """
-        self._mountpoints[self._join_chunks(self._normalize_path(path))] = mount
+        self._mountpoints[self._join_chunks(self._resolve_path(path))] = mount
 
     def unmount(self, path):
         """
         Remove a mountpoint from the filesystem.
         """
-        del self._mountpoints[self._join_chunks(self._normalize_path(path))]
+        del self._mountpoints[self._join_chunks(self._resolve_path(path))]
 
     def get_mountpoint(self, path):
         """
         Look up the mountpoint servicing the given path.
 
         :return: A tuple of the mount and a list of path elements traversing from the mountpoint to the specified file.
+                 If no mountpoint services the path, the list traverses from the real root instead.
         """
-        path_chunks = self._normalize_path(path)
+        path_chunks = self._resolve_path(path)
+        if not path_chunks:
+            # the path is the real root itself; the loop below cannot express that
+            return self._mountpoints.get(self._join_chunks([])), []
         for i in range(len(path_chunks) - 1, -1, -1):
             partial_path = self._join_chunks(path_chunks[:-i])
             if partial_path in self._mountpoints:
@@ -233,14 +294,17 @@ class SimFilesystem(SimStatePlugin): # pretends links don't exist
 
         return None, path_chunks
 
-SimFilesystem.register_default('fs')
 
-class SimMount(SimStatePlugin):
+SimFilesystem.register_default("fs")
+
+
+class SimMount(SimStatePlugin, SupportsMerge):
     """
     This is the base class for "mount points" in angr's simulated filesystem. Subclass this class and
     give it to the filesystem to intercept all file creations and opens below the mountpoint.
     Since this a SimStatePlugin you may also want to implement set_state, copy, merge, etc.
     """
+
     def get(self, path_elements):
         """
         Implement this function to instrument file lookups.
@@ -279,12 +343,14 @@ class SimMount(SimStatePlugin):
         """
         raise NotImplementedError
 
+
 class SimConcreteFilesystem(SimMount):
     """
     Abstract SimMount allowing the user to import files from some external source into the guest
 
     :param str pathsep:         The host path separator character, default os.path.sep
     """
+
     def __init__(self, pathsep=os.path.sep):
         super().__init__()
         self.pathsep = pathsep
@@ -340,7 +406,7 @@ class SimConcreteFilesystem(SimMount):
             self.cache[fname].set_state(state)
 
     def merge(self, others, merge_conditions, common_ancestor=None):
-        merging_occured = False
+        merging_occurred = False
 
         for o in others:
             if o.pathsep != self.pathsep:
@@ -348,7 +414,7 @@ class SimConcreteFilesystem(SimMount):
             if o.deleted_list != self.deleted_list:
                 raise SimMergeError("Can't merge concrete filesystems with disparate deleted files")
 
-        deck = [self] + others
+        deck = [self, *others]
         all_files = set.union(*(set(o._files.keys()) for o in deck))
         for fname in all_files:
             subdeck = []
@@ -366,12 +432,8 @@ class SimConcreteFilesystem(SimMount):
             else:
                 common_simfile = None
 
-            merging_occured |= subdeck[0].merge(subdeck[1:], merge_conditions, common_ancestor=common_simfile)
-        return merging_occured
-
-    def widen(self, others): # pylint: disable=unused-argument
-        if once('host_fs_widen_warning'):
-            l.warning("The host filesystem mount can't be widened yet - beware unsoundness")
+            merging_occurred |= subdeck[0].merge(subdeck[1:], merge_conditions, common_ancestor=common_simfile)
+        return merging_occurred
 
     def _join_chunks(self, keys):
         """
@@ -387,6 +449,7 @@ class SimHostFilesystem(SimConcreteFilesystem):
     :param str host_path:       The path on the host to mount
     :param str pathsep:         The host path separator character, default os.path.sep
     """
+
     def __init__(self, host_path=None, **kwargs):
         super().__init__(**kwargs)
         self.host_path = host_path if host_path is not None else self.pathsep
@@ -401,12 +464,12 @@ class SimHostFilesystem(SimConcreteFilesystem):
         guest_path = guest_path.lstrip(self.pathsep)
         path = os.path.join(self.host_path, guest_path)
         try:
-            with open(path, 'rb') as fp:
+            with open(path, "rb") as fp:
                 content = fp.read()
         except OSError:
             return None
         else:
-            return SimFile(name='file://' + os.path.realpath(path), content=content, size=len(content))
+            return SimFile(name="file://" + os.path.realpath(path), content=content, size=len(content))
 
     def _get_stat(self, guest_path, dereference=False):
         guest_path = guest_path.lstrip(self.pathsep)
@@ -415,264 +478,24 @@ class SimHostFilesystem(SimConcreteFilesystem):
             if dereference:
                 path = os.path.realpath(path)
             s = os.stat(path)
-            stat = Stat(s.st_dev, s.st_ino, s.st_nlink, s.st_mode, s.st_uid,
-                        s.st_gid, s.st_rdev, s.st_size, s.st_blksize, s.st_blocks,
-                        round(s.st_atime), s.st_atime_ns, round(s.st_mtime), s.st_mtime_ns,
-                        round(s.st_ctime), s.st_ctime_ns)
-            return stat
+            # st_rdev, st_blksize and st_blocks are present only on Unix hosts.
+            return Stat(
+                s.st_dev,
+                s.st_ino,
+                s.st_nlink,
+                s.st_mode,
+                s.st_uid,
+                s.st_gid,
+                getattr(s, "st_rdev", 0),
+                s.st_size,
+                getattr(s, "st_blksize", 0x1000),
+                getattr(s, "st_blocks", (s.st_size + 511) // 512),
+                round(s.st_atime),
+                s.st_atime_ns,
+                round(s.st_mtime),
+                s.st_mtime_ns,
+                round(s.st_ctime),
+                s.st_ctime_ns,
+            )
         except OSError:
             return None
-
-#class SimDirectory(SimStatePlugin):
-#    """
-#    This is the base class for directories in angr's emulated filesystem. An instance of this class or a subclass will
-#    be found as ``state.fs``, representing the root of the filesystem.
-#
-#    :ivar files:    A mapping from filename to file that this directory contains.
-#    """
-#    def __init__(self, files=None, writable=True, parent=None, pathsep='/'):
-#        super(SimDirectory, self).__init__()
-#        self.files = files
-#        self.writable = writable
-#        self.parent = parent if parent is not None else self
-#        self.pathsep = pathsep
-#        self.files['.'] = self
-#        self.files['..'] = self.parent
-#
-#    def __len__(self):
-#        return len(self.files)
-#
-#    def lookup(self, path, writing=False):
-#        """
-#        Look up the file or directory at the end of the given path.
-#        This method should be called on the current working directory object.
-#
-#        :param str path:        The path to look up
-#        :param bool writing:    Whether the operation desired requires write permissions
-#        :returns:               The SimDirectory or SimFile object specified, or None if not found, or False if writing
-#                                was requested and the target is nonwritable
-#        """
-#        if len(path) == 0:
-#            return None
-#        if path[0] == self.pathsep:
-#            # lookup the filesystem root
-#            root = self
-#            while root.parent is not root:
-#                root = root.parent
-#            return root._lookup(path[1:], writing)
-#        else:
-#            return self._lookup(path, writing)
-#
-#    def _lookup(self, path, writing):
-#        while path.startswith(self.pathsep):
-#            path = path[1:]
-#
-#        if len(path) == 0:
-#            if writing and not self.writable:
-#                return False
-#            return self
-#
-#        for fname, simfile in self.files.items():
-#            if path.startswith(fname):
-#                if len(path) == len(fname):
-#                    if writing and not simfile.writable:
-#                        return False
-#                    return simfile
-#                elif path[len(fname)] == self.pathsep:
-#                    if isinstance(simfile, SimDirectory):
-#                        return simfile._lookup(path[len(fname)+1:])
-#                    else: # TODO: symlinks
-#                        return None
-#
-#        return None
-#
-#    def insert(self, path, simfile):
-#        """
-#        Add a file to the filesystem.
-#        This method should be called on the current working directory object.
-#
-#        :param str path:    The path to insert the new file at
-#        :param simfile:     The new file or directory
-#        :returns:           A boolean indicating whether the operation succeeded
-#        """
-#        while len(path) > 1 and path[-1] == self.pathsep:
-#            path = path[:-1]
-#
-#        if self.pathsep not in path:
-#            if path in self.files:
-#                return False
-#            if isinstance(simfile, SimDirectory):
-#                if simfile.parent is simfile:
-#                    simfile.parent = self
-#                    simfile.pathsep = self.pathsep
-#                else:
-#                    l.error("Trying to add directory to filesystem which already has a parent")
-#
-#            self.files[path] = simfile
-#            simfile.set_state(self.state)
-#            return True
-#        else:
-#            lastsep = path.rindex(self.pathsep) + 1
-#            head, tail = path[:lastsep], path[lastsep:]
-#            parent = self.lookup(head, True)
-#
-#            if not parent:
-#                return False
-#            return parent.insert(tail, simfile)
-#
-#    def remove(self, path):
-#        """
-#        Remove a file from the filesystem. If the target is a directory, the directory must be empty.
-#        This method should be called on the current working directory object.
-#
-#        :param str path:    The path to remove the file at
-#        :returns:           A boolean indicating whether the operation succeeded
-#        """
-#        while len(path) > 1 and path[-1] == self.pathsep:
-#            # TODO: when symlinks exist this will need to be fixed to delete the target of the
-#            # symlink instead of the link itself
-#            path = path[:-1]
-#
-#        if self.pathsep not in path:
-#            if path in ('.', '..'):
-#                return False
-#            if path not in self.files:
-#                return False
-#            if isinstance(self.files[path], SimDirectory) and len(self.files[path]) != 2:
-#                return False
-#
-#            del self.files[path]
-#            return True
-#        else:
-#            lastsep = path.rindex(self.pathsep) + 1
-#            head, tail = path[:lastsep], path[lastsep:]
-#            parent = self.lookup(head, True)
-#
-#            if not parent:
-#                return False
-#            return parent.remove(tail)
-#
-#    @SimStatePlugin.memo
-#    def copy(self, memo):
-#        return SimDirectory(
-#                files={x: y.copy(memo) for x, y in self.files.items()},
-#                writable=self.writable,
-#                parent=self.parent.copy(memo),
-#                pathsep=self.pathsep)
-#
-#    def merge(self, others, conditions, ancestor=None):
-#        new_files = {path: (simfile, [], []) for path, simfile in self.files.items() if path not in ('.', '..')}
-#        for other, condition in zip(others, conditions):
-#            if type(other) is not type(self):
-#                raise SimMergeError("Can't merge filesystem elements of disparate types")
-#            for path, simfile in other.files.items():
-#                if path in ('.', '..'):
-#                    continue
-#                if path not in new_files:
-#                    l.warning("Cannot represent the conditional creation of files")
-#                    new_files[path] = (simfile, [], [])
-#                else:
-#                    new_files[path][1].append(simfile)
-#                    new_files[path][2].append(condition)
-#
-#        for k in new_files:
-#            new_files[k][0].merge(new_files[k][1], new_files[k][2], ancestor)
-#            new_files[k] = new_files[k][0]
-#        new_files['.'] = self
-#        new_files['..'] = self.parent
-#        self.files = new_files
-#
-#    def widen(self, others):
-#        new_files = {path: [simfile] for path, simfile in self.files.items() if path not in ('.', '..')}
-#        for other in others:
-#            if type(other) is not type(self):
-#                raise SimMergeError("Can't merge filesystem elements of disparate types")
-#            for path, simfile in other.files.items():
-#                if path in ('.', '..'):
-#                    continue
-#                if path not in new_files:
-#                    new_files[path] = [simfile]
-#                else:
-#                    new_files[path].append(simfile)
-#
-#        for k in new_files:
-#            new_files[k][0].widen(new_files[k][1:])
-#            new_files[k] = new_files[k][0]
-#        new_files['.'] = self
-#        new_files['..'] = self.parent
-#        self.files = new_files
-#
-#class SimDirectoryConcrete(SimDirectory):
-#    """
-#    A SimDirectory that forwards its requests to the host filesystem
-#
-#    :param host_path:   The path on the host filesystem to provide
-#    :param writable:    Whether to allow mutation of the host filesystem by the guest
-#    """
-#    def __init__(self, host_path, writable=False, pathsep='/', host_root=None, parent=None):
-#        super(SimConcreteDirectory, self).__init__(files={}, writable=writable, parent=parent, pathsep=pathsep)
-#        self.host_path = os.path.realpath(host_path)
-#        self.host_root = self.host_path if host_root is None else host_root
-#
-#    def _lookup(self, path, writing):
-#        partial_path = self.host_path
-#        for i, pathkey in enumerate(path.split(self.pathsep)):
-#            if partial_path == self.host_root and pathkey == '..':
-#                target = self.pathsep.join(path.split(self.pathsep)[i+1:])
-#                return self.parent._lookup(target, writing)
-#            if not os.path.isdir(partial_path):
-#                return None
-#
-#            partial_path = os.path.realpath(partial_path + self.pathsep + pathkey)
-#
-#        if writing and not self.writable:
-#            return False
-#
-#        if os.path.isdir(partial_path):
-#            f = SimDirectoryConcrete(host_path=partial_path, writable=self.writable, host_root=self.host_root, parent=self.parent)
-#            f.set_state(self.state)
-#            return f
-#        elif os.path.isfile(partial_path):
-#            try:
-#                f = SimFileConcrete(host_path=partial_path, writable=self.writable)
-#                f.set_state(self.state)
-#                return f
-#            except OSError:
-#                return None
-#        else:
-#            raise SimFilesystemError("Can't handle something other than a file or directory in a concrete filesystem")
-#
-#    def insert(self, path, simfile):
-#        if self.pathsep in path:
-#            return super(SimDirectoryConcrete, self).insert(path, simfile)
-#        else:
-#            fullpath = os.path.join(self.host_path, path)
-#            if os.path.exists(fullpath):
-#                return False
-#            with open(fullpath, 'w') as fp:
-#                fp.write(simfile.concretize())
-#            return True
-#
-#    def remove(self, path):
-#        if self.pathsep in path:
-#            return super(SimDirectoryConcrete, self).remove(path)
-#        else:
-#            fullpath = os.path.join(self.host_path, path)
-#            if not os.path.exists(fullpath):
-#                return False
-#            if os.path.isdir(fullpath):
-#                try:
-#                    os.rmdir(fullpath)
-#                except OSError:
-#                    return False
-#                return True
-#            elif os.path.isfile(fullpath):
-#                try:
-#                    os.unlink(fullpath)
-#                except OSError:
-#                    return False
-#                return True
-#            else:
-#                raise SimFilesystemError("Can't handle anything but files and directories in concrete filesystem")
-#
-#SimDirectory.register_default('fs')

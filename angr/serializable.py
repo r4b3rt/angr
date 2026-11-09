@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 
 class Serializable:
     """
     The base class of all protobuf-serializable classes in angr.
     """
 
-    __slots__ = tuple()
+    __slots__ = ()
 
     @classmethod
     def _get_cmsg(cls):
@@ -14,7 +16,7 @@ class Serializable:
         :return:    The correct cmessage object.
         """
 
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def serialize_to_cmessage(self):
         """
@@ -24,7 +26,7 @@ class Serializable:
         :rtype:     protobuf.cmessage
         """
 
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def serialize(self):
         """
@@ -46,7 +48,7 @@ class Serializable:
         :rtype:         cls
         """
 
-        raise NotImplementedError()
+        raise NotImplementedError
 
     @classmethod
     def parse(cls, s, **kwargs):

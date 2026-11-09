@@ -1,24 +1,34 @@
-once_set = set()
+from __future__ import annotations
 
-def once(key):
+import warnings
+from collections.abc import Callable
+from functools import wraps
+
+once_set: set[str] = set()
+
+
+def once(key: str) -> bool:
     if key in once_set:
         return False
-    else:
-        once_set.add(key)
-        return True
-
-already_complained = set()
+    once_set.add(key)
+    return True
 
 
-def deprecated(replacement=None):
-    def outer(func):
-        def inner(*args, **kwargs):
+already_complained: set[object] = set()
+
+
+def deprecated[R, **P](replacement: str | None = None) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def outer(func: Callable[P, R]) -> Callable[P, R]:
+        @wraps(func)
+        def inner(*args: P.args, **kwargs: P.kwargs) -> R:
             if func not in already_complained:
                 if replacement is None:
-                    print("\x1b[31;1mDeprecation warning: Don't use %s\x1b[0m" % (func.__name__))
+                    warnings.warn(f"Don't use {func.__name__}", DeprecationWarning, stacklevel=2)
                 else:
-                    print("\x1b[31;1mDeprecation warning: Use %s instead of %s\x1b[0m" % (replacement, func.__name__))
+                    warnings.warn(f"Use {replacement} instead of {func.__name__}", DeprecationWarning, stacklevel=2)
                 already_complained.add(func)
             return func(*args, **kwargs)
+
         return inner
+
     return outer

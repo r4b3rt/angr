@@ -1,17 +1,29 @@
-from typing import Optional, Dict, Set, Iterable, Union, List
-from functools import reduce
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
+from typing import (
+    Any,
+    Literal,
+    overload,
+)
 
 import networkx
-
-import claripy
 from cle.loader import Loader
 
-from ...code_location import CodeLocation
-from ...knowledge_plugins.key_definitions.atoms import Atom, MemoryLocation
-from ...knowledge_plugins.key_definitions.definition import Definition
-from ...knowledge_plugins.key_definitions.undefined import UNDEFINED
-from ...knowledge_plugins.cfg import CFGModel
-from .external_codeloc import ExternalCodeLocation
+from angr import claripy
+from angr.code_location import CodeLocation, ExternalCodeLocation
+from angr.knowledge_plugins.cfg import CFGModel
+from angr.knowledge_plugins.key_definitions.atoms import (
+    Atom,
+    AtomKind,
+    ConstantSrc,
+    GuardUse,
+    MemoryLocation,
+    Register,
+    Tmp,
+)
+from angr.knowledge_plugins.key_definitions.definition import A, Definition, DefinitionMatchPredicate
+from angr.knowledge_plugins.key_definitions.undefined import UNDEFINED
 
 
 def _is_definition(node):
@@ -25,20 +37,20 @@ class DepGraph:
     Mostly a wrapper around a <networkx.DiGraph>.
     """
 
-    def __init__(self, graph: Optional[networkx.DiGraph]=None):
+    def __init__(self, graph: networkx.DiGraph[Definition] | None = None):
         """
         :param graph: A graph where nodes are definitions, and edges represent uses.
         """
         # Used for memoization of the `transitive_closure` method.
-        self._transitive_closures: Dict = {}
+        self._transitive_closures: dict = {}
 
         if graph and not all(map(_is_definition, graph.nodes)):
-            raise TypeError("In a DepGraph, nodes need to be <%s>s." % Definition.__name__)
+            raise TypeError(f"In a DepGraph, nodes need to be <{Definition.__name__}>s.")
 
-        self._graph: networkx.DiGraph = graph if graph is not None else networkx.DiGraph()
+        self._graph: networkx.DiGraph[Definition] = graph if graph is not None else networkx.DiGraph()
 
     @property
-    def graph(self) -> networkx.DiGraph:
+    def graph(self) -> networkx.DiGraph[Definition]:
         return self._graph
 
     def add_node(self, node: Definition) -> None:
@@ -57,17 +69,16 @@ class DepGraph:
         """
         self._graph.add_edge(source, destination, **labels)
 
-    def nodes(self) -> networkx.classes.reportviews.NodeView:
+    def nodes(self) -> Iterator[Definition]:
         return self._graph.nodes()
 
-    def predecessors(self, node: Definition) -> networkx.classes.reportviews.NodeView:
+    def predecessors(self, node: Definition) -> Iterator[Definition]:
         """
         :param node: The definition to get the predecessors of.
         """
         return self._graph.predecessors(node)
 
-
-    def transitive_closure(self, definition: Definition) -> networkx.DiGraph:
+    def transitive_closure(self, definition: Definition[Atom]) -> networkx.DiGraph[Definition[Atom]]:
         """
         Compute the "transitive closure" of a given definition.
         Obtained by transitively aggregating the ancestors of this definition in the graph.
@@ -78,8 +89,12 @@ class DepGraph:
         :return:            A graph of the transitive closure of the given definition.
         """
 
-        def _transitive_closure(def_: Definition, graph: networkx.DiGraph, result: networkx.DiGraph,
-                                visited: Optional[Set[Definition]]=None):
+        def _transitive_closure(
+            def_: Definition[Atom],
+            graph: networkx.DiGraph[Definition[Atom]],
+            result: networkx.DiGraph[Definition[Atom]],
+            visited: set[Definition[Atom]] | None = None,
+        ):
             """
             Returns a joint graph that comprises the transitive closure of all defs that `def_` depends on and the
             current graph `result`. `result` is updated.
@@ -96,23 +111,20 @@ class DepGraph:
             predecessors = list(graph.predecessors(def_))
 
             result.add_node(def_)
-            result.add_edges_from(list(map(
-                lambda e: (*e, graph.get_edge_data(*e)),
-                map(
-                    lambda p: (p, def_),
-                    predecessors
-                )
-            )))
+            for pred in predecessors:
+                edge_data = graph.get_edge_data(pred, def_)
+                if edge_data is None:
+                    result.add_edge(pred, def_)
+                else:
+                    result.add_edge(pred, def_, **edge_data)
 
             visited = visited or set()
             visited.add(def_)
             predecessors_to_visit = set(predecessors) - set(visited)
 
-            closure = reduce(
-                lambda acc, def0: _transitive_closure(def0, graph, acc, visited),
-                predecessors_to_visit,
-                result
-            )
+            closure = result
+            for def0 in predecessors_to_visit:
+                closure = _transitive_closure(def0, graph, closure, visited)
 
             self._transitive_closures[def_] = closure
             return closure
@@ -120,16 +132,11 @@ class DepGraph:
         return _transitive_closure(definition, self._graph, networkx.DiGraph())
 
     def contains_atom(self, atom: Atom) -> bool:
-        return any(map(
-            lambda definition: definition.atom == atom,
-            self.nodes()
-        ))
+        return any(definition.atom == atom for definition in self.nodes())
 
-    def add_dependencies_for_concrete_pointers_of(self,
-                                                  values: Iterable[Union[claripy.ast.Base,int]],
-                                                  definition: Definition,
-                                                  cfg: CFGModel,
-                                                  loader: Loader):
+    def add_dependencies_for_concrete_pointers_of(
+        self, values: Iterable[claripy.ast.Base | int], definition: Definition, cfg: CFGModel | None, loader: Loader
+    ):
         """
         When a given definition holds concrete pointers, make sure the <MemoryLocation>s they point to are present in
         the dependency graph; Adds them if necessary.
@@ -139,49 +146,44 @@ class DepGraph:
         :param cfg: The CFG, containing information about memory data.
         :param loader:
         """
-        assert definition in self.nodes(), 'The given Definition must be present in the given graph.'
+        assert definition in self.nodes(), "The given Definition must be present in the given graph."
 
-        known_predecessor_addresses: List[Union[int, claripy.ast.Base]] = list(map(
-            lambda definition: definition.atom.addr, # type: ignore # Needs https://github.com/python/mypy/issues/6847
-            filter(
-                lambda p: isinstance(p.atom, MemoryLocation),
-                self.predecessors(definition)
-            )
-        ))
+        known_predecessor_addresses: list[int | claripy.ast.Base] = [
+            definition.atom.addr
+            for definition in filter(lambda p: isinstance(p.atom, MemoryLocation), self.predecessors(definition))
+        ]
 
         # concretize addresses where possible
         concrete_known_pred_addresses = []
         for address in known_predecessor_addresses:
             if isinstance(address, claripy.ast.Base):
                 if address.concrete:
-                    concrete_known_pred_addresses.append(address._model_concrete.value)
+                    concrete_known_pred_addresses.append(address.concrete_value)
             else:
                 concrete_known_pred_addresses.append(address)
 
-        unknown_concrete_addresses: Set[int] = set()
+        unknown_concrete_addresses: set[int] = set()
         for v in values:
             if isinstance(v, claripy.ast.Base) and v.concrete:
-                v = v._model_concrete.value
-            if isinstance(v, int):
-                if v not in concrete_known_pred_addresses:
-                    unknown_concrete_addresses.add(v)
+                v = v.concrete_value
+            if isinstance(v, int) and v not in concrete_known_pred_addresses:
+                unknown_concrete_addresses.add(v)
 
         for address in unknown_concrete_addresses:
             data_at_address = cfg.memory_data.get(address, None) if cfg is not None else None
 
-            if data_at_address is None or data_at_address.sort not in ['string', 'unknown']:
+            if data_at_address is None or data_at_address.sort not in ["string", "unknown"]:
                 continue
 
             section = loader.main_object.find_section_containing(address)
             read_only = False if section is None else not section.is_writable
-            code_location = \
-                CodeLocation(0, 0, info={'readonly': True}) if read_only else ExternalCodeLocation()
+            code_location = CodeLocation(0, 0, info={"readonly": True}) if read_only else ExternalCodeLocation()
 
             def _string_and_length_from(data_at_address):
                 if data_at_address.content is None:
                     return UNDEFINED, data_at_address.size
-                else:
-                    return data_at_address.content.decode('utf-8'), data_at_address.size + 1
+                return data_at_address.content.decode("utf-8"), data_at_address.size + 1
+
             _, string_length = _string_and_length_from(data_at_address)
 
             memory_location_definition = Definition(
@@ -190,3 +192,238 @@ class DepGraph:
             )
 
             self.graph.add_edge(memory_location_definition, definition)
+
+    @overload
+    def find_definitions(
+        self,
+        *,
+        kind: type[A],
+        **kwargs: Any,
+    ) -> list[Definition[A]]: ...
+
+    @overload
+    def find_definitions(
+        self,
+        *,
+        kind: Literal[AtomKind.REGISTER] = AtomKind.REGISTER,
+        **kwargs: Any,
+    ) -> list[Definition[Register]]: ...
+
+    @overload
+    def find_definitions(
+        self,
+        *,
+        kind: Literal[AtomKind.MEMORY] = AtomKind.MEMORY,
+        **kwargs: Any,
+    ) -> list[Definition[MemoryLocation]]: ...
+
+    @overload
+    def find_definitions(
+        self,
+        *,
+        kind: Literal[AtomKind.TMP] = AtomKind.TMP,
+        **kwargs: Any,
+    ) -> list[Definition[Tmp]]: ...
+
+    @overload
+    def find_definitions(
+        self,
+        *,
+        kind: Literal[AtomKind.CONSTANT] = AtomKind.CONSTANT,
+        **kwargs: Any,
+    ) -> list[Definition[ConstantSrc]]: ...
+
+    @overload
+    def find_definitions(
+        self,
+        *,
+        kind: Literal[AtomKind.GUARD] = AtomKind.GUARD,
+        **kwargs: Any,
+    ) -> list[Definition[GuardUse]]: ...
+
+    @overload
+    def find_definitions(
+        self,
+        *,
+        reg_name: int | str = ...,
+        **kwargs: Any,
+    ) -> list[Definition[Register]]: ...
+
+    @overload
+    def find_definitions(self, *, stack_offset: int = ..., **kwargs: Any) -> list[Definition[MemoryLocation]]: ...
+
+    @overload
+    def find_definitions(self, *, const_val: int = ..., **kwargs: Any) -> list[Definition[ConstantSrc]]: ...
+
+    def find_definitions(self, **kwargs) -> list[Definition]:
+        """
+        Filter the definitions present in the graph based on various criteria.
+        Parameters can be any valid keyword args to `DefinitionMatchPredicate`
+        """
+        predicate = DefinitionMatchPredicate.construct(**kwargs)
+        result = []
+        defn: Definition
+        for defn in self.nodes():
+            if predicate.matches(defn):
+                result.append(defn)
+        return result
+
+    @overload
+    def find_all_predecessors(
+        self,
+        starts: Definition[Atom] | Iterable[Definition[Atom]],
+        *,
+        kind: type[A],
+        **kwargs: Any,
+    ) -> list[Definition[A]]: ...
+
+    @overload
+    def find_all_predecessors(
+        self,
+        starts: Definition[Atom] | Iterable[Definition[Atom]],
+        *,
+        kind: Literal[AtomKind.REGISTER] = AtomKind.REGISTER,
+        **kwargs: Any,
+    ) -> list[Definition[Register]]: ...
+
+    @overload
+    def find_all_predecessors(
+        self,
+        starts: Definition[Atom] | Iterable[Definition[Atom]],
+        *,
+        kind: Literal[AtomKind.MEMORY] = AtomKind.MEMORY,
+        **kwargs: Any,
+    ) -> list[Definition[MemoryLocation]]: ...
+
+    @overload
+    def find_all_predecessors(
+        self,
+        starts: Definition[Atom] | Iterable[Definition[Atom]],
+        *,
+        kind: Literal[AtomKind.TMP] = AtomKind.TMP,
+        **kwargs: Any,
+    ) -> list[Definition[Tmp]]: ...
+
+    @overload
+    def find_all_predecessors(
+        self,
+        starts: Definition[Atom] | Iterable[Definition[Atom]],
+        *,
+        kind: Literal[AtomKind.CONSTANT] = AtomKind.CONSTANT,
+        **kwargs: Any,
+    ) -> list[Definition[ConstantSrc]]: ...
+
+    @overload
+    def find_all_predecessors(
+        self,
+        starts: Definition[Atom] | Iterable[Definition[Atom]],
+        *,
+        kind: Literal[AtomKind.GUARD] = AtomKind.GUARD,
+        **kwargs: Any,
+    ) -> list[Definition[GuardUse]]: ...
+
+    @overload
+    def find_all_predecessors(
+        self,
+        starts: Definition[Atom] | Iterable[Definition[Atom]],
+        *,
+        reg_name: int | str = ...,
+        **kwargs: Any,
+    ) -> list[Definition[Register]]: ...
+
+    @overload
+    def find_all_predecessors(
+        self, starts: Definition[Atom] | Iterable[Definition[Atom]], *, stack_offset: int = ..., **kwargs: Any
+    ) -> list[Definition[MemoryLocation]]: ...
+
+    @overload
+    def find_all_predecessors(
+        self, starts: Definition[Atom] | Iterable[Definition[Atom]], *, const_val: int = ..., **kwargs: Any
+    ) -> list[Definition[ConstantSrc]]: ...
+
+    def find_all_predecessors(self, starts, **kwargs):
+        """
+        Filter the ancestors of the given start node or nodes that match various criteria.
+        Parameters can be any valid keyword args to `DefinitionMatchPredicate`
+        """
+        predicate = DefinitionMatchPredicate.construct(**kwargs)
+        result = []
+        queue = [starts] if isinstance(starts, Definition) else list(starts)
+        seen = set(queue)
+        while queue:
+            thing = queue.pop()
+            try:
+                preds = self.graph.pred[thing]
+            except KeyError:
+                continue
+            for pred in preds:
+                if pred in seen:
+                    continue
+                queue.append(pred)
+                seen.add(pred)
+                if predicate.matches(pred):
+                    result.append(pred)
+        return result
+
+    def find_all_successors(self, starts: Definition | Iterable[Definition], **kwargs) -> list[Definition]:
+        """
+        Filter the descendents of the given start node or nodes that match various criteria.
+        Parameters can be any valid keyword args to `DefinitionMatchPredicate`
+        """
+        predicate = DefinitionMatchPredicate.construct(**kwargs)
+        result = []
+        queue = [starts] if isinstance(starts, Definition) else list(starts)
+        seen = set(queue)
+        while queue:
+            thing = queue.pop()
+            for pred in self.graph.succ[thing]:
+                if pred in seen:
+                    continue
+                queue.append(pred)
+                seen.add(pred)
+                if predicate.matches(pred):
+                    result.append(pred)
+        return result
+
+    def find_path(
+        self, starts: Definition | Iterable[Definition], ends: Definition | Iterable[Definition], **kwargs
+    ) -> tuple[Definition, ...] | None:
+        """
+        Find a path between the given start node or nodes and the given end node or nodes.
+        All the intermediate steps in the path must match the criteria given in kwargs.
+        The kwargs can be any valid parameters to `DefinitionMatchPredicate`.
+
+        This algorithm has exponential time and space complexity. Use at your own risk.
+        Want to do better? Do it yourself or use networkx and eat the cost of indirection and/or cloning.
+        """
+        return next(self.find_paths(starts, ends, **kwargs), None)
+
+    def find_paths(
+        self, starts: Definition | Iterable[Definition], ends: Definition | Iterable[Definition], **kwargs
+    ) -> Iterator[tuple[Definition, ...]]:
+        """
+        Find all non-overlapping simple paths between the given start node or nodes and the given end node or nodes.
+        All the intermediate steps in the path must match the criteria given in kwargs.
+        The kwargs can be any valid parameters to `DefinitionMatchPredicate`.
+
+        This algorithm has exponential time and space complexity. Use at your own risk.
+        Want to do better? Do it yourself or use networkx and eat the cost of indirection and/or cloning.
+        """
+        predicate = DefinitionMatchPredicate.construct(**kwargs)
+        ends = {ends} if isinstance(ends, Definition) else set(ends)
+        queue: list[tuple[Definition, ...]] = (
+            [(starts,)] if isinstance(starts, Definition) else [(start,) for start in starts]
+        )
+        seen: set[Definition] = {starts} if isinstance(starts, Definition) else set(starts)
+        while queue:
+            path = queue.pop()
+            for succ in self.graph.succ[path[-1]]:
+                newpath = (*path, succ)
+                if succ in ends:
+                    yield newpath
+                elif succ in seen:
+                    continue
+
+                seen.add(succ)
+                if predicate.matches(succ):
+                    queue.append(newpath)

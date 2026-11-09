@@ -1,6 +1,6 @@
+from __future__ import annotations
 
 from .errors import SimStateOptionsError
-
 
 _NO_DEFAULT_VALUE = "_NO_DEFAULT_VALUE"  # please god don't use this value as the default value of your state option
 
@@ -10,7 +10,13 @@ class StateOption:
     Describes a state option.
     """
 
-    __slots__ = ('name', 'types', 'default', 'description', '_one_type', )
+    __slots__ = (
+        "_one_type",
+        "default",
+        "description",
+        "name",
+        "types",
+    )
 
     def __init__(self, name, types, default=_NO_DEFAULT_VALUE, description=None):
         self.name = name
@@ -20,8 +26,9 @@ class StateOption:
 
         # Sanity check
         if not isinstance(self.default, tuple(self.types)):
-            raise SimStateOptionsError("The type of the default value does not match the expected types of this state "
-                                       "option.")
+            raise SimStateOptionsError(
+                "The type of the default value does not match the expected types of this state option."
+            )
 
         # Speed optimization
         if len(self.types) == 1:
@@ -40,21 +47,13 @@ class StateOption:
         return hash(self.name)
 
     def __eq__(self, other):
-        return isinstance(other, StateOption) \
-               and self.name == other.name \
-               and self.types == other.types
+        return isinstance(other, StateOption) and self.name == other.name and self.types == other.types
 
     def __repr__(self):
-        if self.description is not None:
-            desc = ": %s" % self.description
-        else:
-            desc = ""
-        if self.one_type() is not None:
-            types = self.one_type().__name__
-        else:
-            types = ",".join(t.__name__ for t in self.types)
+        desc = f": {self.description}" if self.description is not None else ""
+        types = self.one_type().__name__ if self.one_type() is not None else ",".join(t.__name__ for t in self.types)
 
-        return "<O %s[%s]%s>" % (self.name, types, desc)
+        return f"<O {self.name}[{types}]{desc}>"
 
     def __getstate__(self):
         return {
@@ -77,16 +76,16 @@ class SimStateOptions:
     seen as a key-valued entry whose value can only be either True or False).
     """
 
-    __slots__ = ('_options', )
+    __slots__ = ("_options",)
 
-    OPTIONS = { }
+    OPTIONS = {}
 
     def __init__(self, thing):
         """
         :param thing:    Either a set of Boolean switches to enable, or an existing SimStateOptions instance.
         """
 
-        self._options = { }
+        self._options = {}
         if thing is None:
             pass
         elif isinstance(thing, (set, list)):
@@ -97,7 +96,7 @@ class SimStateOptions:
             ops = thing
             self._options = ops._options.copy()
         else:
-            raise SimStateOptionsError("Unsupported constructor argument type '%s'." % type(thing))
+            raise SimStateOptionsError(f"Unsupported constructor argument type '{type(thing)}'.")
 
     def _get_option_desc(self, key):
         """
@@ -110,12 +109,11 @@ class SimStateOptions:
 
         try:
             return self.OPTIONS[key]
-        except KeyError:
-            raise SimStateOptionsError("The state option '%s' does not exist." % key)
+        except KeyError as err:
+            raise SimStateOptionsError(f"The state option '{key}' does not exist.") from err
 
     def __repr__(self):
-        s = "<SimStateOptions>"
-        return s
+        return "<SimStateOptions>"
 
     def __contains__(self, key):
         """
@@ -161,10 +159,10 @@ class SimStateOptions:
         o = self._get_option_desc(key)
 
         if type(value) not in o.types:
-            raise SimStateOptionsError("The value '%s' does not have an acceptable type for state option '%s'. "
-                                       "Accepted types are: %s." %
-                                       (value, key, str(o.types))
-                                       )
+            raise SimStateOptionsError(
+                f"The value '{value}' does not have an acceptable type for state option '{key}'. "
+                f"Accepted types are: {o.types!s}."
+            )
 
         self._options[o.name] = value
 
@@ -239,15 +237,15 @@ class SimStateOptions:
         return ops
 
     def __getattr__(self, key):
-        if key in { 'OPTIONS', '_options' }:
+        if key in {"OPTIONS", "_options"}:
             return self.__getattribute__(key)
         if key.startswith("__") and key.endswith("__"):
             return self.__getattribute__(key)
         return self[key]
 
     def __setattr__(self, key, value):
-        if key in { 'OPTIONS', '_options' }:
-            super(SimStateOptions, self).__setattr__(key, value)
+        if key in {"OPTIONS", "_options"}:
+            super().__setattr__(key, value)
             return
         self[key] = value
 
@@ -350,7 +348,7 @@ class SimStateOptions:
         :rtype:                     str
         """
 
-        total = [ ]
+        total = []
 
         for o in sorted(self.OPTIONS.values(), key=lambda x: x.name):
             try:
@@ -362,9 +360,9 @@ class SimStateOptions:
                 # Skip Boolean switches that are False
                 continue
 
-            s = "{option}: {value}".format(option=o.name, value=value)
+            s = f"{o.name}: {value}"
             if description:
-                s += " | {description}".format(description=o.description)
+                s += f" | {o.description}"
 
             total.append(s)
 
@@ -386,7 +384,7 @@ class SimStateOptions:
             raise SimStateOptionsError("A state option with the same name has been registered.")
 
         if isinstance(types, type):
-            types = { types }
+            types = {types}
 
         o = StateOption(name, types, default=default, description=description)
         cls.OPTIONS[name] = o
@@ -402,4 +400,4 @@ class SimStateOptions:
         :return:                None
         """
 
-        cls.register_option(name, { bool }, default=False, description=description)
+        cls.register_option(name, {bool}, default=False, description=description)

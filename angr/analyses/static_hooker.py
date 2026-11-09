@@ -1,12 +1,13 @@
+from __future__ import annotations
 
 import logging
 
-from . import Analysis
-
-from .. import SIM_LIBRARIES
-from ..errors import AngrValueError
+from angr.analyses.analysis import AnalysesHub, Analysis
+from angr.errors import AngrValueError
+from angr.procedures import SIM_LIBRARIES
 
 l = logging.getLogger(name=__name__)
+
 
 class StaticHooker(Analysis):
     """
@@ -19,9 +20,9 @@ class StaticHooker(Analysis):
     def __init__(self, library, binary=None):
         self.results = {}
         try:
-            lib = SIM_LIBRARIES[library]
-        except KeyError:
-            raise AngrValueError("No such library %s" % library)
+            libs = SIM_LIBRARIES[library]
+        except KeyError as err:
+            raise AngrValueError(f"No such library {library}") from err
 
         if binary is None:
             binary = self.project.loader.main_object
@@ -34,16 +35,18 @@ class StaticHooker(Analysis):
                 l.debug("Skipping %s at %#x, already hooked", func.name, func.rebased_addr)
                 continue
 
-            if lib.has_implementation(func.name):
-                proc = lib.get(func.name, self.project.arch)
-                self.results[func.rebased_addr] = proc
-                if self.project.is_hooked(func.rebased_addr):
-                    l.debug("Skipping %s at %#x, already hooked", func.name, func.rebased_addr)
-                else:
-                    self.project.hook(func.rebased_addr, proc)
-                    l.info("Hooked %s at %#x", func.name, func.rebased_addr)
+            for lib in libs:
+                if lib.has_implementation(func.name):
+                    proc = lib.get(func.name, self.project.arch)
+                    self.results[func.rebased_addr] = proc
+                    if self.project.is_hooked(func.rebased_addr):
+                        l.debug("Skipping %s at %#x, already hooked", func.name, func.rebased_addr)
+                    else:
+                        self.project.hook(func.rebased_addr, proc)
+                        l.info("Hooked %s at %#x", func.name, func.rebased_addr)
+                    break
             else:
                 l.debug("Failed to hook %s at %#x", func.name, func.rebased_addr)
 
-from angr.analyses import AnalysesHub
-AnalysesHub.register_default('StaticHooker', StaticHooker)
+
+AnalysesHub.register_default("StaticHooker", StaticHooker)

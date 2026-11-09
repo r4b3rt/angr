@@ -1,17 +1,14 @@
-from typing import Dict, Tuple
+from __future__ import annotations
 
 import logging
-import pickle
-import time
+import multiprocessing
 import os
 import tempfile
-import multiprocessing
+import time
 
 from .worker import Worker
 
-
 _l = logging.getLogger(__name__)
-_l.setLevel(logging.INFO)
 
 
 class Server:
@@ -28,16 +25,28 @@ class Server:
     :ivar bool bucketizer:  Use the Bucketizer exploration strategy.
     :ivar _worker_exit_callback:    A method that will be called upon the exit of each worker.
     """
-    def __init__(self, project, spill_yard=None, db=None, max_workers=None, max_states=10, staging_max=10,
-                 bucketizer=True, recursion_limit=1000, worker_exit_callback=None, techniques=None, add_options=None,
-                 remove_options=None):
 
+    def __init__(
+        self,
+        project,
+        spill_yard=None,
+        db=None,
+        max_workers=None,
+        max_states=10,
+        staging_max=10,
+        bucketizer=True,
+        recursion_limit=1000,
+        worker_exit_callback=None,
+        techniques=None,
+        add_options=None,
+        remove_options=None,
+    ):
         self.project = project
 
-        self.spill_yard = spill_yard if spill_yard else tempfile.mkdtemp(suffix="angr_spill_yard")
+        self.spill_yard = spill_yard or tempfile.mkdtemp(suffix="angr_spill_yard")
         if not spill_yard:
             _l.info("Temporary spill yard: %s", self.spill_yard)
-        self.db_str = db if db else "sqlite:///" + os.path.join(tempfile.mkdtemp(suffix="angr_server_db"), "db.sqlite3")
+        self.db_str = db or "sqlite:///" + os.path.join(tempfile.mkdtemp(suffix="angr_server_db"), "db.sqlite3")
         if not db:
             _l.info("Database: %s", self.db_str)
 
@@ -52,45 +61,43 @@ class Server:
         self._recursion_limit = recursion_limit
 
         self._worker_exit_args_lock = None
-        self._worker_exit_args: Dict[int,Tuple] = None
+        self._worker_exit_args: dict[int, tuple] = None
 
         # the following will not be pickled
         self._worker_exit_callback = worker_exit_callback
 
-        self._workers = [ ]
+        self._workers = []
         self._stopped = False
-        self._active_workers = multiprocessing.Value('i', lock=True)  # type: multiprocessing.Value
+        self._active_workers = multiprocessing.Value("i", lock=True)
 
     def __setstate__(self, state):
+        self.project = state["project"]
+        self.spill_yard = state["spill_yard"]
+        self.db_str = state["db_str"]
 
-        self.project = state['project']
-        self.spill_yard = state['spill_yard']
-        self.db_str = state['db_str']
-
-        self.max_states = state['max_states']
-        self.max_workers = state['max_workers']
-        self.staging_max = state['staging_max']
-        self.bucketizer = state['bucketizer']
-        self._worker_exit_args_lock = state['_worker_exit_args_lock']
-        self._worker_exit_args = state['_worker_exit_args']
-        self._stopped = state['_stopped']
-        self._active_workers = state['_active_workers']
+        self.max_states = state["max_states"]
+        self.max_workers = state["max_workers"]
+        self.staging_max = state["staging_max"]
+        self.bucketizer = state["bucketizer"]
+        self._worker_exit_args_lock = state["_worker_exit_args_lock"]
+        self._worker_exit_args = state["_worker_exit_args"]
+        self._stopped = state["_stopped"]
+        self._active_workers = state["_active_workers"]
 
     def __getstate__(self):
-        s = {
-            'project': self.project,
-            'spill_yard': self.spill_yard,
-            'db_str': self.db_str,
-            'max_states': self.max_states,
-            'max_workers': self.max_workers,
-            'staging_max': self.staging_max,
-            'bucketizer': self.bucketizer,
-            '_worker_exit_args_lock': self._worker_exit_args_lock,
-            '_worker_exit_args': self._worker_exit_args,
-            '_stopped': self._stopped,
-            '_active_workers': self._active_workers,
+        return {
+            "project": self.project,
+            "spill_yard": self.spill_yard,
+            "db_str": self.db_str,
+            "max_states": self.max_states,
+            "max_workers": self.max_workers,
+            "staging_max": self.staging_max,
+            "bucketizer": self.bucketizer,
+            "_worker_exit_args_lock": self._worker_exit_args_lock,
+            "_worker_exit_args": self._worker_exit_args,
+            "_stopped": self._stopped,
+            "_active_workers": self._active_workers,
         }
-        return s
 
     #
     # Actions
@@ -128,18 +135,20 @@ class Server:
             # callback is enabled
             # we add this check since passing Python objects between processes is definitely not fast
             with self._worker_exit_args_lock:
-                self._worker_exit_args[worker_id] = (worker_id, stashes, )
+                self._worker_exit_args[worker_id] = (
+                    worker_id,
+                    stashes,
+                )
 
     #
     # Public methods
     #
 
     def run(self):
-
         # create workers
         with multiprocessing.Manager() as manager:
             server_state = manager.dict()
-            server_state['stopped'] = self.stopped
+            server_state["stopped"] = self.stopped
 
             if self._worker_exit_callback:
                 # Do not initialize the lock if no callback is provided
@@ -148,9 +157,15 @@ class Server:
 
             for i in range(self.max_workers):
                 _l.info("### Creating worker %d", i)
-                worker = Worker(i, self, server_state, recursion_limit=self._recursion_limit,
-                                techniques=self.techniques,
-                                add_options=self.add_options, remove_options=self.remove_options)
+                worker = Worker(
+                    i,
+                    self,
+                    server_state,
+                    recursion_limit=self._recursion_limit,
+                    techniques=self.techniques,
+                    add_options=self.add_options,
+                    remove_options=self.remove_options,
+                )
                 self._workers.append(worker)
 
             # start them
@@ -162,15 +177,15 @@ class Server:
 
             i = 0
             while not self.stopped or self.active_workers > 0:
-                server_state['stopped'] = self.stopped
+                server_state["stopped"] = self.stopped
                 time.sleep(1)
 
                 if self._worker_exit_callback and self._worker_exit_args:
                     with self._worker_exit_args_lock:
-                        for _, args in self._worker_exit_args.items():
+                        for args in self._worker_exit_args.values():
                             self._worker_exit_callback(*args)
 
-            server_state['stopped'] = self.stopped
+            server_state["stopped"] = self.stopped
             for worker in self._workers:
                 # wait for 10 seconds then kill the process
                 _l.info("Joining worker %d.", worker.worker_id)
@@ -179,4 +194,4 @@ class Server:
                     _l.info("Worker %d is still running. Kill it", worker.worker_id)
                     worker._proc.kill()
 
-            self._workers = [ ]
+            self._workers = []

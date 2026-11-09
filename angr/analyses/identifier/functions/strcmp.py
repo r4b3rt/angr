@@ -1,20 +1,13 @@
+from __future__ import annotations
 
-import random
-
-from ..func import Func, TestData
-
-
-def rand_str(length, byte_list=None):
-    if byte_list is None:
-        return "".join(chr(random.randint(0, 255)) for _ in range(length))
-    return "".join(random.choice(byte_list) for _ in range(length))
+from angr.analyses.identifier.func import Func, TestData, rand_str
 
 
 class strcmp(Func):
     non_null = [chr(i) for i in range(1, 256)]
 
     def __init__(self):
-        super(strcmp, self).__init__() #pylint disable=useless-super-delegation
+        super().__init__()  # pylint disable=useless-super-delegation
 
     def get_name(self):
         return "strcmp"
@@ -22,15 +15,12 @@ class strcmp(Func):
     def num_args(self):
         return 2
 
-    def args(self): #pylint disable=no-self-use
+    def args(self):  # pylint disable=no-self-use
         return ["buf1", "buf2"]
 
     def gen_input_output_pair(self):
         l = 5
-        s = rand_str(l, strcmp.non_null)
-         #pylint disable=unused-variable
-
-        return None
+        rand_str(l, strcmp.non_null)  # s
 
     def can_call_other_funcs(self):
         return False
@@ -44,7 +34,6 @@ class strcmp(Func):
 
     @staticmethod
     def _strcmp_pretest(func, runner):
-
         # todo we don't test which order it returns the signs in
         bufa = "asdf\x00"
         bufb = "asdf\x00"

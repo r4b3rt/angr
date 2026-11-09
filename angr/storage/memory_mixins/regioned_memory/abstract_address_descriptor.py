@@ -1,6 +1,8 @@
-from typing import List, Tuple, Generator
+from __future__ import annotations
 
-from claripy.vsa import StridedInterval
+from collections.abc import Generator
+
+from angr.claripy.ast import BV
 
 
 class AbstractAddressDescriptor:
@@ -9,16 +11,16 @@ class AbstractAddressDescriptor:
     cardinality (the total number of addresses) without enumerating or creating all addresses in static mode.
     """
 
-    __slots__ = ('_regioned_addrs', )
+    __slots__ = ("_regioned_addrs",)
 
     def __init__(self):
-        self._regioned_addrs: List[Tuple[str,StridedInterval]] = [ ]
+        self._regioned_addrs: list[tuple[str, BV]] = []
 
     def __len__(self) -> int:
         # this may raise an OverflowError if self.cardinality is greater than sys.maxint
         return self.cardinality
 
-    def __iter__(self) -> Generator[Tuple[str,StridedInterval],None,None]:
+    def __iter__(self) -> Generator[tuple[str, BV]]:
         yield from self._regioned_addrs
 
     @property
@@ -28,7 +30,7 @@ class AbstractAddressDescriptor:
             n += si.cardinality
         return n
 
-    def add_regioned_address(self, region: str, addr: StridedInterval):
+    def add_regioned_address(self, region: str, addr: BV):
         self._regioned_addrs.append((region, addr))
 
     def clear(self):

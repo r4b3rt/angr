@@ -1,7 +1,11 @@
-from ..errors import AngrExitError
-from . import ExplorationTechnique
+from __future__ import annotations
 
 import logging
+
+from angr.errors import AngrExitError
+
+from .base import ExplorationTechnique
+
 l = logging.getLogger(name=__name__)
 
 
@@ -10,7 +14,7 @@ class Slicecutor(ExplorationTechnique):
     The Slicecutor is an exploration that executes provided code slices.
     """
 
-    def __init__(self, annotated_cfg, force_taking_exit=False, force_sat: bool=False):
+    def __init__(self, annotated_cfg, force_taking_exit=False, force_sat: bool = False):
         """
         All parameters except `annotated_cfg` are optional.
 
@@ -20,14 +24,14 @@ class Slicecutor(ExplorationTechnique):
         :param force_sat:           If a branch specified by the slice is unsatisfiable, set this option to True if you
                                     want to force it to be satisfiable and be taken anyway.
         """
-        super(Slicecutor, self).__init__()
+        super().__init__()
 
         self._annotated_cfg = annotated_cfg
         self._force_taking_exit = force_taking_exit
         self._force_sat = force_sat
 
     def setup(self, simgr):
-        for stash in ('cut', 'mysteries'):
+        for stash in ("cut", "mysteries"):
             simgr.populate(stash, [])
 
     def filter(self, simgr, state, **kwargs):
@@ -46,14 +50,14 @@ class Slicecutor(ExplorationTechnique):
         flat_successors = stashes.get(None, None)
         if flat_successors is None:
             # Did the user explicitly put them into the 'active' stash instead?
-            flat_successors = stashes.pop('active', [])
+            flat_successors = stashes.pop("active", [])
 
         for successor in flat_successors:
             l.debug("... checking exit to %#x from %#x.", successor.addr, state.addr)
 
             try:
                 taken = self._annotated_cfg.should_take_exit(state.addr, successor.addr)
-            except AngrExitError: # TODO: which exception?
+            except AngrExitError:  # TODO: which exception?
                 l.debug("... annotated CFG did not know about it!")
                 new_mystery.append(successor)
             else:
@@ -66,9 +70,9 @@ class Slicecutor(ExplorationTechnique):
                     l.debug("... not taking the exit.")
                     new_cut.append(successor)
 
-        unconstrained_successors = stashes.get('unconstrained', [])
+        unconstrained_successors = stashes.get("unconstrained", [])
         if not new_active and unconstrained_successors and self._force_taking_exit:
-            stashes['unconstrained'] = []
+            stashes["unconstrained"] = []
             # somehow there is no feasible state. We are forced to create a successor based on our slice
             if len(unconstrained_successors) != 1:
                 raise Exception("This should absolutely never happen, what?")
@@ -76,15 +80,15 @@ class Slicecutor(ExplorationTechnique):
                 successor = unconstrained_successors[0].copy()
                 successor.regs._ip = target
                 new_active.append(successor)
-            l.debug('Got unconstrained: %d new states are created based on AnnotatedCFG.', len(new_active))
+            l.debug("Got unconstrained: %d new states are created based on AnnotatedCFG.", len(new_active))
 
-        unsat_successors = stashes.get('unsat', None)
+        unsat_successors = stashes.get("unsat", None)
         if not new_active and unsat_successors and self._force_sat:
-            stashes['unsat'] = []
+            stashes["unsat"] = []
             # find the state
             targets = self._annotated_cfg.get_targets(state.addr)
             if targets is None:
-                targets = [ ]
+                targets = []
             for target in targets:
                 try:
                     suc = next(iter(u for u in unsat_successors if u.addr == target))
@@ -94,7 +98,7 @@ class Slicecutor(ExplorationTechnique):
                 # drop all constraints
                 if suc.mode == "fastpath":
                     # dropping constraints and making the state satisfiable again under fastpath mode is easy
-                    suc.solver._solver.constraints = [ ]
+                    suc.solver._solver.constraints = []
                     suc._satisfiable = True
                     new_active.append(suc)
                     l.debug("Forced unsat at %#x to be sat again.", suc.addr)
@@ -103,13 +107,12 @@ class Slicecutor(ExplorationTechnique):
                     # straightforward. I'll leave it to the next person who uses this feature
                     l.warning("force_sat is not implemented for solver mode %s.", suc.moe)
 
-
         stashes[None] = new_active
-        stashes['mystery'] = new_mystery
-        stashes['cut'] = new_cut
+        stashes["mystery"] = new_mystery
+        stashes["cut"] = new_cut
         return stashes
 
     def successors(self, simgr, state, **kwargs):
-        kwargs['whitelist'] = self._annotated_cfg.get_whitelisted_statements(state.addr)
-        kwargs['last_stmt'] = self._annotated_cfg.get_last_statement_index(state.addr)
+        kwargs["whitelist"] = self._annotated_cfg.get_whitelisted_statements(state.addr)
+        kwargs["last_stmt"] = self._annotated_cfg.get_last_statement_index(state.addr)
         return simgr.successors(state, **kwargs)

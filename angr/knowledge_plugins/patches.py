@@ -1,4 +1,4 @@
-from typing import Optional, List, Dict
+from __future__ import annotations
 
 from cle.address_translator import AddressTranslator
 from sortedcontainers import SortedDict
@@ -8,7 +8,7 @@ from .plugin import KnowledgeBasePlugin
 
 # TODO: Serializable
 class Patch:
-    def __init__(self, addr, new_bytes, comment: Optional[str]=None):
+    def __init__(self, addr, new_bytes, comment: str | None = None):
         self.addr = addr
         self.new_bytes = new_bytes
         self.comment = comment
@@ -21,27 +21,32 @@ class PatchManager(KnowledgeBasePlugin):
     """
     A placeholder-style implementation for a binary patch manager. This class should be significantly changed in the
     future when all data about loaded binary objects are loaded into angr knowledge base from CLE. As of now, it only
-    stores byte-level replacements. Other angr components may choose to use or not use information provided by this
-    manager. In other words, it is not transparent.
+    stores byte-level replacements.
 
     Patches should not overlap, but it's user's responsibility to check for and avoid overlapping patches.
     """
 
     def __init__(self, kb):
-        super().__init__()
+        super().__init__(kb=kb)
 
-        self._patches: Dict[int,Patch] = SortedDict()
-        self._kb = kb
+        self._patches: dict[int, Patch] = SortedDict()
+        self._patched_entry_state = None
 
-    def add_patch(self, addr, new_bytes, comment: Optional[str]=None):
+    def has_patches(self) -> bool:
+        return bool(self._patches)
+
+    def add_patch(self, addr, new_bytes, comment: str | None = None):
         self._patches[addr] = Patch(addr, new_bytes, comment=comment)
+        self._patched_entry_state = None
 
     def add_patch_obj(self, patch: Patch):
         self._patches[patch.addr] = patch
+        self._patched_entry_state = None
 
     def remove_patch(self, addr):
         if addr in self._patches:
             del self._patches[addr]
+        self._patched_entry_state = None
 
     def patch_addrs(self):
         return self._patches.keys()
@@ -65,10 +70,10 @@ class PatchManager(KnowledgeBasePlugin):
         :return:            A list of patches.
         :rtype:             list
         """
-        patches = [ ]
-        for patch_addr in self._patches.irange(maximum=addr+size-1, reverse=True):
+        patches = []
+        for patch_addr in self._patches.irange(maximum=addr + size - 1, reverse=True):
             p = self._patches[patch_addr]
-            if self.overlap(p.addr, p.addr + len(p), addr, addr+size):
+            if self.overlap(p.addr, p.addr + len(p), addr, addr + size):
                 patches.append(p)
             else:
                 break
@@ -86,14 +91,15 @@ class PatchManager(KnowledgeBasePlugin):
     def copy(self):
         o = PatchManager(self._kb)
         o._patches = self._patches.copy()
+        return o
 
     @staticmethod
     def overlap(a0, a1, b0, b1):
         return a0 <= b0 < a1 or a0 <= b1 < a1 or b0 <= a0 < b1
 
-    def apply_patches_to_binary(self, binary_bytes: Optional[bytes]=None, patches: Optional[List[Patch]]=None) -> bytes:
+    def apply_patches_to_binary(self, binary_bytes: bytes | None = None, patches: list[Patch] | None = None) -> bytes:
         if patches is None:
-            patches = sorted(list(self._patches.values()), key=lambda x: x.addr)
+            patches = sorted(self._patches.values(), key=lambda x: x.addr)
 
         if binary_bytes is None:
             with open(self._kb._project.loader.main_object.binary, "rb") as f:
@@ -104,11 +110,22 @@ class PatchManager(KnowledgeBasePlugin):
             file_offset = at.to_raw()
 
             if file_offset < len(binary_bytes) and file_offset + len(patch.new_bytes) < len(binary_bytes):
-                binary_bytes = binary_bytes[:file_offset] + \
-                               patch.new_bytes + \
-                               binary_bytes[file_offset + len(patch.new_bytes):]
+                binary_bytes = (
+                    binary_bytes[:file_offset] + patch.new_bytes + binary_bytes[file_offset + len(patch.new_bytes) :]
+                )
 
         return binary_bytes
 
+    def apply_patches_to_state(self, state):
+        for patch in self._patches.values():
+            state.memory.store(patch.addr, patch.new_bytes)
 
-KnowledgeBasePlugin.register_default('patches', PatchManager)
+    @property
+    def patched_entry_state(self):
+        if self._patched_entry_state is None:
+            self._patched_entry_state = self._kb._project.factory.entry_state()
+            self.apply_patches_to_state(self._patched_entry_state)
+        return self._patched_entry_state
+
+
+KnowledgeBasePlugin.register_default("patches", PatchManager)

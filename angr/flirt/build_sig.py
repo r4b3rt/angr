@@ -1,47 +1,45 @@
 # pylint:disable=consider-using-with
-from typing import List, Dict
-import json
-import subprocess
+from __future__ import annotations
+
 import argparse
-import tempfile
-import os
 import itertools
+import json
+import os
+import subprocess
+import tempfile
 from collections import defaultdict
 
 import angr
-
 
 UNIQUE_STRING_COUNT = 20
 # strings longer than MAX_UNIQUE_STRING_LEN will be truncated
 MAX_UNIQUE_STRING_LEN = 70
 
 
-def get_basic_info(ar_path: str) -> Dict[str,str]:
+def get_basic_info(ar_path: str) -> dict[str, str]:
     """
     Get basic information of the archive file.
     """
 
     with tempfile.TemporaryDirectory() as tempdirname:
-        cwd = os.getcwd()
-        os.chdir(tempdirname)
-        subprocess.call(["ar", "x", ar_path])
+        subprocess.call(["ar", "x", ar_path], cwd=tempdirname)
 
         # Load arch and OS information from the first .o file
-        o_files = [ f for f in os.listdir(".") if f.endswith(".o") ]
+        o_files = [f for f in os.listdir(".") if f.endswith(".o")]
         if o_files:
             proj = angr.Project(o_files[0], auto_load_libs=False)
             arch_name = proj.arch.name.lower()
             os_name = proj.simos.name.lower()
-
-        os.chdir(cwd)
+        else:
+            raise ValueError("No .o files found in the archive.")
 
     return {
-            'arch': arch_name,
-            'platform': os_name,
-            }
+        "arch": arch_name,
+        "platform": os_name,
+    }
 
 
-def get_unique_strings(ar_path: str) -> List[str]:
+def get_unique_strings(ar_path: str) -> list[str]:
     """
     For Linux libraries, this method requires ar (from binutils), nm (from binutils), and strings.
     """
@@ -54,7 +52,7 @@ def get_unique_strings(ar_path: str) -> List[str]:
         for symbol_type in symbol_types:
             if f" {symbol_type} " in nm_line:
                 # parse it
-                symbol = nm_line[nm_line.find(f" {symbol_type}") + 3: ].strip(" ")
+                symbol = nm_line[nm_line.find(f" {symbol_type}") + 3 :].strip(" ")
                 if "." in symbol:
                     symbols |= set(symbol.split("."))
                 else:
@@ -64,9 +62,7 @@ def get_unique_strings(ar_path: str) -> List[str]:
     # extract the archive file into a temporary directory
     all_strings = set()
     with tempfile.TemporaryDirectory() as tempdirname:
-        cwd = os.getcwd()
-        os.chdir(tempdirname)
-        subprocess.call(["ar", "x", ar_path])
+        subprocess.call(["ar", "x", ar_path], cwd=tempdirname)
 
         for filename in os.listdir("."):
             if filename.endswith(".o"):
@@ -93,16 +89,14 @@ def get_unique_strings(ar_path: str) -> List[str]:
                     non_symbol_strings.add(s)
                 all_strings |= non_symbol_strings
 
-        os.chdir(cwd)
-
     grouped_strings = defaultdict(set)
     for s in all_strings:
         grouped_strings[s[:5]].add(s)
-    sorted_strings = list(sorted(all_strings, key=len, reverse=True))
+    sorted_strings = sorted(all_strings, key=len, reverse=True)
 
     ctr = 0
     picked = set()
-    unique_strings = [ ]
+    unique_strings = []
     for s in sorted_strings:
         if s[:5] in picked:
             continue
@@ -119,30 +113,26 @@ def run_pelf(pelf_path: str, ar_path: str, output_path: str):
 
 
 def run_sigmake(sigmake_path: str, sig_name: str, pat_path: str, sig_path: str):
-    if " " not in sig_name:
-        sig_name_arg = f"-n{sig_name}"
-    else:
-        sig_name_arg = f"-n\"{sig_name}\""
+    sig_name_arg = f"-n{sig_name}" if " " not in sig_name else f'-n"{sig_name}"'
 
-    proc = subprocess.Popen([sigmake_path, sig_name_arg, pat_path, sig_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            )
+    proc = subprocess.Popen(
+        [sigmake_path, sig_name_arg, pat_path, sig_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
     _, stderr = proc.communicate()
 
-    if b"COLLISIONS:" in stderr:
-        return False
-    return True
+    return b"COLLISIONS:" not in stderr
 
 
 def process_exc_file(exc_path: str):
     """
     We are doing the stupidest thing possible: For each batch of conflicts, we pick the most likely
-    result baed on a set of predefined rules.
+    result based on a set of predefined rules.
 
     TODO: Add caller-callee-based de-duplication.
     """
-    with open(exc_path, "r") as f:
+    with open(exc_path, encoding="utf-8") as f:
         data = f.read()
         lines = data.split("\n")
 
@@ -158,7 +148,7 @@ def process_exc_file(exc_path: str):
             idx = next(ctr)
         else:
             # parse the function name
-            func_name = line[:line.index("\t")].strip(" ")
+            func_name = line[: line.index("\t")].strip(" ")
             groups[idx][func_name] = line
 
     # for each group, decide the one to keep
@@ -173,14 +163,14 @@ def process_exc_file(exc_path: str):
             # .cold functions. doesn't matter what we pick
             continue
 
-        non_cold_names = [ ]
+        non_cold_names = []
         for func_name in g:
             if func_name.endswith(".cold"):
                 continue
             non_cold_names.append(func_name)
 
         # sort it
-        non_cold_names = list(sorted(non_cold_names, key=len))
+        non_cold_names = sorted(non_cold_names, key=len)
 
         # pick the top one
         the_chosen_one = non_cold_names[0]
@@ -188,7 +178,7 @@ def process_exc_file(exc_path: str):
         g[the_chosen_one] = "+" + line
 
     # output
-    with open(exc_path, "w") as f:
+    with open(exc_path, "w", encoding="utf-8") as f:
         for g in groups.values():
             for line in g.values():
                 f.write(line + "\n")
@@ -200,16 +190,21 @@ def main():
     parser.add_argument("ar_path", help="Path of the .a file to build signatures for")
     parser.add_argument("sig_name", help="Name of the signature (a string inside the signature file)")
     parser.add_argument("sig_path", help="File name of the generated signature")
-    parser.add_argument("--compiler", help="Name of the compiler (e.g., gcc, clang). It will be stored in the meta "
-                                           "data file.")
-    parser.add_argument("--compiler_version", help="Version of the compiler (e.g., 6). It will be stored in the meta "
-                                                   "data file.")
+    parser.add_argument(
+        "--compiler", help="Name of the compiler (e.g., gcc, clang). It will be stored in the meta data file."
+    )
+    parser.add_argument(
+        "--compiler_version", help="Version of the compiler (e.g., 6). It will be stored in the meta data file."
+    )
     # parser.add_argument("--platform", help="Name of the platform (e.g., windows/linux/macos). It will be stored in
     # the meta data file.")
-    parser.add_argument("--os", help="Name of the operating system (e.g., ubuntu/debian). It will be stored in the "
-                                     "meta data file.")
-    parser.add_argument("--os_version", help="Version of the operating system (e.g., 20.04). It will be stored in the "
-                                             "meta data file.")
+    parser.add_argument(
+        "--os", help="Name of the operating system (e.g., ubuntu/debian). It will be stored in the meta data file."
+    )
+    parser.add_argument(
+        "--os_version",
+        help="Version of the operating system (e.g., 20.04). It will be stored in the meta data file.",
+    )
     parser.add_argument("--pelf_path", help="Path of pelf")
     parser.add_argument("--sigmake_path", help="Path of sigmake")
     args = parser.parse_args()
@@ -217,14 +212,14 @@ def main():
     if args.pelf_path:
         pelf_path = args.pelf_path
     elif "pelf_path" in os.environ:
-        pelf_path = os.environ['pelf_path']
+        pelf_path = os.environ["PELF_PATH"]
     else:
         raise ValueError("pelf_path must be specified.")
 
     if args.sigmake_path:
         sigmake_path = args.sigmake_path
     elif "sigmake_path" in os.environ:
-        sigmake_path = os.environ['sigmake_path']
+        sigmake_path = os.environ["SIGMAKE_PATH"]
     else:
         raise ValueError("sigmake_path must be specified.")
 
@@ -255,15 +250,9 @@ def main():
     sig_path_basename = os.path.basename(args.sig_path)
     if "." in sig_path_basename:
         sig_dir = os.path.dirname(args.sig_path)
-        filename = sig_path_basename[:sig_path_basename.rfind(".")]
-        exc_path = os.path.join(
-                sig_dir,
-                filename + ".exc"
-                )
-        meta_path = os.path.join(
-                sig_dir,
-                filename + ".meta"
-                )
+        filename = sig_path_basename[: sig_path_basename.rfind(".")]
+        exc_path = os.path.join(sig_dir, filename + ".exc")
+        meta_path = os.path.join(sig_dir, filename + ".meta")
     else:
         exc_path = args.sig_path + ".exc"
         meta_path = args.sig_path + ".meta"
@@ -278,8 +267,7 @@ def main():
         basename = os.path.basename(ar_path)
 
         # sanitize basename since otherwise sigmake is not happy with it
-        if basename.endswith(".a"):
-            basename = basename[:-2]
+        basename = basename.removesuffix(".a")
         basename = basename.replace("+", "plus")
 
         # sanitize signame as well
@@ -297,19 +285,19 @@ def main():
 
             assert not has_collision
 
-    with open(meta_path, "w") as f:
+    with open(meta_path, "w", encoding="utf-8") as f:
         metadata = {
-                'unique_strings': unique_strings,
-                }
+            "unique_strings": unique_strings,
+        }
         metadata.update(basic_info)
         if compiler_version:
-            metadata['compiler_version'] = compiler_version
+            metadata["compiler_version"] = compiler_version
         if compiler:
-            metadata['compiler'] = compiler
+            metadata["compiler"] = compiler
         if os_name:
-            metadata['os'] = os_name
+            metadata["os"] = os_name
         if os_version:
-            metadata['os_version'] = os_version
+            metadata["os_version"] = os_version
         f.write(json.dumps(metadata, indent=2))
 
 

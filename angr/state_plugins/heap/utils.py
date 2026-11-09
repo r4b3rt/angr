@@ -1,4 +1,7 @@
-from ...errors import SimSolverError
+from __future__ import annotations
+
+from angr.errors import SimSolverError
+
 
 def concretize(x, solver, sym_handler):
     """

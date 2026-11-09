@@ -1,8 +1,7 @@
+from __future__ import annotations
+
 import angr
 
-######################################
-# getuid
-######################################
 
 class getuid(angr.SimProcedure):
     # pylint: disable=arguments-differ

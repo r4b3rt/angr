@@ -1,15 +1,17 @@
-from typing import Optional, Set, List, Tuple, TYPE_CHECKING, Dict
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import networkx
 
-import ailment
+from angr import ailment
+from angr.ailment.block_walker import AILBlockViewer
+from angr.codenode import BlockNode, FuncNode
+from angr.knowledge_plugins.functions import Function
+from angr.sim_variable import SimMemoryVariable
 
-from ..codenode import BlockNode
-from ..sim_variable import SimMemoryVariable
-from ..knowledge_plugins.functions import Function
-from .analysis import Analysis, AnalysesHub
-from .decompiler.ailblock_walker import AILBlockWalker
+from .analysis import AnalysesHub, Analysis
 
 if TYPE_CHECKING:
     from angr.analyses.decompiler.decompiler import Decompiler
@@ -23,6 +25,7 @@ class ProxiNodeTypes:
     """
     Node Type Enums
     """
+
     Empty = 0
     String = 1
     Function = 2
@@ -37,7 +40,7 @@ class BaseProxiNode:
     Base class for all nodes in a proximity graph.
     """
 
-    def __init__(self, type_: int, ref_at: Optional[Set[int]] = None):
+    def __init__(self, type_: int, ref_at: set[int] | None = None):
         self.type_ = type_
         self.ref_at = ref_at
 
@@ -53,14 +56,12 @@ class FunctionProxiNode(BaseProxiNode):
     Proximity node showing current and expanded function calls in graph.
     """
 
-    def __init__(self, func, ref_at: Optional[Set[int]] = None):
+    def __init__(self, func: FuncNode, ref_at: set[int] | None = None):
         super().__init__(ProxiNodeTypes.Function, ref_at=ref_at)
         self.func = func
 
     def __eq__(self, other):
-        return isinstance(other, FunctionProxiNode) and \
-               other.type_ == self.type_ and \
-               self.func == other.func
+        return isinstance(other, FunctionProxiNode) and other.type_ == self.type_ and self.func == other.func
 
     def __hash__(self):
         return hash((FunctionProxiNode, self.func))
@@ -71,15 +72,13 @@ class VariableProxiNode(BaseProxiNode):
     Variable arg node
     """
 
-    def __init__(self, addr, name, ref_at: Optional[Set[int]] = None):
+    def __init__(self, addr, name, ref_at: set[int] | None = None):
         super().__init__(ProxiNodeTypes.Variable, ref_at=ref_at)
         self.addr = addr
         self.name = name
 
     def __eq__(self, other):
-        return isinstance(other, VariableProxiNode) and \
-               other.type_ == self.type_ and \
-               self.addr == other.addr
+        return isinstance(other, VariableProxiNode) and other.type_ == self.type_ and self.addr == other.addr
 
     def __hash__(self):
         return hash((VariableProxiNode, self.addr))
@@ -90,15 +89,13 @@ class StringProxiNode(BaseProxiNode):
     String arg node
     """
 
-    def __init__(self, addr, content, ref_at: Optional[Set[int]] = None):
+    def __init__(self, addr, content, ref_at: set[int] | None = None):
         super().__init__(ProxiNodeTypes.String, ref_at=ref_at)
         self.addr = addr
         self.content = content
 
     def __eq__(self, other):
-        return isinstance(other, StringProxiNode) and \
-               other.type_ == self.type_ and \
-               self.addr == other.addr
+        return isinstance(other, StringProxiNode) and other.type_ == self.type_ and self.addr == other.addr
 
     def __hash__(self):
         return hash((StringProxiNode, self.addr))
@@ -109,17 +106,19 @@ class CallProxiNode(BaseProxiNode):
     Call node
     """
 
-    def __init__(self, callee, ref_at: Optional[Set[int]] = None, args: Optional[Tuple[BaseProxiNode]] = None):
+    def __init__(self, callee: FuncNode, ref_at: set[int] | None = None, args: tuple[BaseProxiNode] | None = None):
         super().__init__(ProxiNodeTypes.FunctionCall, ref_at=ref_at)
         self.callee = callee
         self.args = args
 
     def __eq__(self, other):
-        return isinstance(other, CallProxiNode) and \
-               other.type_ == self.type_ and \
-               self.callee == other.callee and \
-               self.args == other.args and \
-               self.ref_at == other.ref_at
+        return (
+            isinstance(other, CallProxiNode)
+            and other.type_ == self.type_
+            and self.callee == other.callee
+            and self.args == other.args
+            and self.ref_at == other.ref_at
+        )
 
     def __hash__(self):
         return hash((CallProxiNode, self.callee, self.args))
@@ -130,14 +129,12 @@ class IntegerProxiNode(BaseProxiNode):
     Int arg node
     """
 
-    def __init__(self, value: int, ref_at: Optional[Set[int]] = None):
+    def __init__(self, value: int, ref_at: set[int] | None = None):
         super().__init__(ProxiNodeTypes.Integer, ref_at=ref_at)
         self.value = value
 
     def __eq__(self, other):
-        return isinstance(other, IntegerProxiNode) and \
-               self.type_ == other.type_ and \
-               self.value == other.value
+        return isinstance(other, IntegerProxiNode) and self.type_ == other.type_ and self.value == other.value
 
     def __hash__(self):
         return hash((IntegerProxiNode, self.value))
@@ -153,9 +150,9 @@ class UnknownProxiNode(BaseProxiNode):
         self.dummy_value = dummy_value
 
     def __eq__(self, other):
-        return isinstance(other, UnknownProxiNode) and \
-               self.type_ == other.type_ and \
-               self.dummy_value == other.dummy_value
+        return (
+            isinstance(other, UnknownProxiNode) and self.type_ == other.type_ and self.dummy_value == other.dummy_value
+        )
 
     def __hash__(self):
         return hash((UnknownProxiNode, self.dummy_value))
@@ -166,39 +163,75 @@ class ProximityGraphAnalysis(Analysis):
     Generate a proximity graph.
     """
 
-    def __init__(self, func: 'Function', cfg_model: 'CFGModel', xrefs: 'XRefManager',
-                 decompilation: Optional['Decompiler'] = None, expand_funcs: Optional[Set[int]] = None):
+    def __init__(
+        self,
+        func: Function,
+        cfg_model: CFGModel,
+        xrefs: XRefManager,
+        decompilation: Decompiler | None = None,
+        expand_funcs: set[int] | None = None,
+    ):
         self._function = func
         self._cfg_model = cfg_model
         self._xrefs = xrefs
         self._decompilation = decompilation
+        self._variable_map = self._decompilation._variable_map if self._decompilation is not None else None
         self._expand_funcs = expand_funcs.copy() if expand_funcs else None
 
-        self.graph: Optional[networkx.DiGraph] = None
+        self.graph: networkx.DiGraph | None = None
         self.handled_stmts = []
 
         self._work()
+
+    def _condense_blank_nodes(self, graph: networkx.DiGraph) -> None:
+        nodes = list(graph.nodes)
+        blank_nodes: list[BaseProxiNode] = []
+
+        for node in nodes:
+            if isinstance(node, BaseProxiNode) and node.type_ == ProxiNodeTypes.Empty:
+                blank_nodes.append(node)
+            else:
+                if blank_nodes:
+                    self._merge_nodes(graph, blank_nodes)
+                    blank_nodes = []
+
+        if blank_nodes:
+            self._merge_nodes(graph, blank_nodes)
+
+    @staticmethod
+    def _merge_nodes(graph: networkx.DiGraph, nodes: list[BaseProxiNode]) -> None:
+        for node in nodes:
+            predecessors = set(graph.predecessors(node))
+            successors = set(graph.successors(node))
+
+            for pred in predecessors:
+                for succ in successors:
+                    edge_data = graph.get_edge_data(pred, node) or {}
+                    graph.add_edge(pred, succ, **edge_data)
+
+            graph.remove_node(node)
 
     def _work(self):
         self.graph = networkx.DiGraph()
 
         # initial function
-        func_proxi_node = FunctionProxiNode(self._function)
+        func_proxi_node = FunctionProxiNode(FuncNode(self._function.addr))
 
         if not self._decompilation:
             to_expand = self._process_function(self._function, self.graph, func_proxi_node=func_proxi_node)
         else:
-            to_expand = self._process_decompilation(self.graph, decompilation=self._decompilation,
-                                                    func_proxi_node=func_proxi_node)
+            to_expand = self._process_decompilation(
+                self.graph, decompilation=self._decompilation, func_proxi_node=func_proxi_node
+            )
 
         for func_node in to_expand:
             if self._expand_funcs:
                 self._expand_funcs.discard(func_node.func.addr)
 
             subgraph = networkx.DiGraph()
-            dec = self._decompilation.project.analyses.Decompiler(func_node.func, cfg=self._decompilation._cfg)
+            dec = self.project.analyses.Decompiler(func_node.func.addr, cfg=self._decompilation._cfg)
             if not dec:
-                sub_expand = self._process_function(func_node.func, subgraph, func_proxi_node=func_node)
+                sub_expand = self._process_function(func_node.func.addr, subgraph, func_proxi_node=func_node)
             else:
                 sub_expand = self._process_decompilation(subgraph, decompilation=dec, func_proxi_node=func_node)
 
@@ -208,7 +241,10 @@ class ProximityGraphAnalysis(Analysis):
             self.graph.add_nodes_from(subgraph.nodes())
             self.graph.add_edges_from(subgraph.edges())
 
-    def _endnode_connector(self, func: 'Function', subgraph: networkx.DiGraph):
+        # condense blank nodes after the graph has been constructed
+        self._condense_blank_nodes(self.graph)
+
+    def _endnode_connector(self, func: FuncNode, subgraph: networkx.DiGraph):
         """
         Properly connect expanded function call's to proximity graph.
         """
@@ -235,30 +271,27 @@ class ProximityGraphAnalysis(Analysis):
                 for succ in successors:
                     subgraph.add_edge(end_node, succ)
 
-    def _process_function(self, func: 'Function', graph: networkx.DiGraph,
-                          func_proxi_node: Optional[FunctionProxiNode] = None) -> List[FunctionProxiNode]:
-
-        to_expand: List[FunctionProxiNode] = []
-        found_blocks: Dict[BlockNode: BaseProxiNode] = {}
+    def _process_function(
+        self, func: Function, graph: networkx.DiGraph, func_proxi_node: FunctionProxiNode | None = None
+    ) -> list[FunctionProxiNode]:
+        to_expand: list[FunctionProxiNode] = []
+        found_blocks: dict[BlockNode, BaseProxiNode] = {}
 
         # function calls
         for n_ in func.nodes:
-            if isinstance(n_, Function):
+            if isinstance(n_, FuncNode):
                 func_node = n_
                 for block, _, data in func.transition_graph.in_edges(func_node, data=True):
-                    if 'ins_addr' in data:
+                    if "ins_addr" in data:
                         if self._expand_funcs and func_node.addr in self._expand_funcs:  # pylint:disable=unsupported-membership-test
-                            node = FunctionProxiNode(func_node, ref_at={data['ins_addr']})
+                            node = FunctionProxiNode(func_node, ref_at={data["ins_addr"]})
                             to_expand.append(node)
                         else:
-                            node = CallProxiNode(func_node, ref_at={data['ins_addr']})
+                            node = CallProxiNode(func_node, ref_at={data["ins_addr"]})
                         found_blocks[block] = node
 
         # subgraph check - do before in case of recursion
-        if self.graph == graph:
-            subgraph = False
-        else:
-            subgraph = True
+        subgraph = self.graph != graph
 
         for edge in func.graph.edges:
             nodes = ()
@@ -282,82 +315,88 @@ class ProximityGraphAnalysis(Analysis):
 
     # TODO look into harnessing ailblock_walker to find Strings, Constants, or Function Calls
     def _arg_handler(self, arg, args, string_refs):
-        if isinstance(arg, ailment.Expr.Const):
+        if isinstance(arg, ailment.Expr.Const) and arg.is_int:
             # is it a reference to a string?
-            if arg.value in self._cfg_model.memory_data:
-                md = self._cfg_model.memory_data[arg.value]
+            if arg.value_int in self._cfg_model.memory_data:
+                md = self._cfg_model.memory_data[arg.value_int]
                 if md.sort == "string":
                     # Yes!
-                    args.append(StringProxiNode(arg.value, md.content))
-                    string_refs.add(arg.value)
+                    args.append(StringProxiNode(arg.value_int, md.content))
+                    string_refs.add(arg.value_int)
             else:
                 # not a string. present it as a constant integer
-                args.append(IntegerProxiNode(arg.value, None))
+                args.append(IntegerProxiNode(arg.value_int, None))
         elif isinstance(arg, ailment.expression.Load):
-            if arg.variable is not None:
-                args.append(VariableProxiNode(arg.variable.addr, arg.variable.name))
-            elif arg.addr.variable is not None:
-                if isinstance(arg.addr.variable, SimMemoryVariable):
-                    args.append(VariableProxiNode(arg.addr.variable.addr, arg.addr.variable.name))
+            arg_var = self._variable_map.variable(arg)
+            arg_addr_var = self._variable_map.variable(arg.addr)
+            if arg_var is not None:
+                args.append(VariableProxiNode(arg_var.addr, arg_var.name))
+            elif arg_addr_var is not None:
+                if isinstance(arg_addr_var, SimMemoryVariable):
+                    args.append(VariableProxiNode(arg_addr_var.addr, arg_addr_var.name))
                 else:
-                    args.append(VariableProxiNode(None, arg.addr.variable.name))
+                    args.append(VariableProxiNode(None, arg_addr_var.name))
             else:
                 args.append(UnknownProxiNode("l_"))
         elif isinstance(arg, ailment.expression.StackBaseOffset):
-            if arg.variable is not None:
-                args.append(VariableProxiNode(arg.variable, arg.variable.name))
+            arg_var = self._variable_map.variable(arg)
+            if arg_var is not None:
+                args.append(VariableProxiNode(arg_var, arg_var.name))
             else:
                 args.append(UnknownProxiNode("s_"))
         else:
             args.append(UnknownProxiNode("_"))
 
-    def _process_decompilation(self, graph: networkx.DiGraph, decompilation: 'Decompiler',
-                               func_proxi_node: Optional[FunctionProxiNode] = None) -> List[FunctionProxiNode]:
-        to_expand: List[FunctionProxiNode] = []
+    def _process_decompilation(
+        self, graph: networkx.DiGraph, decompilation: Decompiler, func_proxi_node: FunctionProxiNode | None = None
+    ) -> list[FunctionProxiNode]:
+        to_expand: list[FunctionProxiNode] = []
 
         # dedup
-        string_refs: Set[int] = set()
+        string_refs: set[int] = set()
+
+        if decompilation.clinic is None:
+            return []
 
         # Walk the clinic structure to dump string references and function calls
         ail_graph = decompilation.clinic.cc_graph
+        if ail_graph is None:
+            return []
+        self._variable_map = decompilation.clinic.variable_map
 
-        def _handle_Call(stmt_idx: int, stmt: ailment.Stmt.Call,  # pylint:disable=unused-argument
-                         block: Optional[ailment.Block]):  # pylint:disable=unused-argument
-            func_node = self.kb.functions[stmt.target.value]
-            ref_at = {stmt.ins_addr}
+        def _handle_Call(
+            expr_idx: int,
+            expr: ailment.Expr.Call,
+            stmt_idx: int,  # pylint:disable=unused-argument
+            stmt: ailment.Stmt.Statement,  # pylint:disable=unused-argument
+            block: ailment.Block | None,
+        ):  # pylint:disable=unused-argument
+            if isinstance(expr.target, ailment.Expr.Const) and self.kb.functions.contains_addr(expr.target.value):
+                func_node = FuncNode(expr.target.value)
+                ref_at = {stmt.tags["ins_addr"]}
 
-            # extract arguments
-            args = []
-            if stmt.args:
-                for arg in stmt.args:
-                    self._arg_handler(arg, args, string_refs)
+                # extract arguments
+                args = []
+                if expr.args:
+                    for arg in expr.args:
+                        self._arg_handler(arg, args, string_refs)
 
-            if self._expand_funcs and func_node.addr in self._expand_funcs:  # pylint:disable=unsupported-membership-test
-                new_node = FunctionProxiNode(func_node, ref_at=ref_at)
-                if new_node not in to_expand:
-                    to_expand.append(new_node)
-            else:
-                new_node = CallProxiNode(func_node, ref_at=ref_at, args=tuple(args) if args is not None else None)
+                if self._expand_funcs and func_node.addr in self._expand_funcs:  # pylint:disable=unsupported-membership-test
+                    new_node = FunctionProxiNode(func_node, ref_at=ref_at)
+                    if new_node not in to_expand:
+                        to_expand.append(new_node)
+                else:
+                    new_node = CallProxiNode(func_node, ref_at=ref_at, args=tuple(args) if args is not None else None)
 
-            # stmt has been properly handled, add the proxi node to the list
-            self.handled_stmts.append(new_node)
-
-        # This should have the same functionality as the previous handler
-        def _handle_CallExpr(expr_idx: int, expr: ailment.Stmt.Call, stmt_idx: int,  # pylint:disable=unused-argument
-                             stmt: ailment.Stmt.Statement,  # pylint:disable=unused-argument
-                             block: Optional[ailment.Block]):  # pylint:disable=unused-argument
-            _handle_Call(stmt_idx, expr, block)
+                # stmt has been properly handled, add the proxi node to the list
+                self.handled_stmts.append(new_node)
 
         # subgraph check - do before in case of recursion
-        if self.graph == graph:
-            subgraph = False
-        else:
-            subgraph = True
+        subgraph = self.graph != graph
 
         # Keep all default handlers, but overwrite necessary ones:
-        bw = AILBlockWalker()
-        bw.stmt_handlers[ailment.Stmt.Call] = _handle_Call
-        bw.expr_handlers[ailment.Stmt.Call] = _handle_CallExpr
+        bw = AILBlockViewer()
+        bw.expr_handlers[ailment.Expr.Call] = _handle_Call
 
         # Custom Graph walker, go through AIL edges
         for ail_edge in ail_graph.edges:
@@ -376,10 +415,7 @@ class ProximityGraphAnalysis(Analysis):
                             graph.add_edge(self.handled_stmts[idx - 1], current)
                     # If first block in edge, LAST handled node -> next node
                     # Else (second block in edge), prev node -> FIRST handled node
-                    if block == ail_edge[0]:
-                        proxi_node = self.handled_stmts[-1]
-                    else:
-                        proxi_node = self.handled_stmts[0]
+                    proxi_node = self.handled_stmts[-1] if block == ail_edge[0] else self.handled_stmts[0]
 
                     # Clear the handled stmts for next block
                     self.handled_stmts = []
@@ -395,16 +431,17 @@ class ProximityGraphAnalysis(Analysis):
             # Add the new edge for this pair of blocks
             graph.add_edge(*new_edge)
 
-        # Append FunctionProxiNode before Graph
-        root_node = [n for n, d in graph.in_degree() if d == 0]
-        if root_node:
-            graph.add_edge(func_proxi_node, root_node[0])
+        if func_proxi_node is not None:
+            # Append FunctionProxiNode before Graph
+            root_node = [n for n, d in graph.in_degree() if d == 0]
+            if root_node:
+                graph.add_edge(func_proxi_node, root_node[0])
 
-        # Draw edge from subgraph endnodes to current node's successor
-        if subgraph:
-            self._endnode_connector(func_proxi_node.func, graph)
+            # Draw edge from subgraph endnodes to current node's successor
+            if subgraph:
+                self._endnode_connector(func_proxi_node.func, graph)
 
         return to_expand
 
 
-AnalysesHub.register_default('Proximity', ProximityGraphAnalysis)
+AnalysesHub.register_default("Proximity", ProximityGraphAnalysis)

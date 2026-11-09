@@ -1,9 +1,30 @@
-import claripy
-
-from archinfo.arch_soot import ArchSoot
+from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
+
+from archinfo.arch_soot import SootAddressDescriptor
+
+import angr
+from angr import claripy
+from angr import sim_options as o
+from angr.calling_conventions import SYSCALL_CC
+from angr.engines.engine import SimEngine
+from angr.errors import (
+    AngrSyscallError,
+    AngrUnsupportedSyscallError,
+    SimException,
+    SimSolverModeError,
+)
+from angr.state_plugins.inspect import BP_AFTER, BP_BEFORE
+from angr.state_plugins.sim_action_object import _raw_ast
+
+if TYPE_CHECKING:
+    from angr.sim_state import SimState
+
+
 l = logging.getLogger(name=__name__)
+
 
 class SimSuccessors:
     """
@@ -32,30 +53,26 @@ class SimSuccessors:
     https://docs.angr.io/core-concepts/simulation#simsuccessors
     """
 
-    def __init__(self, addr, initial_state):
+    def __init__(self, addr: int | SootAddressDescriptor | None, initial_state: HeavyState | None):
         self.addr = addr
         self.initial_state = initial_state
 
-        self.successors = [ ]
-        self.all_successors = [ ]
-        self.flat_successors = [ ]
-        self.unsat_successors = [ ]
-        self.unconstrained_successors = [ ]
+        self.successors: list[HeavyState] = []
+        self.all_successors: list[HeavyState] = []
+        self.flat_successors: list[HeavyState] = []
+        self.unsat_successors: list[HeavyState] = []
+        self.unconstrained_successors: list[HeavyState] = []
 
         # the engine that should process or did process this request
         self.engine = None
         self.processed = False
-        self.description = 'SimSuccessors'
-        self.sort = None
+        self.description = "SimSuccessors"
+        self.sort: str | None = None
         self.artifacts = {}
-
-    @classmethod
-    def failure(cls):
-        return cls(None, None)
 
     def __repr__(self):
         if self.processed:
-            successor_strings = [ ]
+            successor_strings = []
             if len(self.flat_successors) != 0:
                 successor_strings.append(f"{len(self.flat_successors)} sat")
             if len(self.unsat_successors) != 0:
@@ -63,22 +80,36 @@ class SimSuccessors:
             if len(self.unconstrained_successors) != 0:
                 successor_strings.append(f"{len(self.unconstrained_successors)} unconstrained")
 
-            if len(successor_strings) == 0:
-                result = 'empty'
-            else:
-                result = ' '.join(successor_strings)
+            result = "empty" if len(successor_strings) == 0 else " ".join(successor_strings)
         else:
-            result = 'failure'
+            result = "failure"
 
         if isinstance(self.addr, int):
-            return f'<{self.description} from {self.addr:#x}: {result}>'
+            int_addr = self.addr
+            addendum = ""
+            if self.initial_state is not None and self.initial_state.scratch.is_ail:
+                idx = self.initial_state.scratch.ail_block_idx
+                if idx is not None:
+                    addendum = f".{idx}"
         else:
-            return f'<{self.description} from {self.addr}: {result}>'
+            return f"<{self.description} from {self.addr}: {result}>"
+        if self.initial_state is not None:
+            whatsup = self.initial_state.project.loader.describe_addr(int_addr)
+            hex_addr = hex(int_addr)
+            if hex_addr in whatsup:
+                whatsup = whatsup.replace(hex_addr, hex_addr + addendum)
+                return f"<{self.description} from {whatsup}: {result}>"
+            return f"<{self.description} from {int_addr:#x}{addendum} ({whatsup}): {result}>"
+        return f"<{self.description} from {int_addr:#x}{addendum}: {result}>"
 
     @property
     def is_empty(self):
-        return not self.all_successors and not self.flat_successors and not self.unsat_successors and \
-               not self.unconstrained_successors
+        return (
+            not self.all_successors
+            and not self.flat_successors
+            and not self.unsat_successors
+            and not self.unconstrained_successors
+        )
 
     def __getitem__(self, k):
         return self.flat_successors[k]
@@ -86,8 +117,9 @@ class SimSuccessors:
     def __iter__(self):
         return iter(self.flat_successors)
 
-    def add_successor(self, state, target, guard, jumpkind, add_guard=True, exit_stmt_idx=None, exit_ins_addr=None,
-                      source=None):
+    def add_successor(
+        self, state, target, guard, jumpkind, add_guard=True, exit_stmt_idx=None, exit_ins_addr=None, source=None
+    ):
         """
         Add a successor state of the SimRun.
         This procedure stores method parameters into state.scratch, does some housekeeping,
@@ -107,7 +139,7 @@ class SimSuccessors:
         """
 
         # First, trigger the SimInspect breakpoint
-        state._inspect('exit', BP_BEFORE, exit_target=target, exit_guard=guard, exit_jumpkind=jumpkind)
+        state._inspect("exit", BP_BEFORE, exit_target=target, exit_guard=guard, exit_jumpkind=jumpkind)
         state.scratch.target = state._inspect_getattr("exit_target", target)
         state.scratch.guard = state._inspect_getattr("exit_guard", guard)
         state.history.jumpkind = state._inspect_getattr("exit_jumpkind", jumpkind)
@@ -122,11 +154,11 @@ class SimSuccessors:
 
         self._preprocess_successor(state, add_guard=add_guard)
 
-        if state.history.jumpkind == 'Ijk_SigFPE_IntDiv' and o.PRODUCE_ZERODIV_SUCCESSORS not in state.options:
+        if state.history.jumpkind == "Ijk_SigFPE_IntDiv" and o.PRODUCE_ZERODIV_SUCCESSORS not in state.options:
             return
 
         self._categorize_successor(state)
-        state._inspect('exit', BP_AFTER, exit_target=target, exit_guard=guard, exit_jumpkind=jumpkind)
+        state._inspect("exit", BP_AFTER, exit_target=target, exit_guard=guard, exit_jumpkind=jumpkind)
         if state.supports_inspect:
             state.inspect.downsize()
 
@@ -134,12 +166,14 @@ class SimSuccessors:
     # Successor management
     #
 
-    def _preprocess_successor(self, state, add_guard=True): #pylint:disable=unused-argument
+    def _preprocess_successor(self, state, add_guard=True):  # pylint:disable=unused-argument
         """
         Preprocesses the successor state.
 
         :param state: the successor state
         """
+
+        assert self.initial_state is not None
 
         # Next, simplify what needs to be simplified
         if o.SIMPLIFY_EXIT_STATE in state.options:
@@ -157,80 +191,18 @@ class SimSuccessors:
         if add_guard:
             state.add_constraints(state.scratch.guard)
         # trigger inspect breakpoints here since this statement technically shows up in the IRSB as the "next"
-        state.regs.ip = state.scratch.target
+        state.ip = state.scratch.target
 
-        # For architectures with no stack pointer, we can't manage a callstack. This has the side effect of breaking
-        # SimProcedures that call out to binary code self.call.
-        if self.initial_state.arch.sp_offset is not None and not isinstance(state.arch, ArchSoot):
-            self._manage_callstack(state)
+        if state.has_plugin("callstack"):
+            state.callstack._manage()
 
         if len(self.successors) != 0:
             # This is a fork!
-            state._inspect('fork', BP_AFTER)
+            state._inspect("fork", BP_AFTER)
 
         # clean up the state
         state.options.discard(o.AST_DEPS)
         state.options.discard(o.AUTO_REFS)
-
-    @staticmethod
-    def _manage_callstack(state):
-        # condition for call = Ijk_Call
-        # condition for ret = stack pointer drops below call point
-        if state.history.jumpkind == 'Ijk_Call':
-            state._inspect('call', BP_BEFORE, function_address=state.regs._ip)
-            new_func_addr = state._inspect_getattr('function_address', None)
-            if new_func_addr is not None and not claripy.is_true(new_func_addr == state.regs._ip):
-                state.regs._ip = new_func_addr
-
-            try:
-                if state.arch.call_pushes_ret:
-                    ret_addr = state.mem[state.regs._sp].long.concrete
-                else:
-                    ret_addr = state.solver.eval(state.regs._lr)
-            except (SimSolverModeError, SimUnsatError):
-                # Use the address for UnresolvableCallTarget instead.
-                ret_addr = state.project.simos.unresolvable_call_target
-
-            try:
-                state_addr = state.addr
-            except (SimValueError, SimSolverModeError):
-                state_addr = None
-
-            try:
-                stack_ptr = state.solver.eval(state.regs._sp)
-            except (SimSolverModeError, SimUnsatError):
-                stack_ptr = 0
-
-            new_frame = CallStack(
-                    call_site_addr=state.history.recent_bbl_addrs[-1],
-                    func_addr=state_addr,
-                    stack_ptr=stack_ptr,
-                    ret_addr=ret_addr,
-                    jumpkind='Ijk_Call')
-            state.callstack.push(new_frame)
-
-            state._inspect('call', BP_AFTER)
-        else:
-            while True:
-                cur_sp = state.solver.max(state.regs._sp) if state.has_plugin('symbolizer') else state.regs._sp
-                if not state.solver.is_true(cur_sp > state.callstack.top.stack_ptr):
-                    break
-                state._inspect('return', BP_BEFORE, function_address=state.callstack.top.func_addr)
-                state.callstack.pop()
-                state._inspect('return', BP_AFTER)
-
-            if not state.arch.call_pushes_ret and \
-                    claripy.is_true(state.regs._ip == state.callstack.ret_addr) and \
-                    claripy.is_true(state.regs._sp == state.callstack.stack_ptr):
-                # very weird edge case that's not actually weird or on the edge at all:
-                # if we use a link register for the return address, the stack pointer will be the same
-                # before and after the call. therefore we have to check for equality with the marker
-                # along with this other check with the instruction pointer to guess whether it's time
-                # to pop a callframe. Still better than relying on Ijk_Ret.
-                state._inspect('return', BP_BEFORE, function_address=state.callstack.top.func_addr)
-                state.callstack.pop()
-                state._inspect('return', BP_AFTER)
-
 
     def _categorize_successor(self, state):
         """
@@ -246,22 +218,32 @@ class SimSuccessors:
 
         # categorize the state
         if o.APPROXIMATE_GUARDS in state.options and state.solver.is_false(state.scratch.guard, exact=False):
-            if o.VALIDATE_APPROXIMATIONS in state.options:
-                if state.satisfiable():
-                    raise Exception('WTF')
+            if o.VALIDATE_APPROXIMATIONS in state.options and state.satisfiable():
+                raise AssertionError("WTF")
             self.unsat_successors.append(state)
         elif o.APPROXIMATE_SATISFIABILITY in state.options and not state.solver.satisfiable(exact=False):
-            if o.VALIDATE_APPROXIMATIONS in state.options:
-                if state.solver.satisfiable():
-                    raise Exception('WTF')
+            if o.VALIDATE_APPROXIMATIONS in state.options and state.solver.satisfiable():
+                raise AssertionError("WTF")
             self.unsat_successors.append(state)
-        elif not state.scratch.guard.symbolic and state.solver.is_false(state.scratch.guard):
+        elif (not state.scratch.guard.symbolic and state.solver.is_false(state.scratch.guard)) or (
+            o.LAZY_SOLVES not in state.options and not state.satisfiable()
+        ):
             self.unsat_successors.append(state)
-        elif o.LAZY_SOLVES not in state.options and not state.satisfiable():
-            self.unsat_successors.append(state)
-        elif o.NO_SYMBOLIC_JUMP_RESOLUTION in state.options and state.solver.symbolic(target):
+        elif (
+            o.NO_SYMBOLIC_JUMP_RESOLUTION in state.options
+            and isinstance(target, claripy.ast.Base)
+            and state.solver.symbolic(target)
+        ):
             self.unconstrained_successors.append(state)
-        elif not state.solver.symbolic(target) and not state.history.jumpkind.startswith("Ijk_Sys"):
+        elif o.CALLLESS in state.options and state.history.jumpkind == "Ijk_Call" and state.solver.symbolic(target):
+            # If CALLESS is set, even a symbolic call target is allowed, because we don't want to resolve the target
+            # anyway
+            # The actual state will be fixed up later during `VEXMixin.process_successors`
+            self.successors.append(state)
+            self.flat_successors.append(state)
+        elif not (
+            isinstance(target, claripy.ast.Base) and state.solver.symbolic(target)
+        ) and not state.history.jumpkind.startswith("Ijk_Sys"):
             # a successor with a concrete IP, and it's not a syscall
             self.successors.append(state)
             self.flat_successors.append(state)
@@ -269,10 +251,15 @@ class SimSuccessors:
             # syscall
             self.successors.append(state)
 
-            # Misuse the ip_at_syscall register to save the return address for this syscall
-            # state.ip *might be* changed to be the real address of syscall SimProcedures by syscall handling code in
-            # angr
-            state.regs.ip_at_syscall = state.ip
+            if "ip_at_syscall" in state.arch.registers:
+                # Misuse the ip_at_syscall register to save the return address for this syscall
+                # state.ip *might be* changed to be the real address
+                # of syscall SimProcedures by syscall handling code in angr
+                state.regs.ip_at_syscall = state.ip
+            else:
+                # The architecture doesn't have an ip_at_syscall register.
+                # Nothing to do but hope vigorously.
+                l.warning("Handling syscall on arch %s without ip_at_syscall register", state.arch.name)
 
             try:
                 symbolic_syscall_num, concrete_syscall_nums = self._resolve_syscall(state)
@@ -302,18 +289,18 @@ class SimSuccessors:
                 skip_max_targets_warning = False
                 if o.NO_IP_CONCRETIZATION in state.options:
                     # Don't try to concretize the IP
-                    cond_and_targets = [ (claripy.true, target) ]
+                    cond_and_targets = [(claripy.true(), target)]
                     max_targets = 0
                     skip_max_targets_warning = True  # don't warn
                 elif o.KEEP_IP_SYMBOLIC in state.options:
                     s = claripy.Solver()
-                    addrs = s.eval(target, _max_targets + 1, extra_constraints=tuple(state.ip_constraints))
+                    addrs = s.eval(target, _max_targets + 1)
                     if len(addrs) > _max_targets:
                         # It is not a library
                         l.debug("It is not a Library")
                         addrs = state.solver.eval_upto(target, _max_targets + 1)
                         l.debug("addrs :%s", addrs)
-                    cond_and_targets = [ (target == addr, addr) for addr in addrs ]
+                    cond_and_targets = [(target == addr, addr) for addr in addrs]
                     max_targets = _max_targets
                 else:
                     cond_and_targets = self._eval_target_jumptable(state, target, _max_jumptable_targets + 1)
@@ -329,7 +316,7 @@ class SimSuccessors:
                         l.warning(
                             "Exit state has over %d possible solutions. Likely unconstrained; skipping. %s",
                             max_targets,
-                            target.shallow_repr()
+                            target.shallow_repr(),
                         )
                     self.unconstrained_successors.append(state)
                 else:
@@ -338,7 +325,7 @@ class SimSuccessors:
                         if o.KEEP_IP_SYMBOLIC in split_state.options:
                             split_state.regs.ip = target
                         else:
-                            split_state.add_constraints(cond, action=True)
+                            split_state.add_constraints(cond)
                             split_state.regs.ip = a
                         if split_state.supports_inspect:
                             split_state.inspect.downsize()
@@ -349,7 +336,6 @@ class SimSuccessors:
 
         return state
 
-
     # misc stuff
     @staticmethod
     def _resolve_syscall(state):
@@ -357,7 +343,7 @@ class SimSuccessors:
             cc = SYSCALL_CC[state.arch.name][state.os_name](state.arch)
         else:
             # Use the default syscall calling convention - it may bring problems
-            cc = SYSCALL_CC[state.arch.name]['default'](state.arch)
+            cc = SYSCALL_CC[state.arch.name]["default"](state.arch)
 
         syscall_num = cc.syscall_num(state)
 
@@ -389,8 +375,8 @@ class SimSuccessors:
         """
 
         stub = state.project.simos.syscall(state, allow_unsupported=True)
-        if stub: # can be None if simos is not a subclass of SimUserspace
-            state.ip = stub.addr # fix the IP
+        if stub:  # can be None if simos is not a subclass of SimUserspace
+            state.ip = stub.addr  # fix the IP
 
     def _finalize(self):
         """
@@ -423,10 +409,10 @@ class SimSuccessors:
         """
 
         if ip.symbolic is False:
-            return [ (claripy.ast.bool.true, ip) ]  # concrete
+            return [(claripy.ast.bool.true, ip)]  # concrete
 
         # Detect whether ip is in the form of "if a == 1 then addr_0 else if a == 2 then addr_1 else ..."
-        cond_and_targets = [ ]  # tuple of (condition, target)
+        cond_and_targets = []  # tuple of (condition, target)
 
         ip_ = ip
         # Handle the outer Reverse
@@ -448,7 +434,7 @@ class SimSuccessors:
                 fallback = True
                 break
 
-            if target.symbolic is False and state.solver.eval(target) == DUMMY_SYMBOLIC_READ_VALUE:
+            if target.symbolic is False and state.solver.eval(target) == angr.storage.DUMMY_SYMBOLIC_READ_VALUE:
                 # Ignore the dummy value, which acts as the sentinel of this ITE tree
                 reached_sentinel = True
                 continue
@@ -487,7 +473,7 @@ class SimSuccessors:
                 fallback = True
                 break
 
-            cond_and_targets.append((cond, target if not outer_reverse else state.solver.Reverse(target)))
+            cond_and_targets.append((cond, target if not outer_reverse else claripy.Reverse(target)))
 
         if reached_sentinel is False:
             # huh?
@@ -495,8 +481,7 @@ class SimSuccessors:
 
         if fallback:
             return None
-        else:
-            return cond_and_targets[ : limit]
+        return cond_and_targets[:limit]
 
     @staticmethod
     def _eval_target_brutal(state, ip, limit):
@@ -512,13 +497,110 @@ class SimSuccessors:
 
         addrs = state.solver.eval_upto(ip, limit)
 
-        return [ (ip == addr, addr) for addr in addrs ]
+        return [(ip == addr, addr) for addr in addrs]
 
 
-from ..state_plugins.inspect import BP_BEFORE, BP_AFTER
-from ..errors import SimSolverModeError, AngrUnsupportedSyscallError, AngrSyscallError, SimValueError, SimUnsatError
-from ..calling_conventions import SYSCALL_CC
-from ..state_plugins.sim_action_object import _raw_ast
-from ..state_plugins.callstack import CallStack
-from ..storage import DUMMY_SYMBOLIC_READ_VALUE
-from .. import sim_options as o
+type HeavyState = "SimState[int | SootAddressDescriptor, claripy.ast.BV | SootAddressDescriptor]"
+
+
+class SuccessorsEngine(SimEngine[HeavyState, SimSuccessors]):
+    """
+    A mixin for SimEngine which implements ``process`` to perform common operations related to symbolic execution
+    and dispatches to a ``process_successors`` method to fill a SimSuccessors object with the results.
+    """
+
+    def __init__(self, project: angr.Project):
+        super().__init__(project)
+
+        self.successors: SimSuccessors | None = None
+
+    def process(self, state: HeavyState, **kwargs) -> SimSuccessors:  # pylint:disable=unused-argument
+        """
+        Perform execution with a state.
+
+        You should only override this method in a subclass in order to provide the correct method signature and
+        docstring. You should override the ``_process`` method to do your actual execution.
+
+        :param state:       The state with which to execute. This state will be copied before
+                            modification.
+        :param inline:      This is an inline execution. Do not bother copying the state.
+        :param force_addr:  Force execution to pretend that we're working at this concrete address
+        :returns:           A SimSuccessors object categorizing the execution's successor states
+        """
+        inline = kwargs.pop("inline", False)
+        force_addr = kwargs.pop("force_addr", None)
+
+        ip = state._ip
+        addr = (state.solver.eval(ip) if isinstance(ip, claripy.ast.BV) else ip) if force_addr is None else force_addr
+
+        # make a copy of the initial state for actual processing, if needed
+        new_state = state.copy() if not inline and o.COPY_STATES in state.options else state
+        # enforce this distinction
+        old_state = state
+        del state
+        self.state = new_state
+
+        # we have now officially begun the stepping process! now is where we "cycle" a state's
+        # data - move the "present" into the "past" by pushing an entry on the history stack.
+        # nuance: make sure to copy from the PREVIOUS state to the CURRENT one
+        # to avoid creating a dead link in the history, messing up the statehierarchy
+        new_state.register_plugin("history", old_state.history.make_child())
+        if new_state.scratch.is_ail:
+            new_state.history.recent_bbl_addrs.append((addr, new_state.scratch.ail_block_idx))
+        else:
+            new_state.history.recent_bbl_addrs.append(addr)
+        if new_state.arch.unicorn_support and isinstance(addr, int):
+            new_state.scratch.executed_pages_set = {addr & ~0xFFF}
+
+        self.successors = SimSuccessors(addr, old_state)
+
+        new_state._inspect(
+            "engine_process", when=BP_BEFORE, sim_engine=self, sim_successors=self.successors, address=addr
+        )
+        self.successors = new_state._inspect_getattr("sim_successors", self.successors)
+        try:
+            self.process_successors(self.successors, **kwargs)
+        except SimException as e:
+            if o.EXCEPTION_HANDLING not in old_state.options:
+                raise
+            old_state.project.simos.handle_exception(self.successors, self, e)
+
+        new_state._inspect("engine_process", when=BP_AFTER, sim_successors=self.successors, address=addr)
+        self.successors = new_state._inspect_getattr("sim_successors", self.successors)
+        assert self.successors is not None
+
+        # downsizing
+        if new_state.supports_inspect:
+            new_state.inspect.downsize()
+        # if not TRACK, clear actions on OLD state
+        # if o.TRACK_ACTION_HISTORY not in old_state.options:
+        #    old_state.history.recent_events = []
+
+        # fix up the descriptions...
+        description = str(self.successors)
+        l.debug("Ticked state: %s", description)
+        for succ in self.successors.all_successors:
+            succ.history.recent_description = description
+        for succ in self.successors.flat_successors:
+            succ.history.recent_description = description
+
+        return self.successors
+
+    def process_successors(self, successors: SimSuccessors, **kwargs):  # pylint:disable=unused-argument,no-self-use
+        """
+        Implement this function to fill out the SimSuccessors object with the results of stepping state.
+
+        In order to implement a model where multiple mixins can potentially handle a request, a mixin may implement
+        this method and then perform a super() call if it wants to pass on handling to the next mixin.
+
+        Keep in mind python's method resolution order when composing multiple classes implementing this method.
+        In short: left-to-right, depth-first, but deferring any base classes which are shared by multiple subclasses
+        (the merge point of a diamond pattern in the inheritance graph) until the last point where they would be
+        encountered in this depth-first search. For example, if you have classes A, B(A), C(B), D(A), E(C, D), then the
+        method resolution order will be E, C, B, D, A.
+
+        :param state:           The state to manipulate
+        :param successors:      The successors object to fill out
+        :param kwargs:          Any extra arguments. Do not fail if you are passed unexpected arguments.
+        """
+        successors.processed = False  # mark failure

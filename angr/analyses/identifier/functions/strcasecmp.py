@@ -1,20 +1,13 @@
-
-import random
+from __future__ import annotations
 
 from .strcmp import strcmp
-
-
-def rand_str(length, byte_list=None):
-    if byte_list is None:
-        return "".join(chr(random.randint(0, 255)) for _ in range(length))
-    return "".join(random.choice(byte_list) for _ in range(length))
 
 
 class strcasecmp(strcmp):
     non_null = [chr(i) for i in range(1, 256)]
 
     def __init__(self):
-        super(strcasecmp, self).__init__() #pylint disable=useless-super-delegation
+        super().__init__()  # pylint disable=useless-super-delegation
 
     def get_name(self):
         return "strcasecmp"
